@@ -14,7 +14,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.api.openai_realtime.utils import resample
+from speech_to_speech.api.openai_realtime.utils import decode_client_audio, encode_client_audio
 from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
 
 if TYPE_CHECKING:
@@ -46,7 +46,7 @@ class AudioHandler(RealtimeBaseHandler):
         return item_id
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
-        """Decode base64 audio, resample to pipeline rate, and split into 512-sample PCM16 chunks for the VAD."""
+        """Decode base64 audio to PCM16 at the pipeline rate, then split into 512-sample chunks for the VAD."""
         try:
             pcm_bytes = base64.b64decode(event.audio)
         except Exception as e:
@@ -56,11 +56,8 @@ class AudioHandler(RealtimeBaseHandler):
         st = self._state(conn_id)
 
         audio_cfg = st.runtime_config.session.audio
-        if audio_cfg is not None and audio_cfg.input is not None:
-            client_in_rate = getattr(audio_cfg.input.format, "rate", None) or PIPELINE_SAMPLE_RATE
-        else:
-            client_in_rate = PIPELINE_SAMPLE_RATE
-        pcm_bytes = resample(pcm_bytes, client_in_rate, PIPELINE_SAMPLE_RATE)
+        client_format = audio_cfg.input.format if audio_cfg is not None and audio_cfg.input is not None else None
+        pcm_bytes = decode_client_audio(pcm_bytes, client_format, PIPELINE_SAMPLE_RATE)
 
         pcm_bytes = st.audio_remainder + pcm_bytes
 
@@ -174,16 +171,14 @@ class AudioHandler(RealtimeBaseHandler):
                 )
             )
         rp = st.current_response_params
-        client_out_rate = None
+        client_format = None
         if rp and rp.audio and rp.audio.output and rp.audio.output.format:
-            client_out_rate = getattr(rp.audio.output.format, "rate", None)
-        if client_out_rate is None:
+            client_format = rp.audio.output.format
+        if client_format is None:
             audio_cfg = st.runtime_config.session.audio
             if audio_cfg is not None and audio_cfg.output is not None:
-                client_out_rate = getattr(audio_cfg.output.format, "rate", None) or PIPELINE_SAMPLE_RATE
-            else:
-                client_out_rate = PIPELINE_SAMPLE_RATE
-        audio = resample(audio, PIPELINE_SAMPLE_RATE, client_out_rate)
+                client_format = audio_cfg.output.format
+        audio = encode_client_audio(audio, client_format, PIPELINE_SAMPLE_RATE)
         b64 = base64.b64encode(audio).decode("ascii")
         events.append(
             ResponseAudioDeltaEvent(
