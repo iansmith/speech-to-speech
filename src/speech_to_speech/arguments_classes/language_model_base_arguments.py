@@ -37,6 +37,24 @@ class LanguageModelBaseArguments:
             "language (e.g. 'Please reply to my message in French.'). Default is False."
         },
     )
+    context_provider_url: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional HTTP endpoint POSTed once per turn, after the transcript is final and "
+            "before generation, to enrich the conversation with context the pipeline cannot know "
+            "(caller identity, prior sessions, application state). Returns items to append. Unset "
+            "disables the feature entirely. Failures are non-fatal: the turn generates without "
+            "enrichment rather than failing."
+        },
+    )
+    context_provider_timeout_ms: int = field(
+        default=300,
+        metadata={
+            "help": "Timeout for context_provider_url, in milliseconds. This sits on the critical path "
+            "between the caller finishing speaking and the model starting, so it is deliberately short. "
+            "Default is 300."
+        },
+    )
     compact_history: bool = field(
         default=True,
         metadata={
