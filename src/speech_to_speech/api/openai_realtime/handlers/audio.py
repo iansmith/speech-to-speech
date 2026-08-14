@@ -14,7 +14,7 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.api.openai_realtime.utils import decode_client_audio, encode_client_audio
+from speech_to_speech.api.openai_realtime.utils import decode_client_audio, encode_client_audio, resample
 from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
 
 if TYPE_CHECKING:
@@ -57,7 +57,31 @@ class AudioHandler(RealtimeBaseHandler):
 
         audio_cfg = st.runtime_config.session.audio
         client_format = audio_cfg.input.format if audio_cfg is not None and audio_cfg.input is not None else None
+        # decode_client_audio does BOTH halves of the job: it expands a G.711
+        # codec (mu-law / A-law) to PCM16 *and* resamples to PIPELINE_SAMPLE_RATE.
+        # So the audio handed to append_pcm below is already at the pipeline rate,
+        # which is why PIPELINE_SAMPLE_RATE is passed as src_rate rather than the
+        # client's declared rate -- append_pcm's own resample is then a no-op.
+        #
+        # Doing the decode HERE and not inside append_pcm is deliberate: a codec
+        # is a property of the WebSocket session's declared format, while the
+        # WebRTC transport hands append_pcm PCM it has already decoded from media
+        # frames. Pushing the codec down into the shared path would make WebRTC
+        # carry a format concept it does not have.
         pcm_bytes = decode_client_audio(pcm_bytes, client_format, PIPELINE_SAMPLE_RATE)
+        return self.append_pcm(conn_id, pcm_bytes, PIPELINE_SAMPLE_RATE)
+
+    def append_pcm(self, conn_id: str, pcm_bytes: bytes, src_rate: int) -> list[bytes]:
+        """Resample raw PCM16 to the pipeline rate and split into 512-sample chunks for the VAD.
+
+        Shared by both transports: the WebSocket route feeds it decoded
+        ``input_audio_buffer.append`` payloads, the WebRTC transport feeds it
+        PCM decoded from inbound media-track frames. Keeps the sub-chunk
+        remainder and the commit bookkeeping (``audio_buffer_has_data``) in
+        one place regardless of how audio arrives.
+        """
+        st = self._state(conn_id)
+        pcm_bytes = resample(pcm_bytes, src_rate, PIPELINE_SAMPLE_RATE)
 
         pcm_bytes = st.audio_remainder + pcm_bytes
 
@@ -147,14 +171,19 @@ class AudioHandler(RealtimeBaseHandler):
 
     # ── Outbound audio encoding ──────────────────
 
-    def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
-        """Encode a raw PCM audio chunk, emitting ResponseCreated on the first chunk.
+    def begin_audio_response(self, conn_id: str) -> tuple[str, str, list[ServerEvent]]:
+        """Ensure a response exists for outbound audio, emitting ResponseCreated once.
 
         When ``handle_response_create`` already allocated the response,
         ``current_response_id`` is set and no duplicate event is emitted.
         For the implicit-response path (VAD -> STT -> LLM -> TTS, no
         ``response.create``), ``current_response_id`` is still ``None``
         and the event is emitted here on the first audio chunk.
+
+        Returns ``(response_id, item_id, events)``. Shared by both
+        transports: the WebSocket path appends the base64 audio delta to the
+        returned events, the WebRTC path sends only the bookkeeping events
+        over the data channel while audio travels on the media track.
         """
         response = self._service.response
         st = self._state(conn_id)
@@ -170,6 +199,14 @@ class AudioHandler(RealtimeBaseHandler):
                     response=response._build_response(conn_id, "in_progress"),
                 )
             )
+        return resp_id, item_id, events
+
+    def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
+        """Encode a raw PCM audio chunk as a base64 delta event for the WebSocket transport."""
+        response = self._service.response
+        st = self._state(conn_id)
+
+        resp_id, item_id, events = self.begin_audio_response(conn_id)
         rp = st.current_response_params
         client_format = None
         if rp and rp.audio and rp.audio.output and rp.audio.output.format:
