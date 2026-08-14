@@ -39,6 +39,7 @@ from speech_to_speech.LLM.chat import (
     make_system_message,
     make_user_message,
 )
+from speech_to_speech.LLM.context_provider import fetch_context_items
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
@@ -167,6 +168,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         enable_thinking: bool = False,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
+        context_provider_url: str | None = None,
+        context_provider_timeout_ms: int = 300,
         compact_history: bool = False,
         **_kwargs: Any,
     ) -> None:
@@ -178,6 +181,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.enable_thinking = enable_thinking
         self.stream_batch_sentences = max(1, stream_batch_sentences)
         self.enable_lang_prompt = enable_lang_prompt
+        self.context_provider_url = context_provider_url
+        self.context_provider_timeout_ms = context_provider_timeout_ms
 
         self._load_model(model_name, device, torch_dtype, gen_kwargs)
 
@@ -539,6 +544,20 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         language_code, lang_name = resolve_auto_language(language_code)
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))
+
+        if self.context_provider_url:
+            # The one seam where a consumer's knowledge can reach the model: the
+            # transcript is final, generation has not started. Fails open by
+            # construction -- fetch_context_items never raises.
+            for item in fetch_context_items(
+                self.context_provider_url,
+                active_chat.to_transformers_chat(),
+                timeout_s=self.context_provider_timeout_ms / 1000.0,
+                turn_id=ctx.turn_id,
+                language_code=language_code,
+                instructions=instructions,
+            ):
+                active_chat.add_item(item)
 
         gen = self.cancel_scope.generation if self.cancel_scope else None
         ctx.cancel_generation = gen
