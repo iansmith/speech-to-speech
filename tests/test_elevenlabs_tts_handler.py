@@ -54,12 +54,23 @@ class _FakeClient:
 
 
 def _handler(monkeypatch, chunks=None, status_code=200, text="", **overrides):
+    """Build a handler wired to a fake client, without touching the network.
+
+    setup() now ends in warmup(), which is a real HTTP call. It is stubbed for
+    the duration of setup only, and the genuine method is re-bound as
+    .real_warmup so the warmup tests below exercise the actual code rather than
+    the stub -- a stub that tested itself would pass no matter what warmup did.
+    """
     monkeypatch.setenv(API_KEY_ENV, "test-key-value")
+    real_warmup = ElevenLabsTTSHandler.warmup
+    monkeypatch.setattr(ElevenLabsTTSHandler, "warmup", lambda self: None)
+
     h = object.__new__(ElevenLabsTTSHandler)
     kwargs = dict(voice_id="voice-abc", api_key_env=API_KEY_ENV)
     kwargs.update(overrides)
     h.setup(Event(), **kwargs)
     h._client = _FakeClient(_FakeResponse(chunks or [], status_code=status_code, text=text))
+    h.real_warmup = real_warmup.__get__(h)
     return h
 
 
@@ -221,3 +232,70 @@ def test_no_latency_line_when_the_turn_carries_no_speech_stop(monkeypatch, caplo
         list(h.process(_tts_input()))
 
     assert not any("Last speech detected to first speech out" in r.message for r in caplog.records)
+
+
+# ── startup warmup ───────────────────────────────────────────────────────────
+#
+# Added after a live call on 2026-08-14 produced a caller-facing silence whose
+# only trace was a 402 in the log: "Free users cannot use library voices via the
+# API." That is a CONFIGURATION error — it would have failed identically on
+# every turn of every call forever — but it was discovered by dialling, because
+# nothing exercised the API until a caller did. Every local TTS handler here
+# warms up at setup; this one did not, so it alone could start "healthy" while
+# being incapable of producing a single sample.
+#
+# The split below is the point. A 4xx is the operator's to fix and must refuse
+# to start. A timeout or a 5xx is the provider having a bad minute, and must NOT
+# stop the fleet coming up — the per-turn path already degrades those to silence
+# for one sentence.
+
+
+def test_warmup_refuses_to_start_on_a_4xx(monkeypatch):
+    """402/401/404 are configuration, and configuration must fail at startup."""
+    h = _handler(monkeypatch, chunks=[], status_code=402, text='{"detail":{"message":"paid plan required"}}')
+    with pytest.raises(ValueError, match="402"):
+        h.real_warmup()
+
+
+def test_warmup_4xx_message_carries_the_provider_text(monkeypatch):
+    """The operator needs the provider's own words. 'TTS warmup failed' sends
+    someone to the wrong place; 'Free users cannot use library voices' does not."""
+    h = _handler(monkeypatch, chunks=[], status_code=402, text='{"detail":{"message":"paid plan required"}}')
+    with pytest.raises(ValueError, match="paid plan required"):
+        h.real_warmup()
+
+
+def test_warmup_tolerates_a_5xx(monkeypatch, caplog):
+    """A provider blip must not stop the fleet from starting."""
+    h = _handler(monkeypatch, chunks=[], status_code=503, text="upstream unavailable")
+    with caplog.at_level(logging.WARNING):
+        h.real_warmup()
+    assert any("503" in r.message for r in caplog.records)
+
+
+def test_warmup_tolerates_a_timeout(monkeypatch, caplog):
+    import httpx as _httpx
+
+    h = _handler(monkeypatch, chunks=[])
+
+    def _timeout(*a, **kw):
+        raise _httpx.TimeoutException("slow")
+
+    h._client.stream = _timeout
+    with caplog.at_level(logging.WARNING):
+        h.real_warmup()
+    assert any("warmup" in r.message.lower() for r in caplog.records)
+
+
+def test_warmup_passes_on_audio(monkeypatch, caplog):
+    h = _handler(monkeypatch, chunks=[_pcm([1] * 320)])
+    with caplog.at_level(logging.INFO):
+        h.real_warmup()
+    assert any("warmed up" in r.message for r in caplog.records)
+
+
+def test_warmup_refuses_when_the_api_returns_no_audio(monkeypatch):
+    """A 200 with an empty body is still a handler that cannot speak."""
+    h = _handler(monkeypatch, chunks=[])
+    with pytest.raises(ValueError, match="no audio"):
+        h.real_warmup()

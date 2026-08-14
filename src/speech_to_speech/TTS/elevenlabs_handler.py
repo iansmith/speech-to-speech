@@ -133,12 +133,82 @@ class ElevenLabsTTSHandler(BaseHandler[TTSInput, Any]):
         self._client = httpx.Client(timeout=httpx.Timeout(self.timeout_s, connect=min(5.0, self.timeout_s)))
 
         logger.info(
-            "ElevenLabs TTS ready: model=%s voice=%s format=%s (key from $%s)",
+            "ElevenLabs TTS configured: model=%s voice=%s format=%s (key from $%s)",
             self.model_id,
             self.voice_id,
             self.output_format,
             api_key_env,
         )
+        self.warmup()
+
+    def warmup(self) -> None:
+        """Synthesize one short phrase at startup, so a configuration error is a
+        refused start rather than a silent phone call.
+
+        This exists because of a real incident. On 2026-08-14 a call reached the
+        caller as pure silence, and the only trace was a 402 in the log: "Free
+        users cannot use library voices via the API." That was CONFIGURATION —
+        it would have failed identically on every turn of every call forever —
+        but nothing exercised the API until a caller did, so the only way to
+        find it was to dial. Every local TTS handler here warms up at setup;
+        without this, the one network handler could alone report healthy while
+        being incapable of producing a single sample.
+
+        The 4xx/5xx split is the substance, not a detail:
+
+        - **4xx (bar 429) refuses to start.** Bad key, unentitled voice, wrong
+          voice ID. The operator has to change something, and the loud version
+          costs one restart where the quiet version costs a phone call.
+        - **5xx, 429 and timeouts only warn.** The provider having a bad minute
+          must not stop the fleet coming up, and the per-turn path already
+          degrades those to silence for one sentence.
+        """
+        try:
+            with self._client.stream(
+                "POST",
+                f"{self.base_url}/text-to-speech/{self.voice_id}/stream",
+                headers={"xi-api-key": self._api_key, "accept": "audio/*"},
+                params=self._params(),
+                json=self._body("Ready."),
+            ) as resp:
+                if resp.status_code != 200:
+                    resp.read()
+                    detail = (resp.text or "")[:300]
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        raise ValueError(
+                            f"ElevenLabs TTS warmup failed: HTTP {resp.status_code} for voice "
+                            f"{self.voice_id!r} using model {self.model_id!r}. This is configuration, "
+                            f"not a transient — it would fail the same way on every call. "
+                            f"The API said: {detail}"
+                        )
+                    logger.warning(
+                        "ElevenLabs TTS warmup got HTTP %s (transient — starting anyway): %s",
+                        resp.status_code,
+                        detail,
+                    )
+                    return
+
+                received = sum(len(chunk) for chunk in resp.iter_bytes(chunk_size=_READ_CHUNK_BYTES))
+
+        except httpx.TimeoutException:
+            logger.warning(
+                "ElevenLabs TTS warmup timed out after %.1fs (transient — starting anyway)",
+                self.timeout_s,
+            )
+            return
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("ElevenLabs TTS warmup could not reach the API (starting anyway): %s", exc)
+            return
+
+        if not received:
+            raise ValueError(
+                f"ElevenLabs TTS warmup: HTTP 200 but no audio for voice {self.voice_id!r}. "
+                f"A handler that cannot produce a sample must not report healthy."
+            )
+
+        logger.info("ElevenLabs TTS warmed up and ready: %d bytes for a one-word phrase", received)
 
     # ── pipeline entry point ────────────────────────────────────────────────
 
