@@ -20,6 +20,7 @@ from openai.types.realtime import (
     SessionUpdateEvent,
 )
 
+from speech_to_speech.LLM.chat_completions_language_model import _to_chat_tools
 from speech_to_speech.LLM.language_model import compose_system_prompt
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
@@ -628,8 +629,20 @@ def create_app(
             return {"warmed": False, "reason": "no chat-completions handler in the pool"}
 
         try:
-            system_prompt, _, _, _, _ = compose_system_prompt(
-                instructions, tools, body.get("tool_choice"), wants_audio=True
+            # tool_choice="none" so the tool PROSE is left out of the system
+            # message, and the tools are passed structurally below instead.
+            #
+            # This mirrors what a real turn sends, and matching it is the whole
+            # job. Measured 2026-08-28, the first version of this endpoint got
+            # it wrong in exactly the way that is invisible: it composed the
+            # prose into the system message and sent no tools array, giving
+            # sys=15927b against the real turn's sys=12504b + tools=3664b. Both
+            # requests succeeded, the warm reported warmed:true, and the call it
+            # was meant to help matched 1024 of 4244 tokens -- a disk chunk,
+            # nothing to do with the warm. Different bytes at position 0 match
+            # nothing, and nothing says so.
+            system_prompt, function_tools, _, _, _ = compose_system_prompt(
+                instructions, tools, "none", wants_audio=True
             )
         except Exception as exc:
             logger.warning("warm: could not compose the system prompt: %s", exc)
@@ -640,12 +653,18 @@ def create_app(
             # max_tokens=1: the point is the prefill, not the answer. The
             # response is discarded; what is wanted is the KV state the backing
             # model keeps behind it.
+            chat_tools = _to_chat_tools(function_tools)
+            create_kwargs: dict[str, Any] = {}
+            if chat_tools is not None:
+                create_kwargs["tools"] = chat_tools
+
             await asyncio.to_thread(
                 lambda: handler.client.chat.completions.create(
                     model=handler.model_name,
                     messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "hi"}],
                     max_tokens=1,
                     stream=False,
+                    **create_kwargs,
                 )
             )
         except Exception as exc:
@@ -653,7 +672,7 @@ def create_app(
             return {"warmed": False, "reason": f"prefill failed: {exc}"}
 
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        logger.info("warm: prefilled %d chars of system prompt in %dms", len(system_prompt), elapsed_ms)
+        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(function_tools), elapsed_ms)
         return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
 
     @app.post("/v1/realtime/calls")

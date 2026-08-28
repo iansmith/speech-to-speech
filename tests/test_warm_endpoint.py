@@ -137,8 +137,19 @@ def test_warm_prefills_with_the_same_prompt_a_turn_would_use(warm_client) -> Non
     system = sent[0]["messages"][0]
     assert system["role"] == "system"
 
-    expected, *_ = compose_system_prompt("You are Sophie.", TOOLS, None, wants_audio=True)
+    # tool_choice "none" for the PROSE, tools passed structurally -- the split a
+    # real turn uses. This assertion previously compared against a compose with
+    # tool_choice=None, which is a different system message, and it passed while
+    # the endpoint prefilled a prompt no call would ever send: sys=15927b here
+    # against the real turn's 12504b + a separate tools array. Both requests
+    # succeeded and the warm bought nothing.
+    expected, _, _, _, _ = compose_system_prompt("You are Sophie.", TOOLS, "none", wants_audio=True)
     assert system["content"] == expected
+    assert "list_upcoming_actions" not in system["content"], "tool prose belongs in the tools array, not the system message"
+
+    # Tools travel structurally, as _request sends them.
+    assert "tools" in sent[0]
+    assert any(t["function"]["name"] == "list_upcoming_actions" for t in sent[0]["tools"])
 
     # One token: the answer is discarded, the KV state behind it is the point.
     assert sent[0]["max_tokens"] == 1
