@@ -9,6 +9,7 @@ from typing import Any, Callable, TypeVar
 
 import numpy as np
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from openai.types.realtime import RealtimeFunctionTool
 from openai.types.realtime import (
     ConversationItemCreateEvent,
     InputAudioBufferAppendEvent,
@@ -19,6 +20,7 @@ from openai.types.realtime import (
     SessionUpdateEvent,
 )
 
+from speech_to_speech.LLM.language_model import compose_system_prompt
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import (
@@ -404,6 +406,21 @@ async def _dispatch_client_event(
         unit.response_playing.clear()
 
 
+def _first_llm_handler(pool: list[PipelineUnit]) -> Any | None:
+    """The first pipeline unit's chat-completions handler, or None.
+
+    Any unit will do: the warm targets the BACKING model's prefix cache, which
+    is shared across units, so this deliberately does not try to claim an idle
+    one. Claiming would make a cache warm compete with a real call for a
+    pipeline, which is exactly backwards.
+    """
+    for unit in pool:
+        for h in unit.handlers:
+            if hasattr(h, "client") and hasattr(h, "model_name"):
+                return h
+    return None
+
+
 def create_app(
     pool: list[PipelineUnit],
     stop_event: ThreadingEvent,
@@ -566,6 +583,78 @@ def create_app(
             "in_use": sum(1 for u in pool if u.session is not None),
             "units": [_state(u) for u in pool],
         }
+
+    @app.post("/v1/warm")
+    async def warm_endpoint(request: Request) -> dict[str, Any]:
+        """Prefill the backing model's prefix cache for a session that has not started.
+
+        A caller that knows a conversation is coming -- but is busy doing
+        something else first, such as playing a recorded introduction down the
+        phone -- can spend that dead time here instead of making the caller
+        spend it later.
+
+        Measured on the consumer that asked for this: the system message alone
+        is ~12.5KB, about 3100 of a first turn's 4244 tokens, and a cold prefill
+        of that runs ~47 seconds at the observed 89 tok/s. The caller hears
+        silence for all of it and reasonably concludes the line is dead.
+
+        The prompt is composed by compose_system_prompt, the same function the
+        real turn uses, and that sharing is not tidiness -- prefix matching
+        starts at position 0 and the system message IS position 0, so a warm
+        built from a second copy of that logic would match nothing while
+        appearing to succeed.
+
+        Fails open. A warm is an optimisation; nothing it can do is worth
+        failing a call that has not started yet, so every error becomes a
+        reported status rather than a raised one.
+        """
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return {"warmed": False, "reason": f"bad request body: {exc}"}
+
+        instructions = body.get("instructions")
+        if not isinstance(instructions, str) or not instructions:
+            return {"warmed": False, "reason": "no instructions"}
+
+        raw_tools = body.get("tools") or []
+        try:
+            tools = [RealtimeFunctionTool(**t) if isinstance(t, dict) else t for t in raw_tools]
+        except Exception as exc:
+            return {"warmed": False, "reason": f"tools did not parse: {exc}"}
+
+        handler = _first_llm_handler(pool)
+        if handler is None:
+            return {"warmed": False, "reason": "no chat-completions handler in the pool"}
+
+        try:
+            system_prompt, _, _, _, _ = compose_system_prompt(
+                instructions, tools, body.get("tool_choice"), wants_audio=True
+            )
+        except Exception as exc:
+            logger.warning("warm: could not compose the system prompt: %s", exc)
+            return {"warmed": False, "reason": f"compose failed: {exc}"}
+
+        started = time.monotonic()
+        try:
+            # max_tokens=1: the point is the prefill, not the answer. The
+            # response is discarded; what is wanted is the KV state the backing
+            # model keeps behind it.
+            await asyncio.to_thread(
+                lambda: handler.client.chat.completions.create(
+                    model=handler.model_name,
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "hi"}],
+                    max_tokens=1,
+                    stream=False,
+                )
+            )
+        except Exception as exc:
+            logger.warning("warm: prefill request failed: %s", exc)
+            return {"warmed": False, "reason": f"prefill failed: {exc}"}
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info("warm: prefilled %d chars of system prompt in %dms", len(system_prompt), elapsed_ms)
+        return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
 
     @app.post("/v1/realtime/calls")
     async def webrtc_calls_endpoint(request: Request) -> Response:
