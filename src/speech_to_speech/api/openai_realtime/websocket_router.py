@@ -33,6 +33,7 @@ from speech_to_speech.api.openai_realtime.transports import (
     WebSocketTransport,
     send_ws_event,
 )
+from speech_to_speech.stall import StallClips, StallTimer
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -426,7 +427,14 @@ def create_app(
     pool: list[PipelineUnit],
     stop_event: ThreadingEvent,
     llm_proxy_config: LLMProxyConfig | None = None,
+    stall_audio_dir: str | None = None,
+    stall_after_ms: int = 5000,
 ) -> FastAPI:
+    # Loaded once, shared across units: the clips are immutable bytes and the
+    # per-session state that is NOT shared (which phrase came last, when the
+    # wait began) lives in StallTimer, one per unit, below.
+    stall_clips = StallClips.load(stall_audio_dir)
+    stall_after_s = stall_after_ms / 1000.0
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # One send loop per pipeline unit; each polls its own queues and forwards
@@ -827,6 +835,11 @@ def create_app(
         no stale sentinel can leak into the next claim.
         """
         pipeline_log_ctx.set(unit.index)
+
+        # One timer per unit, because "how long has THIS caller been waiting"
+        # is per-session state. The clips themselves are shared and immutable.
+        stall_timer = StallTimer(stall_after_s)
+
         while not stop_event.is_set():
             try:
                 # Snapshot the session once per iteration; if the route releases the
@@ -888,6 +901,34 @@ def create_app(
                                 )
                 except Empty:
                     pass
+
+                # A holding phrase for a caller who has been waiting in silence.
+                #
+                # Armed while a response is expected and nothing has been heard;
+                # disarmed the moment anything goes out. Sent through
+                # encode_audio_chunk, the same path synthesized speech takes, so
+                # the transport needs no special case and the clip is converted
+                # to the client's format like any other audio.
+                #
+                # It deliberately does NOT touch response state, the cancel
+                # scope, or should_listen. This is comfort, not an answer: the
+                # real response must still arrive, and the idle timeout that
+                # catches a backend which never answers has to keep counting.
+                if len(stall_clips) and session_id and transport is not None:
+                    if unit.service._state(session_id).response_pending and not unit.response_playing.is_set():
+                        stall_timer.arm(time.monotonic())
+                    else:
+                        stall_timer.disarm()
+
+                    if stall_timer.due(time.monotonic()):
+                        clip = stall_clips.next_clip()
+                        if clip is not None:
+                            try:
+                                await transport.send_events(unit.service.audio.encode_audio_chunk(session_id, clip))
+                                logger.info("Pipeline %d: holding phrase played (%d bytes)", unit.index, len(clip))
+                            except Exception as exc:
+                                # Never let comfort audio end a call.
+                                logger.warning("Pipeline %d: holding phrase failed: %s", unit.index, exc)
 
                 try:
                     if session is not None and session.pending_output_item is not None:

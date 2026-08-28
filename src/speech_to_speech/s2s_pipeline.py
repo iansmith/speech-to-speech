@@ -426,7 +426,14 @@ def _build_pipeline_handlers(
         queue_in=recv_audio_chunks_queue,
         queue_out=spoken_prompt_queue,
         setup_args=(should_listen,),
-        setup_kwargs=vars(vad_handler_kwargs),
+        # The stall settings ride in VADHandlerArguments because they are
+        # turn-timing, but they are consumed by the realtime send loop and
+        # VADHandler.setup does not take them. Excluded here rather than
+        # swallowed by a **kwargs there, so a genuinely misspelled VAD flag
+        # still fails loudly.
+        setup_kwargs={
+            k: v for k, v in vars(vad_handler_kwargs).items() if k not in ("stall_audio_dir", "stall_after_ms")
+        },
     )
 
     transcription_notifier = TranscriptionNotifier(
@@ -713,6 +720,8 @@ def build_pipeline(
             host=websocket_streamer_kwargs.ws_host,
             port=websocket_streamer_kwargs.ws_port,
             llm_proxy_config=llm_proxy_config,
+            stall_audio_dir=vad_handler_kwargs.stall_audio_dir,
+            stall_after_ms=vad_handler_kwargs.stall_after_ms,
         )
 
         all_handlers: list[Any] = [realtime_server]

@@ -574,7 +574,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 self.context_provider_url,
                 active_chat.to_transformers_chat(),
                 timeout_s=self.context_provider_timeout_ms / 1000.0,
-                turn_id=ctx.turn_id,
+                turn_id=turn_id,
                 language_code=language_code,
                 instructions=instructions,
             ):
