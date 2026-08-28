@@ -143,6 +143,44 @@ class StreamContext(BaseModel):
         return self.cancelled or self.stopped
 
 
+
+def compose_system_prompt(
+    instructions: str,
+    raw_tools: list[Any] | None,
+    tool_choice: Optional[str],
+    *,
+    wants_audio: bool = True,
+) -> tuple[str, list[FunctionTool], Any, Any, Any]:
+    """Build the exact system message a turn will carry.
+
+    Extracted from _apply_instructions so the cache-warming endpoint can
+    reproduce this byte for byte. That it is byte for byte is the whole point:
+    the backing model matches a cached prefix from position 0, and the system
+    message IS position 0, so a warm built from a second, drifting copy of this
+    logic would match nothing and quietly do nothing at all -- the most
+    expensive kind of no-op, because it looks like it is working.
+
+    Returns the composed prompt plus the tool-parsing state the caller needs;
+    the warm path uses only the prompt.
+    """
+    raw_tools = raw_tools or []
+    function_tools = [FunctionTool(**t.model_dump()) for t in raw_tools if t.type == "function"]
+
+    build_system_prompt = build_voice_system_prompt if wants_audio else build_text_system_prompt
+
+    if function_tools and tool_choice != "none":
+        tool_section = build_tool_system_prompt(function_tools, text_only=not wants_audio)
+        return (
+            build_system_prompt(instructions, tool_section=tool_section),
+            function_tools,
+            build_block_regex(),
+            ENTER_CODE,
+            END_CODE,
+        )
+    return build_system_prompt(instructions), function_tools, None, None, None
+
+
+
 class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
     """Abstract base for text-only and vision language model handlers.
 
@@ -267,23 +305,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if not instructions:
             return
 
-        raw_tools = raw_tools or []
-
-        function_tools = [FunctionTool(**t.model_dump()) for t in raw_tools if t.type == "function"]
-
-        build_system_prompt = build_voice_system_prompt if wants_audio else build_text_system_prompt
-
-        if function_tools and tool_choice != "none":
-            tool_section = build_tool_system_prompt(function_tools, text_only=not wants_audio)
-            full_instructions = build_system_prompt(instructions, tool_section=tool_section)
-            block_regex = build_block_regex()
-            enter_code = ENTER_CODE
-            end_code = END_CODE
-        else:
-            full_instructions = build_system_prompt(instructions)
-            block_regex = None
-            enter_code = None
-            end_code = None
+        full_instructions, function_tools, block_regex, enter_code, end_code = compose_system_prompt(
+            instructions, raw_tools, tool_choice, wants_audio=wants_audio
+        )
 
         chat.add_item(make_system_message(full_instructions))
 

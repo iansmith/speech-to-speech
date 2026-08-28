@@ -9,6 +9,7 @@ from typing import Any, Callable, TypeVar
 
 import numpy as np
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from openai.types.realtime import RealtimeFunctionTool
 from openai.types.realtime import (
     ConversationItemCreateEvent,
     InputAudioBufferAppendEvent,
@@ -19,6 +20,8 @@ from openai.types.realtime import (
     SessionUpdateEvent,
 )
 
+from speech_to_speech.LLM.chat_completions_language_model import _to_chat_tools
+from speech_to_speech.LLM.language_model import compose_system_prompt
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import (
@@ -30,6 +33,7 @@ from speech_to_speech.api.openai_realtime.transports import (
     WebSocketTransport,
     send_ws_event,
 )
+from speech_to_speech.stall import StallClips, StallTimer
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -404,11 +408,40 @@ async def _dispatch_client_event(
         unit.response_playing.clear()
 
 
+def _first_llm_handler(pool: list[PipelineUnit]) -> Any | None:
+    """The first pipeline unit's chat-completions handler, or None.
+
+    Any unit will do: the warm targets the BACKING model's prefix cache, which
+    is shared across units, so this deliberately does not try to claim an idle
+    one. Claiming would make a cache warm compete with a real call for a
+    pipeline, which is exactly backwards.
+    """
+    from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+
+    # An exact type check, not duck-typing on client/model_name: those live on
+    # the shared base and ResponsesApiModelHandler has them too. Warming that
+    # one would fire a chat-completions request at a handler whose real turns
+    # go through responses.create -- a prefix no turn will ever match, reported
+    # as warmed:true.
+    for unit in pool:
+        for h in unit.handlers:
+            if isinstance(h, ChatCompletionsApiModelHandler):
+                return h
+    return None
+
+
 def create_app(
     pool: list[PipelineUnit],
     stop_event: ThreadingEvent,
     llm_proxy_config: LLMProxyConfig | None = None,
+    stall_audio_dir: str | None = None,
+    stall_after_ms: int = 5000,
 ) -> FastAPI:
+    # Loaded once, shared across units: the clips are immutable bytes and the
+    # per-session state that is NOT shared (which phrase came last, when the
+    # wait began) lives in StallTimer, one per unit, below.
+    stall_clips = StallClips.load(stall_audio_dir)
+    stall_after_s = stall_after_ms / 1000.0
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # One send loop per pipeline unit; each polls its own queues and forwards
@@ -567,6 +600,116 @@ def create_app(
             "units": [_state(u) for u in pool],
         }
 
+    @app.post("/v1/warm")
+    async def warm_endpoint(request: Request) -> dict[str, Any]:
+        """Prefill the backing model's prefix cache for a session that has not started.
+
+        A caller that knows a conversation is coming -- but is busy doing
+        something else first, such as playing a recorded introduction down the
+        phone -- can spend that dead time here instead of making the caller
+        spend it later.
+
+        Measured on the consumer that asked for this: the system message alone
+        is ~12.5KB, about 3100 of a first turn's 4244 tokens, and a cold prefill
+        of that runs ~47 seconds at the observed 89 tok/s. The caller hears
+        silence for all of it and reasonably concludes the line is dead.
+
+        The prompt is composed by compose_system_prompt, the same function the
+        real turn uses, and that sharing is not tidiness -- prefix matching
+        starts at position 0 and the system message IS position 0, so a warm
+        built from a second copy of that logic would match nothing while
+        appearing to succeed.
+
+        Fails open. A warm is an optimisation; nothing it can do is worth
+        failing a call that has not started yet, so every error becomes a
+        reported status rather than a raised one.
+        """
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return {"warmed": False, "reason": f"bad request body: {exc}"}
+
+        instructions = body.get("instructions")
+        if not isinstance(instructions, str) or not instructions:
+            return {"warmed": False, "reason": "no instructions"}
+
+        raw_tools = body.get("tools") or []
+        try:
+            tools = [RealtimeFunctionTool(**t) if isinstance(t, dict) else t for t in raw_tools]
+        except Exception as exc:
+            return {"warmed": False, "reason": f"tools did not parse: {exc}"}
+
+        handler = _first_llm_handler(pool)
+        if handler is None:
+            return {"warmed": False, "reason": "no chat-completions handler in the pool"}
+
+        try:
+            # tool_choice="none" so the tool PROSE is left out of the system
+            # message, and the tools are passed structurally below instead.
+            #
+            # This mirrors what a real turn sends, and matching it is the whole
+            # job. Measured 2026-08-28, the first version of this endpoint got
+            # it wrong in exactly the way that is invisible: it composed the
+            # prose into the system message and sent no tools array, giving
+            # sys=15927b against the real turn's sys=12504b + tools=3664b. Both
+            # requests succeeded, the warm reported warmed:true, and the call it
+            # was meant to help matched 1024 of 4244 tokens -- a disk chunk,
+            # nothing to do with the warm. Different bytes at position 0 match
+            # nothing, and nothing says so.
+            system_prompt, function_tools, _, _, _ = compose_system_prompt(
+                instructions, tools, "none", wants_audio=True
+            )
+        except Exception as exc:
+            logger.warning("warm: could not compose the system prompt: %s", exc)
+            return {"warmed": False, "reason": f"compose failed: {exc}"}
+
+        started = time.monotonic()
+        try:
+            # max_tokens=1: the point is the prefill, not the answer. The
+            # response is discarded; what is wanted is the KV state the backing
+            # model keeps behind it.
+            chat_tools = _to_chat_tools(function_tools)
+            create_kwargs: dict[str, Any] = {}
+            if chat_tools is not None:
+                create_kwargs["tools"] = chat_tools
+
+            # extra_body, because a real turn sends it and this must match a
+            # real turn byte for byte or it warms a prefix nothing will look up.
+            #
+            # On this deployment it carries chat_template_kwargs
+            # ({"enable_thinking": False}), which the serving stack's chat
+            # template consumes -- so omitting it renders the prefix under
+            # different template kwargs than every actual request. That is the
+            # same silent no-op the tools/prose split already caused once:
+            # succeeds, reports warmed:true, buys nothing.
+            extra_body = getattr(handler, "_extra_body", None)
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+
+            # A warm must not be able to hold a thread for the SDK's 600s
+            # default. It runs in asyncio's shared executor, so a slow or wedged
+            # backend would otherwise starve the pool that live calls draw on.
+            timeout = getattr(handler, "request_timeout", None)
+            if timeout is not None:
+                create_kwargs["timeout"] = timeout
+
+            await asyncio.to_thread(
+                lambda: handler.client.chat.completions.create(
+                    model=handler.model_name,
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "hi"}],
+                    max_tokens=1,
+                    stream=False,
+                    **create_kwargs,
+                )
+            )
+        except Exception as exc:
+            logger.warning("warm: prefill request failed: %s", exc)
+            return {"warmed": False, "reason": f"prefill failed: {exc}"}
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(function_tools), elapsed_ms)
+        return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
+
     @app.post("/v1/realtime/calls")
     async def webrtc_calls_endpoint(request: Request) -> Response:
         """WebRTC SDP handshake (OpenAI GA Realtime 'calls' endpoint).
@@ -719,6 +862,17 @@ def create_app(
         no stale sentinel can leak into the next claim.
         """
         pipeline_log_ctx.set(unit.index)
+
+        # One timer per SESSION, not per unit, and the distinction is the whole
+        # of a bug this replaced. A unit outlives the caller on it: it is
+        # released and reclaimed by the next call. A timer built out here kept
+        # the previous caller's state, so a caller could inherit an already-armed
+        # timer and hear "let me look that up" before waiting at all -- or
+        # inherit a fired one and never hear it. stall_session tracks whose
+        # timer this is, and a change rebuilds it.
+        stall_timer = StallTimer(stall_after_s)
+        stall_session: str | None = None
+
         while not stop_event.is_set():
             try:
                 # Snapshot the session once per iteration; if the route releases the
@@ -780,6 +934,69 @@ def create_app(
                                 )
                 except Empty:
                     pass
+
+                # A holding phrase for a caller who has been waiting in silence.
+                #
+                # Armed while a response is expected and nothing has been heard;
+                # disarmed the moment anything goes out. Sent through
+                # encode_audio_chunk, the same path synthesized speech takes, so
+                # the transport needs no special case and the clip is converted
+                # to the client's format like any other audio.
+                #
+                # It does not touch the cancel scope or should_listen.
+                #
+                # It DOES open the response: encode_audio_chunk goes through
+                # begin_audio_response, which allocates a response id and emits
+                # response.created when none exists. On the implicit
+                # VAD->STT->LLM->TTS path there is no prior response.create, so
+                # the holding phrase is what opens the response the real answer
+                # then joins. That is benign -- the answer joins an open
+                # response rather than opening its own -- but it is not
+                # "touches nothing", which this comment claimed until it was
+                # traced.
+                #
+                # AND IT RESETS THE CALLER-FACING IDLE TIMEOUT. This was
+                # asserted to be impossible and is not. The phrase goes out as
+                # response.output_audio.delta, a backend event; a consumer's
+                # bridge signals activity on every successful backend read and
+                # resets its idle guard on that signal. So a hung backend is
+                # masked for one extra stall_after_ms per pending response.
+                #
+                # Bounded today: StallTimer fires once per pending response, so
+                # the cost is one threshold, not an indefinite reprieve. It
+                # would become unbounded the moment the phrase is made to
+                # repeat, which is why a second-stall feature must solve this
+                # first rather than inherit it.
+                if len(stall_clips) and session_id and transport is not None:
+                    if session_id != stall_session:
+                        stall_timer = StallTimer(stall_after_s)
+                        stall_session = session_id
+
+                    # _state is a bare dict lookup and the conn can be gone
+                    # while unit.session is still set -- the quarantine path
+                    # pops the conn and leaves both in place. An unguarded
+                    # lookup here raised KeyError every tick, and because this
+                    # block sits BEFORE the audio-queue drain, the aborted
+                    # iteration stopped the loop ever observing SESSION_END,
+                    # which is the exact thing quarantine waits on. The unit
+                    # could then never be reclaimed.
+                    st = unit.service._conns.get(session_id)
+                    if st is None:
+                        stall_timer.disarm()
+                    elif st.response_pending and not unit.response_playing.is_set():
+                        stall_timer.arm(time.monotonic())
+                    else:
+                        stall_timer.disarm()
+
+                    if stall_timer.due(time.monotonic()):
+                        clip = stall_clips.next_clip()
+                        if clip is not None:
+                            try:
+                                await transport.send_events(unit.service.audio.encode_audio_chunk(session_id, clip))
+                                logger.info("Pipeline %d: holding phrase played (%d bytes)", unit.index, len(clip))
+                            except Exception as exc:
+                                # Never let comfort audio end a call.
+                                logger.warning("Pipeline %d: holding phrase failed: %s", unit.index, exc)
 
                 try:
                     if session is not None and session.pending_output_item is not None:

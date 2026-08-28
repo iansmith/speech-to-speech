@@ -61,6 +61,18 @@ class VADHandlerArguments:
             "help": "Interval (in seconds) for releasing progressive audio chunks during speech. Default is 0.5s."
         },
     )
+    stall_audio_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Directory of recorded holding phrases (raw PCM s16le mono at the pipeline rate, *.pcm). When set, one is played if the caller has been waiting stall_after_ms with no audio. Unset means silence, as before."
+        },
+    )
+    stall_after_ms: int = field(
+        default=5000,
+        metadata={
+            "help": "How long a caller may wait in silence before a holding phrase plays. Only consulted when stall_audio_dir is set."
+        },
+    )
     speculative_reopen_ms: int = field(
         default=1000,
         metadata={
