@@ -416,9 +416,16 @@ def _first_llm_handler(pool: list[PipelineUnit]) -> Any | None:
     one. Claiming would make a cache warm compete with a real call for a
     pipeline, which is exactly backwards.
     """
+    from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+
+    # An exact type check, not duck-typing on client/model_name: those live on
+    # the shared base and ResponsesApiModelHandler has them too. Warming that
+    # one would fire a chat-completions request at a handler whose real turns
+    # go through responses.create -- a prefix no turn will ever match, reported
+    # as warmed:true.
     for unit in pool:
         for h in unit.handlers:
-            if hasattr(h, "client") and hasattr(h, "model_name"):
+            if isinstance(h, ChatCompletionsApiModelHandler):
                 return h
     return None
 
@@ -666,6 +673,26 @@ def create_app(
             if chat_tools is not None:
                 create_kwargs["tools"] = chat_tools
 
+            # extra_body, because a real turn sends it and this must match a
+            # real turn byte for byte or it warms a prefix nothing will look up.
+            #
+            # On this deployment it carries chat_template_kwargs
+            # ({"enable_thinking": False}), which the serving stack's chat
+            # template consumes -- so omitting it renders the prefix under
+            # different template kwargs than every actual request. That is the
+            # same silent no-op the tools/prose split already caused once:
+            # succeeds, reports warmed:true, buys nothing.
+            extra_body = getattr(handler, "_extra_body", None)
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+
+            # A warm must not be able to hold a thread for the SDK's 600s
+            # default. It runs in asyncio's shared executor, so a slow or wedged
+            # backend would otherwise starve the pool that live calls draw on.
+            timeout = getattr(handler, "request_timeout", None)
+            if timeout is not None:
+                create_kwargs["timeout"] = timeout
+
             await asyncio.to_thread(
                 lambda: handler.client.chat.completions.create(
                     model=handler.model_name,
@@ -836,9 +863,15 @@ def create_app(
         """
         pipeline_log_ctx.set(unit.index)
 
-        # One timer per unit, because "how long has THIS caller been waiting"
-        # is per-session state. The clips themselves are shared and immutable.
+        # One timer per SESSION, not per unit, and the distinction is the whole
+        # of a bug this replaced. A unit outlives the caller on it: it is
+        # released and reclaimed by the next call. A timer built out here kept
+        # the previous caller's state, so a caller could inherit an already-armed
+        # timer and hear "let me look that up" before waiting at all -- or
+        # inherit a fired one and never hear it. stall_session tracks whose
+        # timer this is, and a change rebuilds it.
         stall_timer = StallTimer(stall_after_s)
+        stall_session: str | None = None
 
         while not stop_event.is_set():
             try:
@@ -910,12 +943,47 @@ def create_app(
                 # the transport needs no special case and the clip is converted
                 # to the client's format like any other audio.
                 #
-                # It deliberately does NOT touch response state, the cancel
-                # scope, or should_listen. This is comfort, not an answer: the
-                # real response must still arrive, and the idle timeout that
-                # catches a backend which never answers has to keep counting.
+                # It does not touch the cancel scope or should_listen.
+                #
+                # It DOES open the response: encode_audio_chunk goes through
+                # begin_audio_response, which allocates a response id and emits
+                # response.created when none exists. On the implicit
+                # VAD->STT->LLM->TTS path there is no prior response.create, so
+                # the holding phrase is what opens the response the real answer
+                # then joins. That is benign -- the answer joins an open
+                # response rather than opening its own -- but it is not
+                # "touches nothing", which this comment claimed until it was
+                # traced.
+                #
+                # AND IT RESETS THE CALLER-FACING IDLE TIMEOUT. This was
+                # asserted to be impossible and is not. The phrase goes out as
+                # response.output_audio.delta, a backend event; a consumer's
+                # bridge signals activity on every successful backend read and
+                # resets its idle guard on that signal. So a hung backend is
+                # masked for one extra stall_after_ms per pending response.
+                #
+                # Bounded today: StallTimer fires once per pending response, so
+                # the cost is one threshold, not an indefinite reprieve. It
+                # would become unbounded the moment the phrase is made to
+                # repeat, which is why a second-stall feature must solve this
+                # first rather than inherit it.
                 if len(stall_clips) and session_id and transport is not None:
-                    if unit.service._state(session_id).response_pending and not unit.response_playing.is_set():
+                    if session_id != stall_session:
+                        stall_timer = StallTimer(stall_after_s)
+                        stall_session = session_id
+
+                    # _state is a bare dict lookup and the conn can be gone
+                    # while unit.session is still set -- the quarantine path
+                    # pops the conn and leaves both in place. An unguarded
+                    # lookup here raised KeyError every tick, and because this
+                    # block sits BEFORE the audio-queue drain, the aborted
+                    # iteration stopped the loop ever observing SESSION_END,
+                    # which is the exact thing quarantine waits on. The unit
+                    # could then never be reclaimed.
+                    st = unit.service._conns.get(session_id)
+                    if st is None:
+                        stall_timer.disarm()
+                    elif st.response_pending and not unit.response_playing.is_set():
                         stall_timer.arm(time.monotonic())
                     else:
                         stall_timer.disarm()

@@ -132,3 +132,29 @@ def test_a_new_wait_after_disarm_can_fire_again() -> None:
     t.disarm()
     t.arm(200.0)
     assert t.due(205.0) is True
+
+
+def test_a_timer_must_not_outlive_its_caller() -> None:
+    """A pipeline unit is reclaimed by the next caller; its timer must not be.
+
+    The send loop built one StallTimer per UNIT, and a unit outlives the caller
+    on it. Caller A hangs up mid-response leaving the timer armed; the unit is
+    released and reclaimed by caller B; B's first pending response finds an
+    already-armed timer whose deadline passed minutes ago, and `arm` is
+    idempotent, so `due` is true at once. B hears "let me look that up" before
+    waiting at all. The mirror case is as bad: a timer left `_fired` gives B no
+    phrase ever.
+
+    This asserts the property a fresh timer has, which is what the send loop now
+    builds on a session change.
+    """
+    stale = StallTimer(after_s=5.0)
+    stale.arm(100.0)
+    assert stale.due(105.0) is True
+
+    # What the caller after them must get.
+    fresh = StallTimer(after_s=5.0)
+    assert fresh.due(1000.0) is False, "a new caller's timer must not be armed by the last one"
+    fresh.arm(1000.0)
+    assert fresh.due(1002.0) is False, "and must still owe the full wait"
+    assert fresh.due(1005.0) is True

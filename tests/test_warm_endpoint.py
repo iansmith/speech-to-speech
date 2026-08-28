@@ -99,6 +99,10 @@ class _FakeHandler:
     def __init__(self) -> None:
         self.client = _FakeClient()
         self.model_name = "test-model"
+        # A real handler carries both. The warm omitted them and so warmed a
+        # prefix no real turn would ever send.
+        self._extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        self.request_timeout = 42.0
 
 
 class _FakeUnit:
@@ -176,3 +180,62 @@ def test_warm_fails_open_when_the_model_errors(warm_client, monkeypatch) -> None
     assert resp.status_code == 200
     assert resp.json()["warmed"] is False
     assert "backend down" in resp.json()["reason"]
+
+
+def test_warm_sends_extra_body_because_a_real_turn_does(warm_client) -> None:
+    """extra_body is part of the prefix, not decoration.
+
+    On a deployment where responses_api_disable_thinking is on -- the default
+    against any non-official base_url -- _extra_body carries chat_template_kwargs,
+    which the serving stack's chat template consumes. A warm that omits it
+    renders the prefix under different template kwargs than every real request:
+    it succeeds, reports warmed:true, and buys nothing. Exactly the failure the
+    tools/prose split already caused once.
+    """
+    client, handler = warm_client
+    client.post("/v1/warm", json={"instructions": "You are Sophie."})
+
+    sent = handler.client.chat.completions.calls
+    assert len(sent) == 1
+    assert sent[0]["extra_body"] == handler._extra_body
+
+
+def test_warm_bounds_its_own_request(warm_client) -> None:
+    """A warm runs in asyncio's shared executor.
+
+    Without a timeout it inherits the SDK's 600s default, so a wedged backend
+    holds a pool thread that live calls also draw on. The real turn passes its
+    handler's request_timeout; so does this.
+    """
+    client, handler = warm_client
+    client.post("/v1/warm", json={"instructions": "You are Sophie."})
+
+    sent = handler.client.chat.completions.calls
+    assert sent[0]["timeout"] == handler.request_timeout
+
+
+def test_warm_survives_a_handler_without_the_optional_attributes() -> None:
+    """Neither field may be required: a handler lacking them must still warm."""
+    from threading import Event
+
+    from speech_to_speech.api.openai_realtime import websocket_router as wr
+
+    class _Bare:
+        def __init__(self) -> None:
+            self.client = _FakeClient()
+            self.model_name = "test-model"
+
+    bare = _Bare()
+    original = wr._first_llm_handler
+    wr._first_llm_handler = lambda pool: bare
+    try:
+        client = TestClient(wr.create_app([], Event()))
+        resp = client.post("/v1/warm", json={"instructions": "You are Sophie."})
+    finally:
+        wr._first_llm_handler = original
+
+    assert resp.json()["warmed"] is True
+    sent = bare.client.chat.completions.calls
+    assert len(sent) == 1
+    assert "extra_body" not in sent[0]
+    assert "timeout" not in sent[0]

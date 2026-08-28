@@ -228,4 +228,5 @@ dmypy.json
 .coverage
 cover/
 .tox/
-uv.lock
+uv.lock.DS_Store
+.slopstop/

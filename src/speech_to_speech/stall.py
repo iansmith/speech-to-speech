@@ -18,8 +18,19 @@ Three properties matter, and each is a way this could be worse than nothing:
   loop, which is the exact impression it is trying to prevent.
 * It must never be the last thing said. It promises an answer; if the real
   answer never arrives, the filler has upgraded a silence into a broken
-  promise. The caller-facing timeout stays the backstop, and nothing here may
-  reset it.
+  promise.
+
+  This module used to claim the caller-facing timeout "stays the backstop, and
+  nothing here may reset it". That was wrong, and wrong in the direction that
+  stops anyone checking. The phrase is emitted as a backend audio delta, and a
+  consumer that resets its idle guard on backend activity -- which is the
+  ordinary way to build one -- resets it on the phrase. A hung backend is
+  therefore masked for one extra threshold per pending response.
+
+  Bounded, because StallTimer fires at most once per pending response. It stops
+  being bounded the moment the phrase is allowed to repeat, so a second-stall
+  feature has to solve this rather than inherit it: the phrase would need a
+  marker its consumer can recognise and decline to count as activity.
 """
 
 from __future__ import annotations
