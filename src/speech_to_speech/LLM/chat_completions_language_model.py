@@ -33,6 +33,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     ToolCall,
     Usage,
 )
+from speech_to_speech.LLM import pass_timing
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
 from speech_to_speech.utils.utils import _generate_id
@@ -194,6 +195,17 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         create_kwargs: dict[str, Any] = dict(optional_kwargs)
         if self.stream:
             create_kwargs["stream_options"] = {"include_usage": True}
+        # Stash this pass's identity for the stream iterator, which runs next in
+        # the same serialized call (base `_generate`: `_request` then
+        # `_iter_events`). `last_role` classifies decide vs answer-after-tool.
+        if pass_timing.enabled():
+            self._pass_meta = {
+                "seq": pass_timing.next_seq(),
+                "t_request": time.monotonic(),
+                "last_role": api_input[-1].get("role") if api_input else None,
+                "n_messages": len(api_input),
+                "n_tool_messages": sum(1 for m in api_input if m.get("role") == "tool"),
+            }
         return self.client.chat.completions.create(
             model=self.model_name,
             messages=api_input,  # type: ignore[arg-type]  # runtime dicts match the Chat Completions message shape
@@ -210,15 +222,29 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         tool_accum: dict[int, dict[str, str]] = {}
         usage: Usage | None = None
         raw_text = ""
+        # Per-pass timing capture (opt-in). mlx-serve's `timings` block rides the
+        # usage-bearing trailing chunk, whose `choices` is empty, so read it
+        # before the `continue` below. TTFT is the first chunk carrying content.
+        timing_capture = pass_timing.enabled()
+        timings: dict[str, Any] | None = None
+        t_first_token: float | None = None
         for chunk in api_response:
             # Usage-only trailing chunk (choices == []) when include_usage is set.
             if chunk.usage is not None:
                 usage = Usage(
                     input_tokens=chunk.usage.prompt_tokens or 0, output_tokens=chunk.usage.completion_tokens or 0
                 )
+            if timing_capture:
+                chunk_timings = pass_timing.extract_timings(chunk)
+                if chunk_timings is not None:
+                    timings = chunk_timings
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
+            if timing_capture and t_first_token is None and (
+                delta.content or delta.tool_calls or getattr(delta, "refusal", None)
+            ):
+                t_first_token = time.monotonic()
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     entry = tool_accum.setdefault(tc.index, {"name": "", "args": "", "id": ""})
@@ -236,11 +262,34 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
                 raw_text += text_piece
                 yield TextDelta(text=text_piece)
 
+        if timing_capture:
+            self._emit_pass_timing(timings, t_first_token, usage)
         if raw_text.strip():
             yield AssistantMessage(content=[AssistantContent(type="output_text", text=raw_text)])
         yield from self._tool_calls_from_accum(tool_accum)
         if usage is not None:
             yield usage
+
+    def _emit_pass_timing(
+        self, timings: dict[str, Any] | None, t_first_token: float | None, usage: Usage | None
+    ) -> None:
+        """Write one timing row for the pass just consumed. Best-effort."""
+        meta = getattr(self, "_pass_meta", None)
+        self._pass_meta = None
+        if meta is None:
+            return
+        now = time.monotonic()
+        ttft_ms = (t_first_token - meta["t_request"]) * 1000 if t_first_token is not None else None
+        pass_timing.record(
+            pass_timing.build_row(
+                meta=meta,
+                timings=timings,
+                wall_ms=(now - meta["t_request"]) * 1000,
+                ttft_ms=ttft_ms,
+                prompt_tokens=usage.input_tokens if usage is not None else None,
+                output_tokens=usage.output_tokens if usage is not None else None,
+            )
+        )
 
     def _iter_response_events(self, api_response: Any) -> Iterator[ProviderEvent]:
         usage = api_response.usage
