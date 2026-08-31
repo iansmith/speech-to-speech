@@ -14,7 +14,8 @@ from openai.types.realtime import (
 )
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
-from speech_to_speech.api.openai_realtime.utils import decode_client_audio, encode_client_audio
+from speech_to_speech.api.openai_realtime.input_state import InputItemState
+from speech_to_speech.api.openai_realtime.utils import decode_client_audio, encode_client_audio, resample
 from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
 
 if TYPE_CHECKING:
@@ -31,7 +32,14 @@ CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 class AudioHandler(RealtimeBaseHandler):
     """Owns inbound audio decoding/chunking and outbound audio encoding."""
 
-    def _start_input_item(self, conn_id: str, *, preserve_active_response: bool = False) -> str:
+    def _start_input_item(
+        self,
+        conn_id: str,
+        *,
+        turn_id: str | None = None,
+        turn_revision: int | None = None,
+        preserve_active_response: bool = False,
+    ) -> str:
         response = self._service.response
         st = self._state(conn_id)
         if not preserve_active_response:
@@ -42,11 +50,60 @@ class AudioHandler(RealtimeBaseHandler):
             item_id = response._start_item(conn_id)
             st.current_item_id = response_item_id
             st.content_index = response_content_index
-        st.input_content_index = 0
+        st.current_input_item_id = item_id
+        st.input_items[item_id] = InputItemState()
+        if turn_id is not None:
+            st.input_item_by_turn_revision[(turn_id, turn_revision)] = item_id
         return item_id
 
+    def _reuse_input_item(
+        self,
+        conn_id: str,
+        item_id: str,
+        *,
+        turn_id: str,
+        turn_revision: int | None,
+        preserve_active_response: bool,
+    ) -> str:
+        """Move an incomplete input item to the latest speculative revision."""
+        st = self._state(conn_id)
+        if not preserve_active_response:
+            st.current_item_id = item_id
+            st.content_index = 0
+        st.current_input_item_id = item_id
+        st.input_item_by_turn_revision = {
+            turn: tracked_item_id
+            for turn, tracked_item_id in st.input_item_by_turn_revision.items()
+            if tracked_item_id != item_id
+        }
+        st.input_item_by_turn_revision[(turn_id, turn_revision)] = item_id
+        return item_id
+
+    def release_input_item_state(
+        self,
+        conn_id: str,
+        turn_id: str | None,
+        turn_revision: int | None,
+    ) -> None:
+        """Drop routing state for a direct-audio item without publishing a transcription terminal."""
+        item_id = self._input_item_id(conn_id, turn_id, turn_revision)
+        if item_id is None:
+            return
+        self._release_input_item_state_by_id(conn_id, item_id)
+
+    def _release_input_item_state_by_id(self, conn_id: str, item_id: str) -> None:
+        st = self._state(conn_id)
+        st.input_item_by_turn_revision = {
+            turn: tracked_item_id
+            for turn, tracked_item_id in st.input_item_by_turn_revision.items()
+            if tracked_item_id != item_id
+        }
+        st.input_items.pop(item_id, None)
+        if st.current_input_item_id == item_id:
+            st.current_input_item_id = None
+
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
-        """Decode base64 audio to PCM16 at the pipeline rate, then split into 512-sample chunks for the VAD."""
+        """Decode base64 audio, resample to pipeline rate, and split into 512-sample PCM16 chunks for the VAD."""
         try:
             pcm_bytes = base64.b64decode(event.audio)
         except Exception as e:
@@ -55,9 +112,31 @@ class AudioHandler(RealtimeBaseHandler):
 
         st = self._state(conn_id)
 
+        # Decode the client's declared audio format to PCM16 at the pipeline
+        # rate HERE, where the format object is in hand. The realtime format is
+        # a discriminated union — audio/pcm, audio/pcmu (G.711 mu-law),
+        # audio/pcma (G.711 A-law) — and the G.711 variants carry no `rate`
+        # field (the codec fixes it at 8 kHz), so reading `.rate` and resampling
+        # would misread G.711 bytes as PCM16. decode_client_audio routes through
+        # resolve_format, so append_pcm below is fed PCM16 already at the
+        # pipeline rate and its own resample is a no-op — leaving that shared
+        # helper (WebRTC + service passthrough also call it) untouched.
         audio_cfg = st.runtime_config.session.audio
         client_format = audio_cfg.input.format if audio_cfg is not None and audio_cfg.input is not None else None
         pcm_bytes = decode_client_audio(pcm_bytes, client_format, PIPELINE_SAMPLE_RATE)
+        return self.append_pcm(conn_id, pcm_bytes, PIPELINE_SAMPLE_RATE)
+
+    def append_pcm(self, conn_id: str, pcm_bytes: bytes, src_rate: int) -> list[bytes]:
+        """Resample raw PCM16 to the pipeline rate and split into 512-sample chunks for the VAD.
+
+        Shared by both transports: the WebSocket route feeds it decoded
+        ``input_audio_buffer.append`` payloads, the WebRTC transport feeds it
+        PCM decoded from inbound media-track frames. Keeps the sub-chunk
+        remainder and the commit bookkeeping (``audio_buffer_has_data``) in
+        one place regardless of how audio arrives.
+        """
+        st = self._state(conn_id)
+        pcm_bytes = resample(pcm_bytes, src_rate, PIPELINE_SAMPLE_RATE)
 
         pcm_bytes = st.audio_remainder + pcm_bytes
 
@@ -95,29 +174,38 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
-        if st.in_response and event.interrupt_response and st.runtime_config.interrupt_response_enabled:
+        interrupt_enabled = event.interrupt_response and st.runtime_config.interrupt_response_enabled
+        if st.in_response and interrupt_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))
+        if interrupt_enabled:
+            response.discard_tool_followup_prefetch(conn_id)
+            st.generation_done_tool_calls.clear()
+            st.completed_tool_response_keys.clear()
         is_reopen = bool(event.reopened and event.turn_id is not None and event.turn_id == st.speculative_turn_id)
         preserve_active_response = st.in_response
-        if is_reopen:
-            input_item_id = st.speculative_input_item_id
-            if input_item_id is None:
-                input_item_id = self._start_input_item(
-                    conn_id,
-                    preserve_active_response=preserve_active_response,
-                )
-                st.speculative_input_item_id = input_item_id
-            elif not preserve_active_response:
-                st.current_item_id = input_item_id
-                st.content_index = 0
-            st.input_audio_duration_s = 0.0
-            st.input_content_index = 0
+        previous_input_item_id = (
+            st.input_item_by_turn_revision.get((event.turn_id, st.speculative_turn_revision))
+            if is_reopen and event.turn_id is not None
+            else None
+        )
+        previous_input_item = st.input_items.get(previous_input_item_id) if previous_input_item_id is not None else None
+        if previous_input_item_id is not None and previous_input_item is not None:
+            assert event.turn_id is not None
+            input_item_id = self._reuse_input_item(
+                conn_id,
+                previous_input_item_id,
+                turn_id=event.turn_id,
+                turn_revision=event.turn_revision,
+                preserve_active_response=preserve_active_response,
+            )
         else:
             input_item_id = self._start_input_item(
                 conn_id,
+                turn_id=event.turn_id,
+                turn_revision=event.turn_revision,
                 preserve_active_response=preserve_active_response,
             )
-            st.speculative_input_item_id = input_item_id
+        if not is_reopen:
             st.response_usage.turns += 1
         st.speculative_turn_id = event.turn_id
         st.speculative_turn_revision = event.turn_revision
@@ -134,34 +222,55 @@ class AudioHandler(RealtimeBaseHandler):
 
     def on_speech_stopped(self, conn_id: str, event: SpeechStoppedEvent) -> list[ServerEvent]:
         """Handle VAD speech_stopped: record duration and emit stopped event."""
+        st = self._state(conn_id)
+        item_id = self._input_item_id(conn_id, event.turn_id, event.turn_revision)
+        if item_id is None:
+            logger.debug(
+                "Ignoring speech stop for unknown turn=%s rev=%s",
+                event.turn_id,
+                event.turn_revision,
+            )
+            return []
         if event.duration_s:
-            self._state(conn_id).input_audio_duration_s = event.duration_s
+            st.input_audio_duration_s = event.duration_s
+            input_item = st.input_items.get(item_id)
+            if input_item is not None:
+                input_item.audio_duration_s = event.duration_s
         return [
             InputAudioBufferSpeechStoppedEvent(
                 type="input_audio_buffer.speech_stopped",
                 event_id=self._next_event_id(),
                 audio_end_ms=event.audio_end_ms,
-                item_id=self._input_item_id(conn_id),
+                item_id=item_id,
             )
         ]
 
     # ── Outbound audio encoding ──────────────────
 
-    def encode_audio_chunk(self, conn_id: str, audio: bytes) -> list[ServerEvent]:
-        """Encode a raw PCM audio chunk, emitting ResponseCreated on the first chunk.
+    def begin_audio_response(
+        self,
+        conn_id: str,
+        response_key: str | None = None,
+    ) -> tuple[str, str, list[ServerEvent]]:
+        """Ensure a response exists for outbound audio, emitting ResponseCreated once.
 
         When ``handle_response_create`` already allocated the response,
         ``current_response_id`` is set and no duplicate event is emitted.
         For the implicit-response path (VAD -> STT -> LLM -> TTS, no
         ``response.create``), ``current_response_id`` is still ``None``
         and the event is emitted here on the first audio chunk.
+
+        Returns ``(response_id, item_id, events)``. Shared by both
+        transports: the WebSocket path appends the base64 audio delta to the
+        returned events, the WebRTC path sends only the bookkeeping events
+        over the data channel while audio travels on the media track.
         """
         response = self._service.response
         st = self._state(conn_id)
 
         events: list[ServerEvent] = []
         need_created = st.current_response_id is None
-        resp_id, item_id = response._ensure_response(conn_id)
+        resp_id, item_id = response._ensure_response(conn_id, response_key)
         if need_created:
             events.append(
                 ResponseCreatedEvent(
@@ -170,6 +279,43 @@ class AudioHandler(RealtimeBaseHandler):
                     response=response._build_response(conn_id, "in_progress"),
                 )
             )
+        self._service._apply_pending_token_usage(conn_id, response_key)
+        return resp_id, item_id, events
+
+    def begin_audio_output(
+        self,
+        conn_id: str,
+        response_key: str | None = None,
+    ) -> tuple[str, str, int, list[ServerEvent]]:
+        """Ensure an audio response and reserve its assistant output identity."""
+        resp_id, item_id, events = self.begin_audio_response(conn_id, response_key)
+        st = self._state(conn_id)
+        assistant_item_id, output_index = self._service.response._ensure_assistant_output_item(
+            conn_id,
+            item_id,
+        )
+        st.audio_output_started = True
+        return resp_id, assistant_item_id, output_index, events
+
+    def encode_audio_chunk(
+        self,
+        conn_id: str,
+        audio: bytes,
+        response_key: str | None = None,
+    ) -> list[ServerEvent]:
+        """Encode a raw PCM audio chunk as a base64 delta event for the WebSocket transport."""
+        response = self._service.response
+        st = self._state(conn_id)
+
+        resp_id, assistant_item_id, assistant_output_index, events = self.begin_audio_output(
+            conn_id,
+            response_key,
+        )
+        # Encode outbound PCM16 to the client's declared format — the response's
+        # own format wins, else the session default. Pass the format object, not
+        # a rate: encode_client_audio resolves G.711 (audio/pcmu / audio/pcma,
+        # 8 kHz, no `rate` field) as well as linear PCM. A None format encodes as
+        # linear PCM at the pipeline rate, unchanged from before G.711.
         rp = st.current_response_params
         client_format = None
         if rp and rp.audio and rp.audio.output and rp.audio.output.format:
@@ -186,8 +332,8 @@ class AudioHandler(RealtimeBaseHandler):
                 event_id=self._next_event_id(),
                 content_index=response._next_content_index(conn_id),
                 delta=b64,
-                item_id=item_id,
-                output_index=0,
+                item_id=assistant_item_id,
+                output_index=assistant_output_index,
                 response_id=resp_id,
             )
         )
