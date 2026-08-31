@@ -495,6 +495,29 @@ async def _dispatch_client_event(
         unit.response_playing.clear()
 
 
+def _first_llm_handler(pool: list[PipelineUnit]) -> Any | None:
+    """The pool's chat-completions handler, or None if it has no mlx path.
+
+    An EXACT type check, not duck-typing on client/model_name: those live on the
+    shared BaseOpenAICompatibleHandler and ResponsesApiModelHandler carries them
+    too. Warming that one would fire a chat-completions request at a handler
+    whose real turns go through responses.create -- a prefix no turn will ever
+    match, reported as warmed:true. A deployment with no chat-completions
+    handler at all (only the Responses path, or none) simply has nothing to
+    warm this way, and /v1/warm declines rather than pretending otherwise.
+
+    Any pool unit's handler serves: the prefix cache is the backing model's, not
+    a unit's, so warming through one warms it for all.
+    """
+    from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+
+    for unit in pool:
+        for h in unit.handlers:
+            if isinstance(h, ChatCompletionsApiModelHandler):
+                return h
+    return None
+
+
 def create_app(
     pool: list[PipelineUnit],
     stop_event: ThreadingEvent,
@@ -660,6 +683,122 @@ def create_app(
             "in_use": sum(1 for u in pool if u.session is not None),
             "units": [_state(u) for u in pool],
         }
+
+    @app.post("/v1/warm")
+    async def warm_endpoint(request: Request) -> dict[str, Any]:
+        """Prefill the backing model's prefix cache for a session not yet started.
+
+        A caller that knows a conversation is coming -- but is busy first, such
+        as playing a recorded introduction down the phone, or has just cold-
+        booted the model plane -- can spend that dead time here instead of
+        making the caller spend it on the first greeting.
+
+        The system message is composed by build_voice_system_prompt, the SAME
+        function BaseOpenAICompatibleHandler._apply_config runs for a real turn,
+        and that sharing is the whole job, not tidiness: the backing model
+        matches a cached prefix from position 0, the system message IS position
+        0, and a warm built from a second copy of that logic would match
+        nothing while reporting warmed:true. The tools travel structurally --
+        as chat-completions tool params -- exactly as the live mlx path sends
+        them, NOT as prose in the prompt; a `session.update`'s tools reach here
+        unchanged and go through the same _to_chat_tools the real request uses.
+
+        The byte-perfect match assumes the live turn composes the same way:
+        default `enable_lang_prompt=False` (so `_apply_config` passes
+        `language_name=None`, as this does) and an audio-modality turn (so it
+        uses the voice builder, not the text one). A phone greeting is both. If
+        a deployment enables the language prompt and a language is detected, the
+        live prefix gains a language block after the session prompt -- the
+        expensive session-prompt prefill still hits, only the tail past it does
+        not.
+
+        Fails open. A warm is an optimisation; nothing it can do is worth
+        failing a call that has not started yet, so every error becomes a
+        reported status rather than a raised one.
+        """
+        from speech_to_speech.LLM.chat_completions_language_model import _to_chat_tools
+        from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
+
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return {"warmed": False, "reason": f"bad request body: {exc}"}
+        # Fail open on a non-object body too: valid JSON that is null/list/scalar
+        # would otherwise make body.get raise AttributeError and 500 -- the exact
+        # thing a warm must never do to a call that has not started.
+        if not isinstance(body, dict):
+            return {"warmed": False, "reason": "body is not a JSON object"}
+
+        instructions = body.get("instructions")
+        if not isinstance(instructions, str) or not instructions:
+            return {"warmed": False, "reason": "no instructions"}
+
+        raw_tools = body.get("tools") or []
+
+        handler = _first_llm_handler(pool)
+        if handler is None:
+            return {"warmed": False, "reason": "no chat-completions handler in the pool"}
+
+        try:
+            # No tool_section: the mlx chat-completions path puts tool prose
+            # nowhere in the system message and sends the tools structurally
+            # below. language_name is left at its default -- a warm has no
+            # session-language yet, and a session with none composes the same
+            # way, so the lead + session-prompt prefix (the expensive ~12.5KB)
+            # matches regardless.
+            system_prompt = build_voice_system_prompt(instructions)
+        except Exception as exc:
+            logger.warning("warm: could not compose the system prompt: %s", exc)
+            return {"warmed": False, "reason": f"compose failed: {exc}"}
+
+        started = time.monotonic()
+        try:
+            create_kwargs: dict[str, Any] = {}
+
+            # Tools structurally, through the SAME converter a real turn uses
+            # (_build_chat_optional_kwargs -> _to_chat_tools), so the rendered
+            # prefix carries the identical tools block.
+            chat_tools = _to_chat_tools(raw_tools)
+            if chat_tools is not None:
+                create_kwargs["tools"] = chat_tools
+
+            # extra_body, because a real turn sends it and this must match a
+            # real turn or it warms a prefix nothing looks up. On this
+            # deployment it carries chat_template_kwargs, which the serving
+            # stack's chat template consumes -- so omitting it renders the
+            # prefix under different template kwargs than every actual request.
+            extra_body = getattr(handler, "_extra_body", None)
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+
+            # A warm must not hold a thread for the SDK's 600s default: it runs
+            # off the event loop in a worker thread, so a wedged backend would
+            # otherwise starve the pool that live calls draw on.
+            timeout = getattr(handler, "request_timeout", None)
+            if timeout is not None:
+                create_kwargs["timeout"] = timeout
+
+            # max_tokens=1: the point is the prefill, not the answer. The
+            # response is discarded; the KV state behind it is what is wanted.
+            await asyncio.to_thread(
+                lambda: handler.client.chat.completions.create(
+                    model=handler.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "hi"},
+                    ],
+                    max_tokens=1,
+                    stream=False,
+                    **create_kwargs,
+                )
+            )
+        except Exception as exc:
+            logger.warning("warm: prefill request failed: %s", exc)
+            return {"warmed": False, "reason": f"prefill failed: {exc}"}
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(raw_tools), elapsed_ms)
+        return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
 
     @app.post("/v1/realtime/calls")
     async def webrtc_calls_endpoint(request: Request) -> Response:
