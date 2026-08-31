@@ -26,7 +26,6 @@ from speech_to_speech.LLM.voice_prompt import (
     build_voice_system_prompt,
 )
 
-
 TOOLS = [
     {
         "type": "function",
@@ -221,9 +220,9 @@ def test_first_llm_handler_skips_the_responses_sibling() -> None:
     chat-completions request at a handler whose real turns go through
     responses.create -- a prefix no turn matches, reported as warmed:true.
     """
+    from speech_to_speech.api.openai_realtime import websocket_router as wr
     from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
     from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
-    from speech_to_speech.api.openai_realtime import websocket_router as wr
 
     class _Unit:
         def __init__(self, handlers: list[Any]) -> None:
