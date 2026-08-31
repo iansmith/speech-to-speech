@@ -703,6 +703,15 @@ def create_app(
         them, NOT as prose in the prompt; a `session.update`'s tools reach here
         unchanged and go through the same _to_chat_tools the real request uses.
 
+        The byte-perfect match assumes the live turn composes the same way:
+        default `enable_lang_prompt=False` (so `_apply_config` passes
+        `language_name=None`, as this does) and an audio-modality turn (so it
+        uses the voice builder, not the text one). A phone greeting is both. If
+        a deployment enables the language prompt and a language is detected, the
+        live prefix gains a language block after the session prompt -- the
+        expensive session-prompt prefill still hits, only the tail past it does
+        not.
+
         Fails open. A warm is an optimisation; nothing it can do is worth
         failing a call that has not started yet, so every error becomes a
         reported status rather than a raised one.
@@ -714,6 +723,11 @@ def create_app(
             body = await request.json()
         except Exception as exc:
             return {"warmed": False, "reason": f"bad request body: {exc}"}
+        # Fail open on a non-object body too: valid JSON that is null/list/scalar
+        # would otherwise make body.get raise AttributeError and 500 -- the exact
+        # thing a warm must never do to a call that has not started.
+        if not isinstance(body, dict):
+            return {"warmed": False, "reason": "body is not a JSON object"}
 
         instructions = body.get("instructions")
         if not isinstance(instructions, str) or not instructions:

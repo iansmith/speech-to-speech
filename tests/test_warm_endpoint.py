@@ -154,6 +154,22 @@ def test_warm_fails_open_without_instructions(warm_client) -> None:
     assert handler.client.chat.completions.calls == []
 
 
+@pytest.mark.parametrize("body", [None, [], "hi", 5])
+def test_warm_fails_open_on_a_non_object_body(warm_client, body) -> None:
+    """Valid JSON that is not an object must decline, not 500.
+
+    body.get on a null/list/scalar raises AttributeError; unguarded it becomes a
+    500, which is exactly the failure a warm must never inflict on a call that
+    has not started.
+    """
+    client, handler = warm_client
+    resp = client.post("/v1/warm", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["warmed"] is False
+    assert resp.json()["reason"]
+    assert handler.client.chat.completions.calls == []
+
+
 def test_warm_fails_open_when_the_model_errors(warm_client, monkeypatch) -> None:
     """A prefill request that raises becomes a reported status, never a 500."""
     client, handler = warm_client
@@ -194,6 +210,33 @@ def test_warm_bounds_its_own_request(warm_client) -> None:
 
     sent = handler.client.chat.completions.calls
     assert sent[0]["timeout"] == handler.request_timeout
+
+
+def test_first_llm_handler_skips_the_responses_sibling() -> None:
+    """The exact-isinstance check is the point: warm only the chat-completions
+    handler, never its ResponsesApiModelHandler sibling.
+
+    Both subclass BaseOpenAICompatibleHandler and carry .client/.model_name, so
+    duck-typing on those would pick the Responses handler and fire a
+    chat-completions request at a handler whose real turns go through
+    responses.create -- a prefix no turn matches, reported as warmed:true.
+    """
+    from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+    from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
+    from speech_to_speech.api.openai_realtime import websocket_router as wr
+
+    class _Unit:
+        def __init__(self, handlers: list[Any]) -> None:
+            self.handlers = handlers
+
+    # __new__ bypasses __init__: _first_llm_handler only ever does isinstance.
+    responses = ResponsesApiModelHandler.__new__(ResponsesApiModelHandler)
+    chat = ChatCompletionsApiModelHandler.__new__(ChatCompletionsApiModelHandler)
+
+    # A pool whose only handler is the Responses sibling: skipped, so None.
+    assert wr._first_llm_handler([_Unit([responses])]) is None
+    # With a chat-completions handler present, that one is returned.
+    assert wr._first_llm_handler([_Unit([responses]), _Unit([responses, chat])]) is chat
 
 
 def test_warm_survives_a_handler_without_the_optional_attributes(monkeypatch) -> None:
