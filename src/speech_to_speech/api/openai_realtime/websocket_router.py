@@ -797,9 +797,7 @@ def create_app(
             return {"warmed": False, "reason": f"prefill failed: {exc}"}
 
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        logger.info(
-            "warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(raw_tools), elapsed_ms
-        )
+        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(raw_tools), elapsed_ms)
         return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
 
     @app.post("/v1/realtime/calls")
