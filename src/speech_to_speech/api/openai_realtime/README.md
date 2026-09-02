@@ -292,7 +292,7 @@ sequenceDiagram
     SendLoop->>Client: response.output_audio_transcript.done (if transcript started)
     SendLoop->>Client: response.done (status=cancelled, reason=turn_detected)
     SendLoop->>Client: input_audio_buffer.speech_started
-    SendLoop->>SendLoop: cancel_scope.cancel() (gen++ & discarding=True)
+    SendLoop->>SendLoop: cancel_scope.cancel() (gen++, discarding=True, run armed aborts)
     SendLoop->>SendLoop: flush output_queue + text_output_queue
     SendLoop->>SendLoop: response_playing.clear()
     LLM->>LLM: is_stale(gen) → True, aborts generation

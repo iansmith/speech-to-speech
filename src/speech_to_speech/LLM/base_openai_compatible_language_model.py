@@ -587,15 +587,20 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     # ── consumption ─────────────────────────────────────────────────────────--
 
     def _abort_safe_events(self, events: Iterator[ProviderEvent], turn: _Turn) -> Iterator[ProviderEvent]:
-        """Yield from ``events``, swallowing the error a cancel-triggered close raises.
+        """Yield from ``events``, swallowing any in-flight error once the turn is cancelled.
 
-        When a barge-in closes the provider response out from under a blocked
-        read, the read surfaces a provider/transport error. On a cancelled turn
-        that error *is* the interruption, so end iteration quietly rather than
-        letting it reach ``_generate`` as a spurious generation failure (which
-        would log a fault and tag EndOfResponse with an error for a response the
-        caller deliberately cut off). An error on a turn that is *not* cancelled
-        is a real fault and propagates unchanged.
+        The error this exists for is the one a barge-in raises: ``cancel()``
+        closes the provider response out from under a blocked read, and the read
+        surfaces a provider/transport error. On a cancelled turn that error *is*
+        the interruption, so end iteration quietly rather than letting it reach
+        ``_generate`` as a spurious generation failure (which would log a fault
+        and tag EndOfResponse with an error for a response the caller
+        deliberately cut off). The guard is ``_turn_is_cancelled``, not the
+        error's identity, so a genuine provider fault (say a 500) that arrives
+        after the barge-in is likewise treated as the interruption and its
+        already-discarded output dropped -- correct, since a cancelled turn emits
+        nothing either way. An error on a turn that is *not* cancelled is a real
+        fault and propagates unchanged.
         """
         try:
             yield from events
@@ -1047,9 +1052,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
             history_commit_fn = commit_audio_history
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # CancelScope.is_stale(gen) is checked when the stream iterator advances. A
+        # read blocked inside httpx between provider events would not see that on
+        # its own, so _generate arms api_response.close on the cancel scope
+        # (register_abort) for the non-prefetch path: cancel_scope.cancel() from the
+        # websocket router then closes the in-flight response and unblocks the read.
+        # request_timeout_s / ReadTimeout remain the fallback when a response
+        # exposes no close.
         turn = _Turn(
             language_code=language_code,
             gen=gen,
@@ -1142,9 +1151,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # CancelScope.is_stale(gen) is checked when the stream iterator advances. A
+        # read blocked inside httpx between provider events would not see that on
+        # its own, so _generate arms api_response.close on the cancel scope
+        # (register_abort) for the non-prefetch path: cancel_scope.cancel() from the
+        # websocket router then closes the in-flight response and unblocks the read.
+        # request_timeout_s / ReadTimeout remain the fallback when a response
+        # exposes no close.
         turn = _Turn(
             language_code=language_code,
             gen=gen,
