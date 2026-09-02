@@ -228,6 +228,10 @@ def test_cancel_scope_aborts_blocked_provider_stream_without_prefetch():
         def __iter__(self):
             self.started.set()
             self.released.wait(timeout=2.0)
+            # A real provider stream raises when the read resumes on a response
+            # closed under it; that error must read as the interruption it is.
+            if self.closed:
+                raise RuntimeError("stream closed")
             return iter(())
 
         def close(self):
@@ -249,6 +253,17 @@ def test_cancel_scope_aborts_blocked_provider_stream_without_prefetch():
 
     assert not worker.is_alive()
     assert stream.closed
+    # The cancel-closed read is the interruption, not a fault: no failure
+    # fallback is spoken and the terminal event carries no error.
+    ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+    assert ends and all(e.error is None for e in ends)
+    assert all(
+        not (
+            isinstance(o, LLMResponseChunk)
+            and o.text == base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+        )
+        for o in outputs
+    )
 
 
 def test_failed_prefetch_is_discarded_before_terminal_is_yielded():
