@@ -207,6 +207,50 @@ def test_discarded_prefetch_aborts_blocked_provider_stream():
     assert cancel_scope.generation == 0
 
 
+def test_cancel_scope_aborts_blocked_provider_stream_without_prefetch():
+    """A barge-in on a normal (non-prefetch) response aborts the in-flight stream.
+
+    SOP-480: a normal spoken response carries no ResponsePrefetchTransaction, so
+    the prefetch path's register_abort never arms. When the caller barges in,
+    the router bumps the CancelScope generation, but a read parked inside the
+    provider stream (DeepInfra gone quiet mid-response) is not unblocked until
+    the provider emits its next event -- measured ~2.5s. cancel() must instead
+    close the in-flight response at once, the same way discard() does for a
+    prefetch, so generation stops within a frame of the interrupt.
+    """
+
+    class BlockingStream:
+        def __init__(self):
+            self.started = Event()
+            self.released = Event()
+            self.closed = False
+
+        def __iter__(self):
+            self.started.set()
+            self.released.wait(timeout=2.0)
+            return iter(())
+
+        def close(self):
+            self.closed = True
+            self.released.set()
+
+    cancel_scope = CancelScope()
+    handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+    stream = BlockingStream()
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: stream))
+    request = _make_request()  # no prefetch_transaction: an ordinary response
+    outputs: list[object] = []
+    worker = Thread(target=lambda: outputs.extend(handler.process(request)))
+
+    worker.start()
+    assert stream.started.wait(timeout=1.0)
+    cancel_scope.cancel()  # the barge-in
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert stream.closed
+
+
 def test_failed_prefetch_is_discarded_before_terminal_is_yielded():
     handler = _make_handler(stream=True, cancel_scope=CancelScope())
 
