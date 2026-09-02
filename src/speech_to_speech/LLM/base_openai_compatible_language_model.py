@@ -586,6 +586,29 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     # ── consumption ─────────────────────────────────────────────────────────--
 
+    def _abort_safe_events(self, events: Iterator[ProviderEvent], turn: _Turn) -> Iterator[ProviderEvent]:
+        """Yield from ``events``, swallowing any in-flight error once the turn is cancelled.
+
+        The error this exists for is the one a barge-in raises: ``cancel()``
+        closes the provider response out from under a blocked read, and the read
+        surfaces a provider/transport error. On a cancelled turn that error *is*
+        the interruption, so end iteration quietly rather than letting it reach
+        ``_generate`` as a spurious generation failure (which would log a fault
+        and tag EndOfResponse with an error for a response the caller
+        deliberately cut off). The guard is ``_turn_is_cancelled``, not the
+        error's identity, so a genuine provider fault (say a 500) that arrives
+        after the barge-in is likewise treated as the interruption and its
+        already-discarded output dropped -- correct, since a cancelled turn emits
+        nothing either way. An error on a turn that is *not* cancelled is a real
+        fault and propagates unchanged.
+        """
+        try:
+            yield from events
+        except Exception:
+            if not self._turn_is_cancelled(turn):
+                raise
+            logger.info("LLM generation cancelled (interruption)")
+
     def _consume_streaming(
         self,
         events: Iterator[ProviderEvent],
@@ -746,6 +769,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     ) -> Generator[LLMOut, None, bool]:
         api_response: Any = None
         events: Iterator[ProviderEvent] | None = None
+        armed_abort: Callable[[], None] | None = None
         state = _GenState()
         error_message: str | None = None
         generation_completed = False
@@ -795,6 +819,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     else:
                         api_response = make_request()
                         events = (event_iterator_fn or self._iter_events)(api_response)
+                        # A normal response has no prefetch transaction to carry
+                        # register_abort, so a barge-in that bumps the cancel
+                        # scope cannot reach a read parked inside a provider that
+                        # has gone quiet -- it lingers until the next event
+                        # (~2.5s measured). Arm the scope to close this response
+                        # the instant cancel() fires; the finally disarms it.
+                        if self.cancel_scope is not None and turn.gen is not None and hasattr(api_response, "close"):
+                            armed_abort = api_response.close
+                            self.cancel_scope.register_abort(turn.gen, armed_abort)
+                            events = self._abort_safe_events(events, turn)
                 if events is not None:
                     if self.stream:
                         generation_completed = yield from self._consume_streaming(events, state, turn)
@@ -908,6 +942,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             )
             return history_committed
         finally:
+            if armed_abort is not None and self.cancel_scope is not None:
+                # Disarm before closing below: the read is over, so a later
+                # cancel must not reach into a response this turn already owns.
+                self.cancel_scope.unregister_abort(armed_abort)
             if turn.prefetch_transaction is not None and not history_committed:
                 # Publish failure to the shared transaction before the queued
                 # logical-done event can race the client's response.create.
@@ -1014,9 +1052,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
             history_commit_fn = commit_audio_history
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # CancelScope.is_stale(gen) is checked when the stream iterator advances. A
+        # read blocked inside httpx between provider events would not see that on
+        # its own, so _generate arms api_response.close on the cancel scope
+        # (register_abort) for the non-prefetch path: cancel_scope.cancel() from the
+        # websocket router then closes the in-flight response and unblocks the read.
+        # request_timeout_s / ReadTimeout remain the fallback when a response
+        # exposes no close.
         turn = _Turn(
             language_code=language_code,
             gen=gen,
@@ -1109,9 +1151,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # CancelScope.is_stale(gen) is checked when the stream iterator advances. A
+        # read blocked inside httpx between provider events would not see that on
+        # its own, so _generate arms api_response.close on the cancel scope
+        # (register_abort) for the non-prefetch path: cancel_scope.cancel() from the
+        # websocket router then closes the in-flight response and unblocks the read.
+        # request_timeout_s / ReadTimeout remain the fallback when a response
+        # exposes no close.
         turn = _Turn(
             language_code=language_code,
             gen=gen,
