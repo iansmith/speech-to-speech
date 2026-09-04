@@ -1933,3 +1933,84 @@ def test_a_superseded_turn_ends_without_being_reported_as_a_failure(caplog):
     finally:
         worker.join(timeout=5.0)
         server.close()
+
+
+def test_barge_in_aborts_an_ordinary_turn_parked_in_a_body_read(caplog):
+    """The path the live pipeline actually takes.
+
+    A revised turn carries no ResponsePrefetchTransaction -- those exist only
+    for tool-follow-up speculation -- so the caller talking over Sophie is
+    cancelled through the CancelScope on the ordinary path. SOP-480 armed
+    api_response.close for exactly this, and on the call of 2026-09-04 it fired
+    and the read stayed parked anyway: three turns lost 7.6s, 14.1s and 20.1s
+    waiting for a request whose output was already discarded.
+
+    Closing a response does not wake a thread parked reading its socket. The
+    provider here answers 200 and then goes quiet mid-body, which is the shape
+    the log showed, so the response object exists and close() has something to
+    close -- and it still is not enough.
+    """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
+    server = StallingProvider(stall_after_headers=True)
+    try:
+        cancel_scope = CancelScope()
+        handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()  # no prefetch_transaction: an ordinary turn
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0), "the request never reached the provider"
+        time.sleep(0.3)  # let the read park inside the stalled body
+
+        cancelled_at = time.monotonic()
+        cancel_scope.cancel()  # the barge-in
+        worker.join(timeout=5.0)
+        freed_after = time.monotonic() - cancelled_at
+
+        assert not worker.is_alive(), f"the turn was still parked {freed_after:.1f}s after the barge-in"
+        assert freed_after < 1.0, f"the barge-in took {freed_after:.2f}s to free the turn"
+
+        # A barge-in is not a fault.
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert ends and all(end.error is None for end in ends), (
+            f"the cancellation was reported as a failure: {[e.error for e in ends]}"
+        )
+    finally:
+        server.close()
+
+
+def test_barge_in_aborts_an_ordinary_turn_still_waiting_for_headers():
+    """The same path, cancelled before the provider has said anything.
+
+    Until the first byte arrives there is no response object, so the close-based
+    abort has nothing to arm and the turn is uninterruptible for the provider's
+    whole time to first byte -- 20.5s on the call of 2026-09-03. The abort
+    window therefore has to open before the request, not after it returns.
+    """
+    server = StallingProvider()  # never sends headers at all
+    try:
+        cancel_scope = CancelScope()
+        handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()  # no prefetch_transaction: an ordinary turn
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.3)
+
+        cancelled_at = time.monotonic()
+        cancel_scope.cancel()
+        worker.join(timeout=5.0)
+        freed_after = time.monotonic() - cancelled_at
+
+        assert not worker.is_alive(), f"still parked {freed_after:.1f}s after the barge-in"
+        assert freed_after < 1.0, (
+            f"the barge-in took {freed_after:.2f}s -- the abort window opened too late to "
+            f"reach a request that had not yet been answered"
+        )
+    finally:
+        server.close()

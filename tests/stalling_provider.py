@@ -19,9 +19,16 @@ STALL_S = 10.0
 
 
 class StallingProvider:
-    """A local HTTP server that accepts requests and never sends headers."""
+    """A local HTTP server that stalls, either before or after its headers.
 
-    def __init__(self) -> None:
+    ``stall_after_headers`` models the shape seen on the live call of
+    2026-09-04: the provider answers 200 promptly and then goes quiet
+    mid-body, so the request has a response object and the worker is parked in
+    a body read rather than waiting to connect.
+    """
+
+    def __init__(self, *, stall_after_headers: bool = False) -> None:
+        self.stall_after_headers = stall_after_headers
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("127.0.0.1", 0))
@@ -101,7 +108,17 @@ class StallingProvider:
         if ordinal == 2:
             self.second_request_received.set()
 
-        # Send nothing at all; just watch for the client hanging up. No headers
+        if self.stall_after_headers:
+            # Answer, then go quiet part-way through the body. The client now
+            # holds a response object -- so the existing close-based abort has
+            # something to close -- and is parked in a read all the same.
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+                b": warming up\n\n"
+            )
+
+        # Send nothing more; just watch for the client hanging up. No further
         # are ever written on this connection, so a disconnect seen here is by
         # construction a disconnect before headers.
         conn.settimeout(STALL_S * 3)
