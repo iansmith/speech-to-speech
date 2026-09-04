@@ -232,3 +232,6 @@ uv.lock
 
 # JavaScript dependencies
 node_modules/
+
+# slopstop tooling state — never part of a branch
+.slopstop/
