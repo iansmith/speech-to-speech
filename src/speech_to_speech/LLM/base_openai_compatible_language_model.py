@@ -952,12 +952,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                                 abort_token = None
                         events = (event_iterator_fn or self._iter_events)(api_response)
                         if self.cancel_scope is not None and turn.gen is not None:
-                            # Keep the close armed too. It is the graceful half:
-                            # it releases the response object where the shutdown
-                            # only unblocks the socket.
-                            if hasattr(api_response, "close"):
-                                armed_aborts.append(api_response.close)
-                                self.cancel_scope.register_abort(turn.gen, api_response.close)
+                            # Deliberately NOT arming api_response.close as well.
+                            # cancel() would then shut the socket down and close
+                            # it microseconds later, and a close landing before
+                            # the reader has observed the shutdown leaves it
+                            # parked for the whole read timeout with the wake-up
+                            # already spent -- the harm this module documents and
+                            # SOP-538's review round 2 removed. Re-arming the
+                            # close is a mutation the suite catches: measured
+                            # 2026-09-04 on a 12-core mac, 24 busy-loops running,
+                            # test_cancel_scope_aborts_blocked_provider_stream_
+                            # without_prefetch failed 1 of 12 runs with the
+                            # worker still parked, against 0 of 12 without it.
+                            # A race loses intermittently by definition, so the
+                            # rate is a floor on the harm, not a measure of it.
+                            # The response is closed by the outer finally once
+                            # the read is over, where nothing races it.
                             events = self._abort_safe_events(events, turn)
                 if events is not None:
                     if self.stream:
@@ -971,10 +981,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 error_message = f"Language model generation timed out after {self.request_timeout_s:.1f}s."
             except ProviderRequestAborted:
-                # Unreachable as things stand: only a thread that called begin()
-                # can raise this, and that is the prefetch worker, which handles
-                # its own at the point it is raised. It is here because the cost
-                # of being wrong is high and asymmetric -- this is a
+                # Load-bearing, not insurance: the ordinary path calls begin()
+                # above, so a barge-in during its request raises here, and this
+                # is what ends the turn. (It was insurance while only the
+                # prefetch worker called begin() -- that worker still catches
+                # its own where it is raised.) Setting no error_message is the
+                # point: a cancellation is not a fault, so EndOfResponse carries
+                # no error and the cut-short text is not committed to history.
+                # The catch must exist regardless -- ProviderRequestAborted is a
                 # BaseException, so the `except Exception` below would not stop
                 # one escaping process(), and an escape means no EndOfResponse
                 # and a session locked out of every later response.

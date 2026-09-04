@@ -118,9 +118,13 @@ class StallingProvider:
                 b": warming up\n\n"
             )
 
-        # Send nothing more; just watch for the client hanging up. No further
-        # are ever written on this connection, so a disconnect seen here is by
-        # construction a disconnect before headers.
+        # Send nothing more; just watch for the client hanging up.
+        #
+        # client_disconnected_before_headers is only meaningful in the default
+        # mode, where nothing at all has been written to this connection, so a
+        # disconnect seen here is by construction one that arrived before any
+        # headers. Under stall_after_headers a 200 has already gone out, and the
+        # flag would be a misnomer -- no test reads it in that mode.
         conn.settimeout(STALL_S * 3)
         try:
             if conn.recv(1) == b"":
