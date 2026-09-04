@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from queue import Queue
 from threading import BoundedSemaphore, Event, Lock, Thread
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock
 import httpx
 import numpy as np
 import pytest
-from openai import Stream
+from openai import OpenAI, Stream
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
@@ -41,6 +42,7 @@ from speech_to_speech.pipeline.messages import (
     ResponsePrefetchTransaction,
     TokenUsage,
 )
+from tests.stalling_provider import StallingProvider
 
 
 def _make_text_delta_event(text):
@@ -1767,3 +1769,70 @@ def test_response_history_precedes_speech_that_arrived_during_generation():
     list(handler.process(request))
 
     assert [part.text for item in chat.buffer for part in item.content if part.text] == ["A", "answer A", "B"]
+
+
+def test_revision_does_not_wait_for_the_superseded_requests_stalled_provider(caplog):
+    """SOP-538: the turn the caller actually finished must not queue behind the
+    one they abandoned.
+
+    The caller starts a sentence, the pipeline sends it upstream, and then the
+    caller keeps talking. The first request is now worthless, but on the live
+    call of 2026-09-03 the pipeline still waited out its full time to first byte
+    -- 15.6 s of a 24.2 s turn -- because the sole provider worker slot was held
+    by a thread parked in a socket read that nothing could interrupt.
+
+    The provider here never sends headers at all, so the second request can only
+    reach it if discarding the first genuinely released the slot.
+    """
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler.client = OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1")
+
+        stale_request = _make_request()
+        stale_transaction = ResponsePrefetchTransaction()
+        stale_request.prefetch_transaction = stale_transaction
+        stale_worker = Thread(target=lambda: list(handler.process(stale_request)), daemon=True)
+        stale_worker.start()
+
+        assert server.request_received.wait(5.0), "the first request never reached the provider"
+        assert not server.second_request_received.is_set()
+
+        # The caller has finished the sentence: this revision supersedes it.
+        superseded_at = time.monotonic()
+        stale_transaction.discard()
+
+        revision = _make_request()
+        revision.prefetch_transaction = ResponsePrefetchTransaction()
+        revision_worker = Thread(target=lambda: list(handler.process(revision)), daemon=True)
+        revision_worker.start()
+
+        assert server.second_request_received.wait(5.0), (
+            "the revision's request never reached the provider -- it was serialised "
+            "behind the superseded request's stalled connect"
+        )
+        started_after = server.request_times[1] - superseded_at
+        assert started_after < 0.5, (
+            f"the revision waited {started_after:.2f}s for the superseded request; "
+            f"the provider is still stalling and has sent nothing"
+        )
+
+        # The voice log must be able to answer "how long did the stale request
+        # hold this turn up?" on its own; that number was only recoverable by
+        # correlating four separate lines when SOP-538 was diagnosed.
+        # Pin the exact format string rather than any rendering of it, so
+        # rewording the sentence cannot silently drop the measurement.
+        measured = [
+            record
+            for record in caplog.records
+            if record.msg is base_openai_compatible_language_model.STALE_REQUEST_ABORT_LOG
+        ]
+        assert measured, (
+            "no measurement line recorded how long the superseded request held the turn up; "
+            f"saw: {[r.getMessage() for r in caplog.records]}"
+        )
+        held_up_s = measured[0].args[0]
+        assert isinstance(held_up_s, float)
+        assert 0.0 <= held_up_s < 30.0
+    finally:
+        server.close()
