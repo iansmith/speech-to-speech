@@ -89,8 +89,11 @@ class StallingProvider:
         return head, rest[length:]
 
     def _serve(self, conn: socket.socket) -> None:
-        if self.read_one_request(conn, b"") is None:
-            return
+        try:
+            if self.read_one_request(conn, b"") is None:
+                return
+        except OSError:
+            return  # closed under us by teardown
         with self._lock:
             self._request_times.append(time.monotonic())
             ordinal = len(self._request_times)
@@ -141,7 +144,10 @@ class KeepAliveProvider:
     def _serve(self, conn: socket.socket) -> None:
         leftover = b""
         while not self._stop.is_set():
-            parsed = StallingProvider.read_one_request(conn, leftover)
+            try:
+                parsed = StallingProvider.read_one_request(conn, leftover)
+            except OSError:
+                return  # closed under us by teardown
             if parsed is None:
                 return
             _, leftover = parsed

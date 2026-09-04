@@ -33,6 +33,7 @@ from speech_to_speech.LLM.chat import (
     Chat,
     make_user_message,
 )
+from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
@@ -139,6 +140,17 @@ def _chat_tool_delta(index, *, tool_id=None, name=None, arguments=None):
     )
 
 
+def _capturing_openai(captured):
+    """An ``OpenAI`` stand-in that records how setup() constructed it."""
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+
+    return FakeOpenAI
+
+
 def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, reasoning_effort="none"):
     handler = object.__new__(ResponsesApiModelHandler)
     handler.model_name = "test-model"
@@ -170,6 +182,7 @@ def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, rea
     )
     handler._prefetch_workers_lock = Lock()
     handler._prefetch_workers = set()
+    handler._connect_aborter = ProviderConnectAborter()
     return handler
 
 
@@ -991,12 +1004,7 @@ def test_setup_uses_dummy_api_key_for_custom_base_url(monkeypatch):
     captured = {}
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1012,12 +1020,7 @@ def test_setup_preserves_environment_api_key_for_custom_base_url(monkeypatch):
     captured = {}
     monkeypatch.setenv("OPENAI_API_KEY", "secret-from-environment")
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1033,12 +1036,7 @@ def test_setup_does_not_inject_dummy_key_for_remote_custom_url(monkeypatch):
     captured = {}
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1784,10 +1782,11 @@ def test_revision_does_not_wait_for_the_superseded_requests_stalled_provider(cap
     The provider here never sends headers at all, so the second request can only
     reach it if discarding the first genuinely released the slot.
     """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
     server = StallingProvider()
     try:
         handler = _make_handler(stream=True, cancel_scope=CancelScope())
-        handler.client = OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1")
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
 
         stale_request = _make_request()
         stale_transaction = ResponsePrefetchTransaction()

@@ -5,6 +5,7 @@ import io
 import ipaddress
 import logging
 import os
+import time
 import wave
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
@@ -38,6 +39,7 @@ from speech_to_speech.LLM.chat import (
     make_user_audio_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter, ProviderRequestAborted
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
     language_name_for_prompt,
@@ -67,6 +69,15 @@ PREFETCH_PROVIDER_WORKER_LIMIT = 1
 PREFETCH_STREAM_QUEUE_MAXSIZE = 16
 PREFETCH_WORKER_ACQUIRE_TIMEOUT_S = 0.05
 PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try again."
+
+# SOP-538: the one line that makes "how long did the abandoned request hold this
+# turn up?" answerable from the voice log alone. Diagnosing the original 15.6 s
+# took correlating four separate lines across two components. Tests pin this
+# object by identity, so rewording it is safe and deleting it is not.
+STALE_REQUEST_ABORT_LOG = (
+    "Aborted a superseded provider request after %.2fs waiting for response headers; "
+    "the current revision no longer waits for it"
+)
 
 
 # ── Normalised provider events ────────────────────────────────────────────────
@@ -207,13 +218,36 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             and self._is_local_base_url(base_url)
         ):
             api_key = "none"
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._connect_aborter = ProviderConnectAborter()
+        self._use_provider_client(OpenAI(api_key=api_key, base_url=base_url))
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self._prefetch_worker_slots = BoundedSemaphore(PREFETCH_PROVIDER_WORKER_LIMIT)
         self._prefetch_workers_lock = Lock()
         self._prefetch_workers: set[Thread] = set()
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
         self.warmup()
+
+    def _use_provider_client(self, client: OpenAI) -> None:
+        """Adopt *client* and make requests issued on it abortable mid-connect.
+
+        A discarded prefetch can only close a response object, and that does not
+        exist until the provider's first byte arrives -- so without this the
+        wait for that byte is uninterruptible and a superseded turn holds the
+        sole provider worker slot for its whole duration (SOP-538). Wiring lives
+        here rather than inline in ``setup`` so that a handler assembled any
+        other way cannot quietly end up without it.
+
+        A stand-in client with no httpx underneath is left alone: there is no
+        socket to abort, so there is nothing to install. That tolerance is why
+        ``test_install_reaches_the_openai_sdk_clients_transport`` exists -- it
+        pins the shape of the *real* SDK client, so an upgrade that moved these
+        internals fails there rather than silently skipping the install here and
+        making every revised turn slow again.
+        """
+        self.client = client
+        http_client = getattr(client, "_client", None)
+        if isinstance(http_client, httpx.Client):
+            self._connect_aborter.install(http_client)
 
     @staticmethod
     def _is_official_openai(base_url: Optional[str]) -> bool:
@@ -432,7 +466,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         def connect_and_read_events() -> None:
             api_response: Any = None
+            worker_ident: int | None = None
             try:
+                worker_ident = current_thread().ident
+                request_started_at = time.monotonic()
+
+                def abort_connect() -> None:
+                    # Armed *before* request(), because until that returns there
+                    # is no response object for the transaction's usual abort to
+                    # close -- which is the whole of SOP-538. Log only when a
+                    # socket was really torn down: a no-op abort held nothing up.
+                    if worker_ident is not None and self._connect_aborter.abort(worker_ident):
+                        logger.info(STALE_REQUEST_ABORT_LOG, time.monotonic() - request_started_at)
+
+                if worker_ident is not None:
+                    self._connect_aborter.begin(worker_ident)
+                transaction.register_abort(abort_connect)
                 api_response = request()
                 with response_lock:
                     connected_response.append(api_response)
@@ -443,10 +492,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 for event in event_iterator(api_response):
                     if not publish((True, event)):
                         return
+            except ProviderRequestAborted:
+                # This turn was superseded and its request torn down on purpose.
+                # There is no failure to report -- just stop, so the worker slot
+                # reaches the revision that replaced it.
+                return
             except BaseException as exc:
                 publish((False, exc))
                 return
             finally:
+                # Ends the abort window before the slot is released, so this
+                # thread's ident cannot arrive already-armed at its next owner.
+                if worker_ident is not None:
+                    self._connect_aborter.end(worker_ident)
                 self._close_response(api_response)
             publish((True, done))
 

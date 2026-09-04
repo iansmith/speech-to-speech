@@ -42,16 +42,27 @@ def keepalive_provider():
     server.close()
 
 
-def _post_in_thread(client: httpx.Client, url: str, outcome: dict) -> threading.Thread:
+def _post_in_thread(
+    client: httpx.Client,
+    url: str,
+    outcome: dict,
+    aborter: ProviderConnectAborter,
+) -> threading.Thread:
+    """Issue one request the way a provider worker does: bracketed by begin/end."""
+
     def run() -> None:
-        outcome["thread_ident"] = threading.get_ident()
+        ident = threading.get_ident()
+        outcome["thread_ident"] = ident
+        aborter.begin(ident)
         started = time.monotonic()
         try:
             client.post(url, json={"hello": "world"})
             outcome["result"] = "returned"
         except BaseException as exc:  # noqa: BLE001 - the failure mode is the subject
             outcome["result"] = type(exc).__name__
-        outcome["elapsed"] = time.monotonic() - started
+        finally:
+            outcome["elapsed"] = time.monotonic() - started
+            aborter.end(ident)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -70,7 +81,7 @@ def test_abort_unblocks_a_request_parked_waiting_for_response_headers(stalling_p
     aborter.install(client)
 
     outcome: dict = {}
-    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome)
+    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome, aborter)
     assert stalling_provider.request_received.wait(5.0), "server never received the request"
     time.sleep(0.2)  # let the client settle into the header read
 
@@ -93,7 +104,7 @@ def test_abort_disconnects_the_socket_before_the_server_sends_headers(stalling_p
     aborter.install(client)
 
     outcome: dict = {}
-    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome)
+    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome, aborter)
     assert stalling_provider.request_received.wait(5.0)
     time.sleep(0.2)
 
@@ -121,7 +132,9 @@ def test_an_abort_armed_before_the_request_starts_still_stops_it(stalling_provid
     armed = threading.Event()
 
     def run() -> None:
-        outcome["thread_ident"] = threading.get_ident()
+        ident = threading.get_ident()
+        outcome["thread_ident"] = ident
+        aborter.begin(ident)  # the window opens before the request, by design
         ready.set()
         armed.wait(5.0)
         started = time.monotonic()
@@ -130,7 +143,9 @@ def test_an_abort_armed_before_the_request_starts_still_stops_it(stalling_provid
             outcome["result"] = "returned"
         except BaseException as exc:  # noqa: BLE001
             outcome["result"] = type(exc).__name__
-        outcome["elapsed"] = time.monotonic() - started
+        finally:
+            outcome["elapsed"] = time.monotonic() - started
+            aborter.end(ident)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -145,40 +160,35 @@ def test_an_abort_armed_before_the_request_starts_still_stops_it(stalling_provid
     assert outcome["elapsed"] < 1.0
 
 
-def test_release_lets_a_worker_thread_be_used_again(stalling_provider, keepalive_provider):
-    """An armed abort is scoped to one request, not to the thread forever.
+def test_an_abort_outside_a_request_window_is_refused(stalling_provider, keepalive_provider):
+    """A late abort must not poison the thread ident for whoever inherits it.
 
-    Provider workers are pooled by the runtime, so a thread that carried an
-    aborted request must be usable for the next one.
+    Provider worker threads are short-lived and CPython reuses their idents. If
+    a cancellation that lost the race against a finishing worker left a standing
+    mark, the next worker handed that ident would fail its first socket
+    operation for a request that was cancelled before it existed.
     """
     aborter = ProviderConnectAborter()
     client = httpx.Client(timeout=httpx.Timeout(STALL_S * 3, connect=5.0))
     aborter.install(client)
 
     outcome: dict = {}
-    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome)
+    thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome, aborter)
     assert stalling_provider.request_received.wait(5.0)
     time.sleep(0.2)
     aborter.abort(outcome["thread_ident"])
     thread.join(timeout=2.0)
+    assert not thread.is_alive()
 
-    aborter.release(outcome["thread_ident"])
+    # The worker has ended its window; a cancellation arriving now is refused...
+    assert aborter.abort(outcome["thread_ident"]) is False
+    assert not aborter.is_armed(outcome["thread_ident"])
 
-    second: dict = {}
-    reused = threading.Thread(
-        target=lambda: second.update(
-            status=client.post(f"http://127.0.0.1:{keepalive_provider.port}/v1/x", json={"a": 1}).status_code
-        ),
-        daemon=True,
-    )
-    # Run it on a *different* thread ident is not enough -- the point is that a
-    # released ident works, so drive it from the main thread instead.
-    reused.start()
-    reused.join(timeout=5.0)
-    assert second.get("status") == 200
-
-    aborter.release(threading.get_ident())
-    assert client.post(f"http://127.0.0.1:{keepalive_provider.port}/v1/x", json={"a": 1}).status_code == 200
+    # ...and a thread inheriting that ident still gets a working request.
+    inheritor: dict = {}
+    reuse = _post_in_thread(client, f"http://127.0.0.1:{keepalive_provider.port}/v1/x", inheritor, aborter)
+    reuse.join(timeout=5.0)
+    assert inheritor["result"] == "returned"
 
 
 def test_normal_requests_still_reuse_one_pooled_connection(keepalive_provider):
@@ -212,6 +222,11 @@ def test_install_reaches_the_openai_sdk_clients_transport():
     """
     sdk_client = OpenAI(api_key="none", base_url="http://127.0.0.1:1/v1")
     aborter = ProviderConnectAborter()
+
+    # The handler skips the install for any client without httpx underneath, so
+    # this is the assertion standing between an SDK rename and every revised
+    # turn quietly going slow again.
+    assert isinstance(sdk_client._client, httpx.Client)
 
     aborter.install(sdk_client._client)  # must not raise
 
