@@ -5,6 +5,7 @@ import io
 import ipaddress
 import logging
 import os
+import time
 import wave
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
@@ -38,6 +39,7 @@ from speech_to_speech.LLM.chat import (
     make_user_audio_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter, ProviderRequestAborted
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
     language_name_for_prompt,
@@ -67,6 +69,15 @@ PREFETCH_PROVIDER_WORKER_LIMIT = 1
 PREFETCH_STREAM_QUEUE_MAXSIZE = 16
 PREFETCH_WORKER_ACQUIRE_TIMEOUT_S = 0.05
 PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try again."
+
+# SOP-538: the one line that makes "how long did the abandoned request hold this
+# turn up?" answerable from the voice log alone. Diagnosing the original 15.6 s
+# took correlating four separate lines across two components. Tests pin this
+# object by identity, so rewording it is safe and deleting it is not.
+STALE_REQUEST_ABORT_LOG = (
+    "Aborted a superseded provider request %.2fs after starting it (interrupted now: %s); "
+    "the current revision no longer waits for it"
+)
 
 
 # ── Normalised provider events ────────────────────────────────────────────────
@@ -207,13 +218,37 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             and self._is_local_base_url(base_url)
         ):
             api_key = "none"
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._connect_aborter = ProviderConnectAborter()
+        self._use_provider_client(OpenAI(api_key=api_key, base_url=base_url))
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self._prefetch_worker_slots = BoundedSemaphore(PREFETCH_PROVIDER_WORKER_LIMIT)
         self._prefetch_workers_lock = Lock()
         self._prefetch_workers: set[Thread] = set()
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
         self.warmup()
+
+    def _use_provider_client(self, client: OpenAI) -> None:
+        """Adopt *client* and make requests issued on it abortable mid-connect.
+
+        A discarded prefetch can only close a response object, and that does not
+        exist until the provider's first byte arrives -- so without this the
+        wait for that byte is uninterruptible and a superseded turn holds the
+        sole provider worker slot for its whole duration (SOP-538). Wiring lives
+        here rather than inline in ``setup`` so there is one place to call and
+        one place to read -- not a guarantee that it was called: a handler built
+        by ``object.__new__`` (as the tests do) still has to do it.
+
+        A stand-in client with no httpx underneath is left alone: there is no
+        socket to abort, so there is nothing to install. That tolerance is why
+        ``test_install_reaches_the_openai_sdk_clients_transport`` exists -- it
+        pins the shape of the *real* SDK client, so an upgrade that moved these
+        internals fails there rather than silently skipping the install here and
+        making every revised turn slow again.
+        """
+        self.client = client
+        http_client = getattr(client, "_client", None)
+        if isinstance(http_client, httpx.Client):
+            self._connect_aborter.install(http_client)
 
     @staticmethod
     def _is_official_openai(base_url: Optional[str]) -> bool:
@@ -432,7 +467,28 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         def connect_and_read_events() -> None:
             api_response: Any = None
+            abort_token: int | None = None
             try:
+                request_started_at = time.monotonic()
+                # Opened *before* request(), because until that returns there is
+                # no response object for the transaction's usual abort to close
+                # -- which is the whole of SOP-538. The token addresses this
+                # request specifically: a bare thread ident would let a late
+                # abort land on whichever worker inherited the ident next.
+                abort_token = self._connect_aborter.begin()
+
+                def abort_connect() -> None:
+                    if abort_token is None:
+                        return
+                    outcome = self._connect_aborter.abort(abort_token)
+                    if outcome.aborted:
+                        logger.info(
+                            STALE_REQUEST_ABORT_LOG,
+                            time.monotonic() - request_started_at,
+                            outcome.socket_torn_down,
+                        )
+
+                transaction.register_abort(abort_connect)
                 api_response = request()
                 with response_lock:
                     connected_response.append(api_response)
@@ -443,10 +499,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 for event in event_iterator(api_response):
                     if not publish((True, event)):
                         return
+            except ProviderRequestAborted:
+                # This turn was superseded and its request torn down on purpose.
+                # There is no failure to report -- just stop, so the worker slot
+                # reaches the revision that replaced it. Nothing is published:
+                # the consumer notices the worker has died (see below), which is
+                # what keeps a turn from hanging if this ever fires on a turn
+                # that was not itself cancelled.
+                return
             except BaseException as exc:
                 publish((False, exc))
                 return
             finally:
+                # Closing the window before the slot is released means a late
+                # abort for this request cannot disturb its successor.
+                if abort_token is not None:
+                    self._connect_aborter.end(abort_token)
                 self._close_response(api_response)
             publish((True, done))
 
@@ -474,7 +542,31 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 try:
                     succeeded, value = results.get(timeout=0.05)
                 except Empty:
-                    continue
+                    if worker.is_alive() or not results.empty() or self._turn_is_cancelled(turn):
+                        # Re-test cancellation here, not only at the top of the
+                        # loop: the loop's own check can be a poll interval old,
+                        # and an abort wakes its reader in about a millisecond,
+                        # so on the ordinary barge-in the worker dies well
+                        # inside this 50ms window. Without this the loop falls
+                        # through to the raise below and every deliberate
+                        # cancellation -- the case this ticket exists for -- is
+                        # logged as a generation fault.
+                        continue
+                    # The worker is gone and left nothing behind -- an aborted
+                    # request ends exactly that way. Without this the loop would
+                    # poll an empty queue forever on a turn nobody cancelled,
+                    # _generate would never reach its EndOfResponse, and every
+                    # later response would be locked out behind it.
+                    #
+                    # Raising rather than returning, because a turn that gets
+                    # this far was not cancelled -- checked twice, just above --
+                    # so its answer really was cut short. Returning would end
+                    # the iterator the way a finished response does, and
+                    # _consume_streaming would report success: whatever text had
+                    # arrived would be committed to history as a complete
+                    # assistant turn, and the caller would hear a sentence stop
+                    # mid-thought with nothing marking it as failed.
+                    raise RuntimeError("Provider request ended before the response was complete.")
                 if not succeeded:
                     worker.join()
                     raise value
@@ -769,7 +861,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     ) -> Generator[LLMOut, None, bool]:
         api_response: Any = None
         events: Iterator[ProviderEvent] | None = None
-        armed_abort: Callable[[], None] | None = None
+        armed_aborts: list[Callable[[], None]] = []
+        abort_token: int | None = None
         state = _GenState()
         error_message: str | None = None
         generation_completed = False
@@ -817,17 +910,64 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                             turn,
                         )
                     else:
-                        api_response = make_request()
+                        # This, not the prefetch branch, is the path a revised
+                        # turn takes: a ResponsePrefetchTransaction is created
+                        # only for tool-follow-up speculation, so the caller
+                        # talking over Sophie is cancelled through the
+                        # CancelScope here. SOP-480 armed api_response.close for
+                        # it, and on the live call of 2026-09-04 that fired and
+                        # the read stayed parked regardless -- three turns lost
+                        # 7.6s, 14.1s and 20.1s. Closing a response does not
+                        # wake a thread parked reading its socket; only a
+                        # shutdown does, which is what the aborter issues.
+                        #
+                        # The window opens BEFORE the request, so a barge-in
+                        # arriving while the provider is still silent has
+                        # something to act on -- there is no response object to
+                        # close until the first byte arrives.
+                        abort_token = self._connect_aborter.begin()
+                        request_started_at = time.monotonic()
+
+                        def abort_provider_socket(
+                            token: int = abort_token, started: float = request_started_at
+                        ) -> None:
+                            outcome = self._connect_aborter.abort(token)
+                            if outcome.aborted:
+                                logger.info(
+                                    STALE_REQUEST_ABORT_LOG,
+                                    time.monotonic() - started,
+                                    outcome.socket_torn_down,
+                                )
+
+                        if self.cancel_scope is not None and turn.gen is not None:
+                            armed_aborts.append(abort_provider_socket)
+                            self.cancel_scope.register_abort(turn.gen, abort_provider_socket)
+                        try:
+                            api_response = make_request()
+                        finally:
+                            if abort_token is not None and api_response is None:
+                                # The request never produced a response, so
+                                # nothing below will close this window.
+                                self._connect_aborter.end(abort_token)
+                                abort_token = None
                         events = (event_iterator_fn or self._iter_events)(api_response)
-                        # A normal response has no prefetch transaction to carry
-                        # register_abort, so a barge-in that bumps the cancel
-                        # scope cannot reach a read parked inside a provider that
-                        # has gone quiet -- it lingers until the next event
-                        # (~2.5s measured). Arm the scope to close this response
-                        # the instant cancel() fires; the finally disarms it.
-                        if self.cancel_scope is not None and turn.gen is not None and hasattr(api_response, "close"):
-                            armed_abort = api_response.close
-                            self.cancel_scope.register_abort(turn.gen, armed_abort)
+                        if self.cancel_scope is not None and turn.gen is not None:
+                            # Deliberately NOT arming api_response.close as well.
+                            # cancel() would then shut the socket down and close
+                            # it microseconds later, and a close landing before
+                            # the reader has observed the shutdown leaves it
+                            # parked for the whole read timeout with the wake-up
+                            # already spent -- the harm this module documents and
+                            # SOP-538's review round 2 removed. Re-arming the
+                            # close is a mutation the suite catches: measured
+                            # 2026-09-04 on a 12-core mac, 24 busy-loops running,
+                            # test_cancel_scope_aborts_blocked_provider_stream_
+                            # without_prefetch failed 1 of 12 runs with the
+                            # worker still parked, against 0 of 12 without it.
+                            # A race loses intermittently by definition, so the
+                            # rate is a floor on the harm, not a measure of it.
+                            # The response is closed by the outer finally once
+                            # the read is over, where nothing races it.
                             events = self._abort_safe_events(events, turn)
                 if events is not None:
                     if self.stream:
@@ -840,6 +980,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     self.request_timeout_s,
                 )
                 error_message = f"Language model generation timed out after {self.request_timeout_s:.1f}s."
+            except ProviderRequestAborted:
+                # Load-bearing, not insurance: the ordinary path calls begin()
+                # above, so a barge-in during its request raises here, and this
+                # is what ends the turn. (It was insurance while only the
+                # prefetch worker called begin() -- that worker still catches
+                # its own where it is raised.) Setting no error_message is the
+                # point: a cancellation is not a fault, so EndOfResponse carries
+                # no error and the cut-short text is not committed to history.
+                # The catch must exist regardless -- ProviderRequestAborted is a
+                # BaseException, so the `except Exception` below would not stop
+                # one escaping process(), and an escape means no EndOfResponse
+                # and a session locked out of every later response.
+                logger.info("Provider request aborted; ending the current response")
             except Exception as exc:
                 # Any other generation failure must still terminate the response: record
                 # the error and fall through to the EndOfResponse below. Without this the
@@ -942,10 +1095,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             )
             return history_committed
         finally:
-            if armed_abort is not None and self.cancel_scope is not None:
+            if self.cancel_scope is not None:
                 # Disarm before closing below: the read is over, so a later
                 # cancel must not reach into a response this turn already owns.
-                self.cancel_scope.unregister_abort(armed_abort)
+                for abort in armed_aborts:
+                    self.cancel_scope.unregister_abort(abort)
+            if abort_token is not None:
+                # Close the abort window before the response is released, so a
+                # late cancel cannot disturb whatever uses this socket next.
+                self._connect_aborter.end(abort_token)
             if turn.prefetch_transaction is not None and not history_committed:
                 # Publish failure to the shared transaction before the queued
                 # logical-done event can race the client's response.create.

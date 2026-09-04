@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from queue import Queue
 from threading import BoundedSemaphore, Event, Lock, Thread
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock
 import httpx
 import numpy as np
 import pytest
-from openai import Stream
+from openai import OpenAI, Stream
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
@@ -32,6 +33,7 @@ from speech_to_speech.LLM.chat import (
     Chat,
     make_user_message,
 )
+from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
@@ -41,6 +43,7 @@ from speech_to_speech.pipeline.messages import (
     ResponsePrefetchTransaction,
     TokenUsage,
 )
+from tests.stalling_provider import StallingProvider
 
 
 def _make_text_delta_event(text):
@@ -137,6 +140,17 @@ def _chat_tool_delta(index, *, tool_id=None, name=None, arguments=None):
     )
 
 
+def _capturing_openai(captured):
+    """An ``OpenAI`` stand-in that records how setup() constructed it."""
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+
+    return FakeOpenAI
+
+
 def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, reasoning_effort="none"):
     handler = object.__new__(ResponsesApiModelHandler)
     handler.model_name = "test-model"
@@ -168,6 +182,7 @@ def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, rea
     )
     handler._prefetch_workers_lock = Lock()
     handler._prefetch_workers = set()
+    handler._connect_aborter = ProviderConnectAborter()
     return handler
 
 
@@ -211,59 +226,49 @@ def test_cancel_scope_aborts_blocked_provider_stream_without_prefetch():
     """A barge-in on a normal (non-prefetch) response aborts the in-flight stream.
 
     SOP-480: a normal spoken response carries no ResponsePrefetchTransaction, so
-    the prefetch path's register_abort never arms. When the caller barges in,
-    the router bumps the CancelScope generation, but a read parked inside the
-    provider stream (DeepInfra gone quiet mid-response) is not unblocked until
-    the provider emits its next event -- measured ~2.5s. cancel() must instead
-    close the in-flight response at once, the same way discard() does for a
-    prefetch, so generation stops within a frame of the interrupt.
+    the prefetch path's register_abort never arms. When the caller barges in the
+    router bumps the CancelScope generation, but a read parked inside a provider
+    that has gone quiet is not unblocked by that -- measured ~2.5s then, and
+    7.6s / 14.1s / 20.1s on the live call of 2026-09-04. cancel() must stop
+    generation within a frame of the interrupt.
+
+    SOP-538 drives this against a real socket rather than the fake stream it was
+    written with. That fake unblocked its read when close() was called on it,
+    which made close look sufficient; a real socket does not behave that way,
+    and closing one never wakes a thread parked reading it. The mechanism is now
+    a shutdown, so a fake that only responds to close can no longer stand in for
+    the thing under test. What this asserts is unchanged: generation stops at
+    once, and the cancelled read reads as the interruption it is.
     """
+    server = StallingProvider(stall_after_headers=True)
+    try:
+        cancel_scope = CancelScope()
+        handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+        request = _make_request()  # no prefetch_transaction: an ordinary response
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
 
-    class BlockingStream:
-        def __init__(self):
-            self.started = Event()
-            self.released = Event()
-            self.closed = False
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.3)  # let the read park inside the stalled body
+        cancel_scope.cancel()  # the barge-in
+        worker.join(timeout=5.0)
 
-        def __iter__(self):
-            self.started.set()
-            self.released.wait(timeout=2.0)
-            # A real provider stream raises when the read resumes on a response
-            # closed under it; that error must read as the interruption it is.
-            if self.closed:
-                raise RuntimeError("stream closed")
-            return iter(())
-
-        def close(self):
-            self.closed = True
-            self.released.set()
-
-    cancel_scope = CancelScope()
-    handler = _make_handler(stream=True, cancel_scope=cancel_scope)
-    stream = BlockingStream()
-    handler.client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: stream))
-    request = _make_request()  # no prefetch_transaction: an ordinary response
-    outputs: list[object] = []
-    worker = Thread(target=lambda: outputs.extend(handler.process(request)))
-
-    worker.start()
-    assert stream.started.wait(timeout=1.0)
-    cancel_scope.cancel()  # the barge-in
-    worker.join(timeout=1.0)
-
-    assert not worker.is_alive()
-    assert stream.closed
-    # The cancel-closed read is the interruption, not a fault: no failure
-    # fallback is spoken and the terminal event carries no error.
-    ends = [o for o in outputs if isinstance(o, EndOfResponse)]
-    assert ends and all(e.error is None for e in ends)
-    assert all(
-        not (
-            isinstance(o, LLMResponseChunk)
-            and o.text == base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+        assert not worker.is_alive()
+        # The cancelled read is the interruption, not a fault: no failure
+        # fallback is spoken and the terminal event carries no error.
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert ends and all(e.error is None for e in ends)
+        assert all(
+            not (
+                isinstance(o, LLMResponseChunk)
+                and o.text == base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+            )
+            for o in outputs
         )
-        for o in outputs
-    )
+    finally:
+        server.close()
 
 
 def test_failed_prefetch_is_discarded_before_terminal_is_yielded():
@@ -989,12 +994,7 @@ def test_setup_uses_dummy_api_key_for_custom_base_url(monkeypatch):
     captured = {}
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1010,12 +1010,7 @@ def test_setup_preserves_environment_api_key_for_custom_base_url(monkeypatch):
     captured = {}
     monkeypatch.setenv("OPENAI_API_KEY", "secret-from-environment")
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1031,12 +1026,7 @@ def test_setup_does_not_inject_dummy_key_for_remote_custom_url(monkeypatch):
     captured = {}
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            captured["api_key"] = api_key
-            captured["base_url"] = base_url
-
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai(captured))
     monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
 
     handler = object.__new__(ResponsesApiModelHandler)
@@ -1767,3 +1757,250 @@ def test_response_history_precedes_speech_that_arrived_during_generation():
     list(handler.process(request))
 
     assert [part.text for item in chat.buffer for part in item.content if part.text] == ["A", "answer A", "B"]
+
+
+def test_revision_does_not_wait_for_the_superseded_requests_stalled_provider(caplog):
+    """SOP-538: the turn the caller actually finished must not queue behind the
+    one they abandoned.
+
+    The caller starts a sentence, the pipeline sends it upstream, and then the
+    caller keeps talking. The first request is now worthless, but on the live
+    call of 2026-09-03 the pipeline still waited out its full time to first byte
+    -- 15.6 s of a 24.2 s turn -- because the sole provider worker slot was held
+    by a thread parked in a socket read that nothing could interrupt.
+
+    The provider here never sends headers at all, so the second request can only
+    reach it if discarding the first genuinely released the slot.
+    """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        stale_request = _make_request()
+        stale_transaction = ResponsePrefetchTransaction()
+        stale_request.prefetch_transaction = stale_transaction
+        stale_worker = Thread(target=lambda: list(handler.process(stale_request)), daemon=True)
+        stale_worker.start()
+
+        assert server.request_received.wait(5.0), "the first request never reached the provider"
+        assert not server.second_request_received.is_set()
+
+        # The caller has finished the sentence: this revision supersedes it.
+        superseded_at = time.monotonic()
+        stale_transaction.discard()
+
+        revision = _make_request()
+        revision.prefetch_transaction = ResponsePrefetchTransaction()
+        revision_worker = Thread(target=lambda: list(handler.process(revision)), daemon=True)
+        revision_worker.start()
+
+        assert server.second_request_received.wait(5.0), (
+            "the revision's request never reached the provider -- it was serialised "
+            "behind the superseded request's stalled connect"
+        )
+        started_after = server.request_times[1] - superseded_at
+        assert started_after < 0.5, (
+            f"the revision waited {started_after:.2f}s for the superseded request; "
+            f"the provider is still stalling and has sent nothing"
+        )
+
+        # The voice log must be able to answer "how long did the stale request
+        # hold this turn up?" on its own; that number was only recoverable by
+        # correlating four separate lines when SOP-538 was diagnosed.
+        # Pin the exact format string rather than any rendering of it, so
+        # rewording the sentence cannot silently drop the measurement.
+        measured = [
+            record
+            for record in caplog.records
+            if record.msg is base_openai_compatible_language_model.STALE_REQUEST_ABORT_LOG
+        ]
+        assert measured, (
+            "no measurement line recorded how long the superseded request held the turn up; "
+            f"saw: {[r.getMessage() for r in caplog.records]}"
+        )
+        held_up_s, interrupted_now = measured[0].args
+        assert isinstance(held_up_s, float)
+        assert 0.0 <= held_up_s < 30.0
+        # The line must distinguish a request really interrupted from one merely
+        # marked, or a cancellation that changed nothing reads as a success.
+        assert interrupted_now is True
+    finally:
+        # Retire the revision too, so no pipeline thread outlives the test and
+        # logs its provider error over a later one's output.
+        revision.prefetch_transaction.discard()
+        stale_worker.join(timeout=5.0)
+        revision_worker.join(timeout=5.0)
+        server.close()
+
+
+def test_an_aborted_request_on_an_uncancelled_turn_still_ends_the_response():
+    """A turn whose request is aborted must still terminate, not hang.
+
+    The prefetch worker reports an aborted request by dying quietly -- there is
+    normally no failure to announce, because the turn that owned it was
+    cancelled. But the consumer loop only ends on cancellation, an error, or the
+    completion sentinel, so a worker that dies having published none of the
+    three would leave it polling an empty queue forever. _generate would then
+    never reach its EndOfResponse, and `st.in_response` stays set: every later
+    response on the session is locked out behind a turn that can never finish.
+
+    Aborting a live request whose turn is *not* cancelled is the shortest way to
+    produce that worker death, so it is what this drives.
+    """
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()
+        request.prefetch_transaction = ResponsePrefetchTransaction()
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.2)
+
+        # Reach past the transaction and abort the request directly, leaving the
+        # turn itself perfectly healthy.
+        aborter = handler._connect_aborter
+        with aborter._lock:
+            live_tokens = set(aborter._open)
+        assert len(live_tokens) == 1
+        assert aborter.abort(live_tokens.pop()).aborted is True
+
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "process() never returned after its request was aborted"
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert ends, "no EndOfResponse was emitted, so the session is locked out of every later response"
+        # And it must be marked failed. Ending cleanly here would let
+        # _consume_streaming report success, and whatever text had arrived would
+        # be written to history as a complete assistant turn.
+        assert all(end.error is not None for end in ends), "the cut-short response was reported as a complete one"
+    finally:
+        worker.join(timeout=5.0)
+        server.close()
+
+
+def test_a_superseded_turn_ends_without_being_reported_as_a_failure(caplog):
+    """A barge-in is not a fault, and must not be logged or reported as one.
+
+    The consumer ends when its worker dies having published nothing, which is
+    how an aborted request ends -- and for a turn nobody cancelled that really
+    is a truncated answer, so it raises. But the ordinary case is the opposite:
+    the turn was cancelled a moment ago, and the worker dies inside the same
+    50ms poll the loop is sitting in. Reporting that as a generation fault tags
+    EndOfResponse with an error and buries the abort's own measurement line
+    under an ERROR, making routine barge-ins look like provider outages.
+    """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+        request = _make_request()
+        transaction = ResponsePrefetchTransaction()
+        request.prefetch_transaction = transaction
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.05)
+
+        transaction.discard()  # the caller kept talking
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert all(end.error is None for end in ends), (
+            f"a deliberate cancellation was reported as a failure: {[e.error for e in ends]}"
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            f"a deliberate cancellation was logged as a fault: "
+            f"{[r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]}"
+        )
+    finally:
+        worker.join(timeout=5.0)
+        server.close()
+
+
+def test_barge_in_aborts_an_ordinary_turn_parked_in_a_body_read(caplog):
+    """The path the live pipeline actually takes.
+
+    A revised turn carries no ResponsePrefetchTransaction -- those exist only
+    for tool-follow-up speculation -- so the caller talking over Sophie is
+    cancelled through the CancelScope on the ordinary path. SOP-480 armed
+    api_response.close for exactly this, and on the call of 2026-09-04 it fired
+    and the read stayed parked anyway: three turns lost 7.6s, 14.1s and 20.1s
+    waiting for a request whose output was already discarded.
+
+    Closing a response does not wake a thread parked reading its socket. The
+    provider here answers 200 and then goes quiet mid-body, which is the shape
+    the log showed, so the response object exists and close() has something to
+    close -- and it still is not enough.
+    """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
+    server = StallingProvider(stall_after_headers=True)
+    try:
+        cancel_scope = CancelScope()
+        handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()  # no prefetch_transaction: an ordinary turn
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0), "the request never reached the provider"
+        time.sleep(0.3)  # let the read park inside the stalled body
+
+        cancelled_at = time.monotonic()
+        cancel_scope.cancel()  # the barge-in
+        worker.join(timeout=5.0)
+        freed_after = time.monotonic() - cancelled_at
+
+        assert not worker.is_alive(), f"the turn was still parked {freed_after:.1f}s after the barge-in"
+        assert freed_after < 1.0, f"the barge-in took {freed_after:.2f}s to free the turn"
+
+        # A barge-in is not a fault.
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert ends and all(end.error is None for end in ends), (
+            f"the cancellation was reported as a failure: {[e.error for e in ends]}"
+        )
+    finally:
+        server.close()
+
+
+def test_barge_in_aborts_an_ordinary_turn_still_waiting_for_headers():
+    """The same path, cancelled before the provider has said anything.
+
+    Until the first byte arrives there is no response object, so the close-based
+    abort has nothing to arm and the turn is uninterruptible for the provider's
+    whole time to first byte -- 20.5s on the call of 2026-09-03. The abort
+    window therefore has to open before the request, not after it returns.
+    """
+    server = StallingProvider()  # never sends headers at all
+    try:
+        cancel_scope = CancelScope()
+        handler = _make_handler(stream=True, cancel_scope=cancel_scope)
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()  # no prefetch_transaction: an ordinary turn
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.3)
+
+        cancelled_at = time.monotonic()
+        cancel_scope.cancel()
+        worker.join(timeout=5.0)
+        freed_after = time.monotonic() - cancelled_at
+
+        assert not worker.is_alive(), f"still parked {freed_after:.1f}s after the barge-in"
+        assert freed_after < 1.0, (
+            f"the barge-in took {freed_after:.2f}s -- the abort window opened too late to "
+            f"reach a request that had not yet been answered"
+        )
+    finally:
+        server.close()

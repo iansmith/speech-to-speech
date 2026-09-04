@@ -1,0 +1,403 @@
+"""Interrupt a provider request that is still waiting for its response headers.
+
+The pipeline speculates: it sends a transcript upstream as soon as it has one,
+and abandons that request if the caller keeps talking. Abandoning it was only
+half-effective. Everything that could cancel a request -- ``CancelScope``'s
+armed aborts, ``ResponsePrefetchTransaction.discard`` -- works by closing a
+*response object*, and that object does not exist until ``create()`` returns,
+which is to say until the provider's first byte arrives. During the wait the
+worker thread is parked inside a socket read with nothing holding a handle on
+it, so the abandoned request runs to completion on its own schedule and, because
+provider workers are capped, the turn the caller actually finished queues behind
+it. On the live call of 2026-09-03 that cost 15.6 s of a 24.2 s turn.
+
+Closing does not help, and closing is in fact harmful. ``httpx.Client.close()``
+does close every pooled connection, active ones included -- but closing a socket
+another thread is parked on does not wake that thread at all. Measured on macOS:
+of 20 readers parked in a timed ``recv``, ``close()`` woke 0, every one sleeping
+out its full timeout, while ``shutdown(SHUT_RDWR)`` woke 20 of 20 in about 50
+ms. (The reader is inside a ``poll`` on a descriptor that has been closed under
+it, and macOS does not report that; a ``recv`` begun *after* the close raises
+EBADF at once, which is a different and harmless case.)
+
+So a close buys nothing here, and it costs something: issued right after a
+shutdown, it can land before the reader has observed the shutdown and leave it
+parked for the full read timeout -- 20 s in production -- with the wake-up
+already spent. Measured at roughly 7% of aborts, which is worse than the stall
+this module exists to remove, and silent, because the abort reports success
+either way.
+
+``shutdown(SHUT_RDWR)`` is what works, and it is used alone. It tears down both
+directions, sends the FIN that tells the provider to stop generating, and wakes
+the blocked reader -- usually within a millisecond, though scheduling means
+"promptly", not "immediately". The descriptor is left for the owning thread to
+close on its way out, where nothing is racing it: normally through httpcore's
+teardown, and on the one path where httpcore does not close (a refusal raised
+inside ``start_tls``) by :meth:`_TrackedStream._guarded` itself.
+
+Reaching the socket means reaching the network stream httpcore opened, which
+means installing a custom network backend. Two design constraints shaped this:
+
+* **The backend wraps a shared client, not a per-request one.** Giving every
+  request its own ``httpx.Client`` would also expose the socket, at the cost of
+  a fresh TCP and TLS handshake on every single turn -- a latency regression
+  inside a latency fix. Wrapping the shared client keeps connection reuse.
+* **Aborts are addressed to a request, by token.** :meth:`begin` opens a window
+  and hands back a token; everything else -- arming, finding the socket,
+  closing the window -- is keyed on that token. Addressing a *thread* instead
+  is the obvious shortcut and it is wrong: provider workers are capped at one
+  and strictly sequential, so CPython hands the same ident to consecutive
+  workers essentially always (measured: 300 sequential threads, one distinct
+  ident). A cancellation that arrives just after its own worker finished would
+  then land on that worker's successor and kill a live turn.
+
+An abort that arrives when the thread is between socket operations -- in the gap
+between writing the request and reading the response, say -- must not be lost,
+so arming is sticky: the token is marked, and the next socket operation on it
+fails at once. A token whose window has closed is refused outright, so a late
+abort does nothing at all.
+
+Scope: both request paths are wired to it -- the speculative prefetch worker and
+the ordinary one in ``_generate``. The ordinary path is the one that matters
+and it was nearly missed: a ``ResponsePrefetchTransaction`` is created in
+exactly one place in the codebase, for tool-follow-up speculation, so a *revised
+turn* -- the caller talking on past a transcript already sent upstream, which is
+what SOP-538 is about -- carries none and is cancelled through the
+``CancelScope`` on the ordinary path instead. Wiring only the prefetch worker
+left the mechanism inert in production: measured on the live call of
+2026-09-04 14:11, zero aborts logged while three turns lost 7.6 s, 14.1 s and
+20.1 s to exactly this. Verified engaged at 14:33, three aborts, no dead gaps.
+
+**Connection setup is not covered, and the boundary is exactly here.** Once a
+connection is established, every read is abortable, and that is where the
+measured stall lived: a provider that accepts promptly and then says nothing for
+20 s. But an abort landing while the connection is still being *set up* is
+bounded by the connect timeout rather than interrupted, for two separate
+reasons, both verified rather than assumed:
+
+* During ``socket.create_connection`` no socket object exists yet to shut down.
+* During the TLS handshake one exists but is useless: ``wrap_socket`` calls
+  ``detach()`` on the socket it is given, so the object ``get_extra_info`` hands
+  us has fd -1 from the first moment of the handshake, and ``shutdown`` on it
+  raises ``EBADF``. Measured: an abort 0.4 s into a stalled handshake has no
+  effect and the request ends at its 5 s connect timeout.
+
+Reaching the descriptor anyway would mean holding the raw fd number across the
+detach and shutting down a dup of it -- which shuts down whatever now owns that
+number if the original has since closed. Not worth it for a window that only
+opens when no pooled connection is available (httpx keeps them 5 s) and that is
+bounded by the connect timeout regardless.
+
+The backend does refuse to dial on an already-armed token, so a cancelled
+request cannot *start* a fresh connection.
+"""
+
+from __future__ import annotations
+
+import itertools
+import socket
+import threading
+from typing import Any, NamedTuple
+
+import httpcore
+import httpx
+
+
+class AbortOutcome(NamedTuple):
+    """What an :meth:`ProviderConnectAborter.abort` actually did."""
+
+    aborted: bool
+    socket_torn_down: bool
+
+
+class ProviderRequestAborted(BaseException):
+    """Raised inside a provider request whose turn has been superseded.
+
+    Deliberately a ``BaseException`` rather than an ``Exception``. The OpenAI
+    SDK turns *any* ``Exception`` escaping its transport into a retryable
+    ``APIConnectionError`` -- so a torn-down socket looked to it like a flaky
+    network and it slept half a second before trying the request again. That
+    retry runs on the provider worker thread, which means the abandoned turn
+    went on holding the sole worker slot long past the abort, and the revision
+    still could not start: the bug, reintroduced one layer up. Sitting outside
+    the ``Exception`` hierarchy is what makes cancellation final.
+    """
+
+
+class ProviderConnectAborter:
+    """Aborts an in-flight provider request, addressed by the token :meth:`begin`
+    handed to whoever issued it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tokens = itertools.count(1)
+        self._token_of_thread: dict[int, int] = {}
+        self._stream_of_token: dict[int, _TrackedStream] = {}
+        self._armed: set[int] = set()
+        self._open: set[int] = set()
+        self.installed_on: httpx.Client | None = None
+
+    # ── installation ──────────────────────────────────────────────────────────
+
+    def install(self, http_client: httpx.Client) -> None:
+        """Route *http_client*'s connections through a stream we can abort.
+
+        This reaches through three private attributes -- httpx's ``_transport``
+        and ``_pool``, and httpcore's ``_network_backend`` -- which expose no
+        public hook for the network backend. That is deliberate and
+        deliberately loud: if an upgrade moves them, cancellation would
+        otherwise stop working silently and every revised turn would quietly go
+        slow again, which is exactly the failure this module exists to end. Note
+        that installing on an already-used client only affects connections
+        opened from here on.
+
+        Every transport the client can route through is patched, not just the
+        default one. httpx consults ``_mounts`` before ``_transport``, and the
+        SDK builds its client with ``trust_env``, so a machine with
+        ``HTTPS_PROXY`` set sends provider traffic through a mounted proxy
+        transport instead. Patching only the default there would leave the
+        abort silently inert on exactly the deployments that have a proxy --
+        while ``abort`` still reported success, because the token was open.
+        """
+        default_transport = getattr(http_client, "_transport", None)
+        if not self._patch(default_transport):
+            # The default transport is the canary. Every real httpx client has
+            # an httpcore pool here, so failing to find one means the internals
+            # this depends on have moved -- and the whole point is that such a
+            # move must be loud rather than quietly leaving revised turns slow.
+            raise RuntimeError(
+                "Cannot make provider requests abortable: this httpx client's default "
+                f"transport exposes no httpcore connection pool "
+                f"({type(default_transport).__name__}). The httpx/httpcore internals "
+                "ProviderConnectAborter depends on have moved."
+            )
+
+        for mount in getattr(http_client, "_mounts", {}).values():
+            # A mount that has no pool opens no sockets we could have reached,
+            # so skipping it loses nothing -- unlike skipping a proxy's pool,
+            # which is what made this inert on proxied machines. In practice a
+            # poolless mount is a test double (WSGITransport, MockTransport).
+            self._patch(mount)
+
+        self.installed_on = http_client
+
+    def _patch(self, transport: object | None) -> bool:
+        """Route *transport*'s connections through tracked streams, if it has a
+        pool to patch. Returns whether it did."""
+        pool = getattr(transport, "_pool", None)
+        if pool is None or not hasattr(pool, "_network_backend"):
+            return False
+        pool._network_backend = _TrackingBackend(self)
+        return True
+
+    # ── arming ────────────────────────────────────────────────────────────────
+
+    def begin(self) -> int:
+        """Open an abort window for the request the calling thread is about to
+        issue, and return the token that addresses it.
+
+        Called before the request, so a cancellation arriving while the provider
+        is still silent has something to act on.
+        """
+        token = next(self._tokens)
+        with self._lock:
+            self._token_of_thread[threading.get_ident()] = token
+            self._open.add(token)
+        return token
+
+    def end(self, token: int) -> None:
+        """Close *token*'s window. Aborts for it are refused from here on."""
+        ident = threading.get_ident()
+        with self._lock:
+            self._open.discard(token)
+            self._armed.discard(token)
+            self._stream_of_token.pop(token, None)
+            if self._token_of_thread.get(ident) == token:
+                del self._token_of_thread[ident]
+
+    def abort(self, token: int) -> AbortOutcome:
+        """Abort the request *token* addresses, and anything it starts next.
+
+        ``aborted`` is false only when the window is closed -- the request
+        finished on its own and nothing was disturbed.
+
+        ``socket_torn_down`` says whether the request was actually interrupted
+        *now*. When it is false the sticky arm is all that took effect, and the
+        request stops at its next socket operation -- immediately if it is
+        between reads, but not until the connect timeout if it is parked in
+        connection setup, which cannot be reached (see the module docstring).
+        Callers that report an abort should say which happened; treating the two
+        as one is how a cancellation that changed nothing yet gets logged as a
+        success.
+        """
+        with self._lock:
+            if token not in self._open:
+                return AbortOutcome(aborted=False, socket_torn_down=False)
+            self._armed.add(token)
+            stream = self._stream_of_token.get(token)
+            if stream is not None:
+                # Torn down while still holding the lock. Releasing it first
+                # leaves a window in which the request can finish and return
+                # its connection to the pool, and the teardown then lands on
+                # whichever request picked that pooled connection up next.
+                # ``shutdown`` is a non-blocking syscall, so holding the lock
+                # across it cannot stall another thread for long.
+                torn_down = stream.abort()
+            else:
+                torn_down = False
+        return AbortOutcome(aborted=True, socket_torn_down=torn_down)
+
+    def is_armed(self, token: int) -> bool:
+        with self._lock:
+            return token in self._armed
+
+    def current_thread_is_armed(self) -> bool:
+        with self._lock:
+            token = self._token_of_thread.get(threading.get_ident())
+            return token is not None and token in self._armed
+
+    # ── used by the tracked streams ───────────────────────────────────────────
+
+    def _bind(self, stream: _TrackedStream) -> tuple[bool, int | None]:
+        """Claim *stream* for the calling thread's in-flight request.
+
+        Returns ``(allowed, token)``. ``allowed`` is false only when that
+        request's abort is already armed, in which case the caller must not
+        begin the socket operation. A thread with no open window is untracked
+        -- not every user of the shared httpx client is a provider worker -- and
+        is allowed through with no token.
+        """
+        with self._lock:
+            token = self._token_of_thread.get(threading.get_ident())
+            if token is None:
+                return True, None
+            if token in self._armed:
+                return False, token
+            self._stream_of_token[token] = stream
+        return True, token
+
+    def _unbind(self, token: int) -> None:
+        """Release the stream, so an abort between operations arms rather than
+        reaching a connection that may already be back in the pool."""
+        with self._lock:
+            self._stream_of_token.pop(token, None)
+
+
+class _TrackedStream(httpcore.NetworkStream):
+    """A network stream that reports itself to the aborter while it is in use, so
+    the request currently reading it can be reached from another thread."""
+
+    def __init__(self, inner: httpcore.NetworkStream, aborter: ProviderConnectAborter) -> None:
+        self._inner = inner
+        self._aborter = aborter
+
+    def _guarded(self, operation: Any, *args: Any) -> Any:
+        allowed, token = self._aborter._bind(self)
+        if not allowed:
+            self.abort()
+            # Closing here is safe and elsewhere is not: this is the owning
+            # thread and it has not started the operation, so no reader can be
+            # racing the descriptor. It matters most when the refusal happens
+            # inside ``start_tls`` -- httpcore marks that connection failed and
+            # re-raises without closing the stream, and its own cleanup catches
+            # ``Exception``, which ProviderRequestAborted is not. Without this
+            # the socket survives to the next garbage collection.
+            try:
+                self._inner.close()
+            except Exception:
+                pass
+            raise ProviderRequestAborted("provider request aborted before it reached the socket")
+        try:
+            result = operation(*args)
+        except BaseException:
+            # Tearing the socket down surfaces here as an ordinary read error,
+            # indistinguishable to the SDK from a flaky network -- and so
+            # retryable. Re-raise as the cancellation it actually is.
+            if token is not None and self._aborter.is_armed(token):
+                raise ProviderRequestAborted("provider request aborted mid-flight") from None
+            raise
+        finally:
+            if token is not None:
+                self._aborter._unbind(token)
+        # A shut-down socket does not always surface as an error: the read can
+        # just as well return b"" and let httpcore raise RemoteProtocolError one
+        # layer up, which is an ordinary Exception and so retryable -- the SDK
+        # would then sleep and re-issue the cancelled request on this very
+        # worker thread. Checking the arm on the way out as well as on the way
+        # through is what closes that door.
+        if token is not None and self._aborter.is_armed(token):
+            raise ProviderRequestAborted("provider request aborted mid-flight")
+        return result
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._guarded(self._inner.read, max_bytes, timeout)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._guarded(self._inner.write, buffer, timeout)
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def start_tls(
+        self,
+        ssl_context: Any,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        inner = self._guarded(self._inner.start_tls, ssl_context, server_hostname, timeout)
+        return _TrackedStream(inner, self._aborter)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self._inner.get_extra_info(info)
+
+    def abort(self) -> bool:
+        """Shut the connection down so the parked reader wakes and the provider
+        sees the hang-up.
+
+        ``shutdown`` and nothing else. Closing the socket from this thread is
+        actively harmful: CPython's timed ``recv`` is a ``poll`` loop that reads
+        ``sock_fd`` into its pollfd, and ``socket.close()`` sets that field to
+        -1 before closing the descriptor. A close landing between the reader's
+        ``settimeout`` and its ``poll`` therefore leaves it polling fd -1, which
+        POSIX ignores -- so the reader sleeps out the *entire* read timeout, 20s
+        here, having already missed the wake-up the shutdown would have given
+        it. Measured at ~7% of aborts, which is worse than the stall this module
+        exists to remove.
+
+        The descriptor is closed by the owning thread on its way out, through
+        httpcore's ordinary teardown, where nothing is racing it.
+        """
+        raw = self._inner.get_extra_info("socket")
+        if raw is None:
+            return False
+        try:
+            raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # Already gone -- or detached, which is what a socket handed to
+            # ``wrap_socket`` looks like for the whole TLS handshake. Either
+            # way this abort interrupted nothing, and saying so is the point:
+            # the caller logs it, and a cancellation that changed nothing must
+            # not read as a success.
+            return False
+        return True
+
+
+class _TrackingBackend(httpcore.SyncBackend):
+    """Hands out :class:`_TrackedStream` for every connection httpcore opens."""
+
+    def __init__(self, aborter: ProviderConnectAborter) -> None:
+        super().__init__()
+        self._aborter = aborter
+
+    def _connect(self, opener: Any, *args: Any, **kwargs: Any) -> httpcore.NetworkStream:
+        # Refuse to dial at all on an armed thread, so a retry the SDK has
+        # already decided on cannot open a connection that is doomed anyway.
+        if self._aborter.current_thread_is_armed():
+            raise ProviderRequestAborted("provider request aborted before connecting")
+        return _TrackedStream(opener(*args, **kwargs), self._aborter)
+
+    def connect_tcp(self, *args: Any, **kwargs: Any) -> httpcore.NetworkStream:
+        return self._connect(super().connect_tcp, *args, **kwargs)
+
+    def connect_unix_socket(self, *args: Any, **kwargs: Any) -> httpcore.NetworkStream:
+        return self._connect(super().connect_unix_socket, *args, **kwargs)
