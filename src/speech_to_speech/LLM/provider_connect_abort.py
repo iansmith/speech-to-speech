@@ -12,15 +12,20 @@ provider workers are capped, the turn the caller actually finished queues behind
 it. On the live call of 2026-09-03 that cost 15.6 s of a 24.2 s turn.
 
 Closing does not help, and closing is in fact harmful. ``httpx.Client.close()``
-does close every pooled connection, active ones included, but a close never
-wakes a thread already blocked reading that socket: measured on macOS, 0 of 60
-parked readers woke, each sleeping out its full timeout. So closing buys nothing
-here -- and it costs something, because ``socket.close()`` from a second thread
-also *undermines* the shutdown that would have worked. CPython's timed ``recv``
-is a ``poll`` loop that copies ``sock_fd`` into its pollfd, and ``close()`` sets
-that field to -1 first; a close landing between a reader's ``settimeout`` and
-its ``poll`` leaves it polling fd -1, which POSIX ignores, so it sleeps out the
-whole read timeout having missed the wake-up entirely.
+does close every pooled connection, active ones included -- but closing a socket
+another thread is parked on does not wake that thread at all. Measured on macOS:
+of 20 readers parked in a timed ``recv``, ``close()`` woke 0, every one sleeping
+out its full timeout, while ``shutdown(SHUT_RDWR)`` woke 20 of 20 in about 50
+ms. (The reader is inside a ``poll`` on a descriptor that has been closed under
+it, and macOS does not report that; a ``recv`` begun *after* the close raises
+EBADF at once, which is a different and harmless case.)
+
+So a close buys nothing here, and it costs something: issued right after a
+shutdown, it can land before the reader has observed the shutdown and leave it
+parked for the full read timeout -- 20 s in production -- with the wake-up
+already spent. Measured at roughly 7% of aborts, which is worse than the stall
+this module exists to remove, and silent, because the abort reports success
+either way.
 
 ``shutdown(SHUT_RDWR)`` is what works, and it is used alone. It tears down both
 directions, sends the FIN that tells the provider to stop generating, and wakes
@@ -54,9 +59,12 @@ abort does nothing at all.
 
 Scope: this is wired into the speculative prefetch worker only, which is where
 the measured stall was. An ordinary (non-prefetch) turn still arms its abort
-after ``request()`` returns, so a barge-in during *its* connect is bounded by
-the connect timeout rather than interrupted. Same hole, different path; SOP-538
-did not set out to close it.
+only after ``request()`` returns, so a barge-in landing anywhere inside that
+call -- the connect *and* the wait for response headers, which is the same 15.6 s
+wait this ticket is named for -- is not interrupted. It is bounded by those
+timeouts instead: connect ``min(10.0, request_timeout_s)`` and read
+``request_timeout_s``, so up to about 30 s as configured. Same hole, different
+path; SOP-538 did not set out to close it, and it should have its own ticket.
 
 **Connection setup is not covered, and the boundary is exactly here.** Once a
 connection is established, every read is abortable, and that is where the
@@ -149,25 +157,36 @@ class ProviderConnectAborter:
         abort silently inert on exactly the deployments that have a proxy --
         while ``abort`` still reported success, because the token was open.
         """
-        transports = [getattr(http_client, "_transport", None)]
-        transports.extend(t for t in getattr(http_client, "_mounts", {}).values() if t is not None)
+        default_transport = getattr(http_client, "_transport", None)
+        if not self._patch(default_transport):
+            # The default transport is the canary. Every real httpx client has
+            # an httpcore pool here, so failing to find one means the internals
+            # this depends on have moved -- and the whole point is that such a
+            # move must be loud rather than quietly leaving revised turns slow.
+            raise RuntimeError(
+                "Cannot make provider requests abortable: this httpx client's default "
+                f"transport exposes no httpcore connection pool "
+                f"({type(default_transport).__name__}). The httpx/httpcore internals "
+                "ProviderConnectAborter depends on have moved."
+            )
 
-        patched = 0
-        for transport in transports:
-            pool = getattr(transport, "_pool", None)
-            if pool is None or not hasattr(pool, "_network_backend"):
-                raise RuntimeError(
-                    "Cannot make provider requests abortable: this httpx client routes "
-                    f"through a transport with no httpcore connection pool "
-                    f"({type(transport).__name__}). The httpx/httpcore internals "
-                    "ProviderConnectAborter depends on have moved."
-                )
-            pool._network_backend = _TrackingBackend(self)
-            patched += 1
+        for mount in getattr(http_client, "_mounts", {}).values():
+            # A mount that has no pool opens no sockets we could have reached,
+            # so skipping it loses nothing -- unlike skipping a proxy's pool,
+            # which is what made this inert on proxied machines. In practice a
+            # poolless mount is a test double (WSGITransport, MockTransport).
+            self._patch(mount)
 
-        if not patched:
-            raise RuntimeError("Cannot make provider requests abortable: this httpx client has no transport.")
         self.installed_on = http_client
+
+    def _patch(self, transport: object | None) -> bool:
+        """Route *transport*'s connections through tracked streams, if it has a
+        pool to patch. Returns whether it did."""
+        pool = getattr(transport, "_pool", None)
+        if pool is None or not hasattr(pool, "_network_backend"):
+            return False
+        pool._network_backend = _TrackingBackend(self)
+        return True
 
     # ── arming ────────────────────────────────────────────────────────────────
 
@@ -221,8 +240,10 @@ class ProviderConnectAborter:
                 # whichever request picked that pooled connection up next.
                 # ``shutdown`` is a non-blocking syscall, so holding the lock
                 # across it cannot stall another thread for long.
-                stream.abort()
-        return AbortOutcome(aborted=True, socket_torn_down=stream is not None)
+                torn_down = stream.abort()
+            else:
+                torn_down = False
+        return AbortOutcome(aborted=True, socket_torn_down=torn_down)
 
     def is_armed(self, token: int) -> bool:
         with self._lock:
@@ -327,7 +348,7 @@ class _TrackedStream(httpcore.NetworkStream):
     def get_extra_info(self, info: str) -> Any:
         return self._inner.get_extra_info(info)
 
-    def abort(self) -> None:
+    def abort(self) -> bool:
         """Shut the connection down so the parked reader wakes and the provider
         sees the hang-up.
 
@@ -346,11 +367,17 @@ class _TrackedStream(httpcore.NetworkStream):
         """
         raw = self._inner.get_extra_info("socket")
         if raw is None:
-            return
+            return False
         try:
             raw.shutdown(socket.SHUT_RDWR)
         except OSError:
-            pass  # already gone
+            # Already gone -- or detached, which is what a socket handed to
+            # ``wrap_socket`` looks like for the whole TLS handshake. Either
+            # way this abort interrupted nothing, and saying so is the point:
+            # the caller logs it, and a cancellation that changed nothing must
+            # not read as a success.
+            return False
+        return True
 
 
 class _TrackingBackend(httpcore.SyncBackend):

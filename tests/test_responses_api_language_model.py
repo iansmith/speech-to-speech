@@ -1891,3 +1891,45 @@ def test_an_aborted_request_on_an_uncancelled_turn_still_ends_the_response():
     finally:
         worker.join(timeout=5.0)
         server.close()
+
+
+def test_a_superseded_turn_ends_without_being_reported_as_a_failure(caplog):
+    """A barge-in is not a fault, and must not be logged or reported as one.
+
+    The consumer ends when its worker dies having published nothing, which is
+    how an aborted request ends -- and for a turn nobody cancelled that really
+    is a truncated answer, so it raises. But the ordinary case is the opposite:
+    the turn was cancelled a moment ago, and the worker dies inside the same
+    50ms poll the loop is sitting in. Reporting that as a generation fault tags
+    EndOfResponse with an error and buries the abort's own measurement line
+    under an ERROR, making routine barge-ins look like provider outages.
+    """
+    caplog.set_level(logging.INFO, logger=base_openai_compatible_language_model.__name__)
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+        request = _make_request()
+        transaction = ResponsePrefetchTransaction()
+        request.prefetch_transaction = transaction
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.05)
+
+        transaction.discard()  # the caller kept talking
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert all(end.error is None for end in ends), (
+            f"a deliberate cancellation was reported as a failure: {[e.error for e in ends]}"
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            f"a deliberate cancellation was logged as a fault: "
+            f"{[r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]}"
+        )
+    finally:
+        worker.join(timeout=5.0)
+        server.close()

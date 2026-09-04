@@ -542,7 +542,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 try:
                     succeeded, value = results.get(timeout=0.05)
                 except Empty:
-                    if worker.is_alive() or not results.empty():
+                    if worker.is_alive() or not results.empty() or self._turn_is_cancelled(turn):
+                        # Re-test cancellation here, not only at the top of the
+                        # loop: the loop's own check can be a poll interval old,
+                        # and an abort wakes its reader in about a millisecond,
+                        # so on the ordinary barge-in the worker dies well
+                        # inside this 50ms window. Without this the loop falls
+                        # through to the raise below and every deliberate
+                        # cancellation -- the case this ticket exists for -- is
+                        # logged as a generation fault.
                         continue
                     # The worker is gone and left nothing behind -- an aborted
                     # request ends exactly that way. Without this the loop would
@@ -550,12 +558,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     # _generate would never reach its EndOfResponse, and every
                     # later response would be locked out behind it.
                     #
-                    # Raising rather than returning, because the turn reaching
-                    # here was NOT cancelled -- the loop condition tests that
-                    # first -- so its answer really was cut short. Returning
-                    # would end the iterator the way a finished response does,
-                    # and _consume_streaming would report success: whatever text
-                    # had arrived would be committed to history as a complete
+                    # Raising rather than returning, because a turn that gets
+                    # this far was not cancelled -- checked twice, just above --
+                    # so its answer really was cut short. Returning would end
+                    # the iterator the way a finished response does, and
+                    # _consume_streaming would report success: whatever text had
+                    # arrived would be committed to history as a complete
                     # assistant turn, and the caller would hear a sentence stop
                     # mid-thought with nothing marking it as failed.
                     raise RuntimeError("Provider request ended before the response was complete.")

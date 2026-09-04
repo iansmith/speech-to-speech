@@ -9,9 +9,9 @@ N+1's request could not start until N's upstream finally answered.  15.6 s of a
 24.2 s turn on the live call of 2026-09-03.
 
 These tests drive a real socket server that accepts the request and then sends
-nothing, because that is the only way to exercise what was broken.  httpx's own
-``Client.close()`` does not touch a connection another thread is actively
-reading, so a design verified against a fake ``create`` that blocks on a
+nothing, because that is the only way to exercise what was broken.  Closing the
+httpx client does close the connection, but it does not *wake* the thread parked
+reading it -- so a design verified against a fake ``create`` that blocks on a
 ``threading.Event`` would prove nothing about the real provider path.
 """
 
@@ -84,9 +84,9 @@ def _post_in_thread(
 def test_abort_unblocks_a_request_parked_waiting_for_response_headers(stalling_provider):
     """The capability that did not exist: interrupt a thread before headers.
 
-    ``httpx.Client.close()`` leaves a connection another thread is actively
-    reading untouched, so until now the parked thread stayed parked for the
-    provider's whole time to first byte.
+    ``httpx.Client.close()`` does close the connection, but a close never wakes
+    a thread already parked reading it, so until now that thread stayed parked
+    for the provider's whole time to first byte.
     """
     aborter = ProviderConnectAborter()
     client = httpx.Client(timeout=httpx.Timeout(STALL_S * 3, connect=5.0))
@@ -545,3 +545,138 @@ def _swallow(fn):
         fn()
     except BaseException:
         pass
+
+
+def test_abort_reports_honestly_when_it_could_not_reach_the_socket():
+    """A cancellation that changed nothing must not read as a success.
+
+    During the TLS handshake the stream is bound and `abort()` does run, but the
+    socket `wrap_socket` was handed has already been detached, so the shutdown
+    raises EBADF and interrupts nothing -- the request goes on to its connect
+    timeout. Reporting that as `socket_torn_down` would put "interrupted now:
+    True" in the voice log for the one case the module documents as out of
+    reach, which is the confusion the field exists to prevent.
+    """
+    aborter = ProviderConnectAborter()
+    abort_from_inside_read: list[int] = []
+    outcomes: list[object] = []
+
+    class DetachedStream(httpcore.NetworkStream):
+        """Hands back a socket that is already closed, as a detached one is."""
+
+        def __init__(self) -> None:
+            self.sock = socket.socket()
+            self.sock.close()
+
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            # Abort while this operation is in flight, so the stream really is
+            # bound and abort() really does try to shut its socket down.
+            for token in abort_from_inside_read:
+                outcomes.append(aborter.abort(token))
+            return b""
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object | None:
+            return self.sock if info == "socket" else None
+
+    stream = _TrackedStream(DetachedStream(), aborter)
+    token = aborter.begin()
+    abort_from_inside_read.append(token)
+
+    with pytest.raises(ProviderRequestAborted):
+        stream.read(1)
+
+    assert outcomes, "the abort never ran"
+    outcome = outcomes[0]
+    assert outcome.aborted is True, "the request is still marked, so it stops at its next step"
+    assert outcome.socket_torn_down is False, "abort() claimed it interrupted a request whose socket it could not reach"
+
+
+def test_the_socket_is_torn_down_while_the_registry_lock_is_held():
+    """Releasing the lock first would let the teardown hit an unrelated request.
+
+    Streams are pooled. Between finding the stream and shutting it down, the
+    request that owns it can finish and hand its connection back to the pool --
+    and then the teardown lands on whichever request picks it up next. That
+    victim is not armed, so it surfaces as an ordinary read error and the SDK
+    retries it, which is the very thing this module is built to stop.
+    """
+    lock_was_held: list[bool] = []
+    aborter = ProviderConnectAborter()
+    abort_from_inside_read: list[int] = []
+
+    class LockObservingStream(httpcore.NetworkStream):
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            # The abort has to arrive while this operation is in flight; that is
+            # the only time the aborter holds a reference to the stream.
+            for token in abort_from_inside_read:
+                aborter.abort(token)
+            return b""
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object | None:
+            # Reached from inside _TrackedStream.abort, i.e. exactly where the
+            # registry lock must still be held.
+            acquired = aborter._lock.acquire(blocking=False)
+            lock_was_held.append(not acquired)
+            if acquired:
+                aborter._lock.release()
+            return None
+
+    stream = _TrackedStream(LockObservingStream(), aborter)
+    token = aborter.begin()
+    abort_from_inside_read.append(token)
+
+    with pytest.raises(ProviderRequestAborted):
+        stream.read(1)
+
+    assert lock_was_held and lock_was_held[0] is True, (
+        f"abort() released the registry lock before tearing the socket down ({lock_was_held})"
+    )
+
+
+def test_a_finished_operation_releases_its_stream():
+    """An abort arriving between operations must arm, not reach into the pool.
+
+    While no operation is in flight the connection may already be back in the
+    pool serving someone else, so the stream is released as each operation ends;
+    the sticky arm is what stops the request instead.
+    """
+    aborter = ProviderConnectAborter()
+    reached: list[str] = []
+
+    class QuietStream(httpcore.NetworkStream):
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            return b""
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object | None:
+            reached.append(info)
+            return None
+
+    stream = _TrackedStream(QuietStream(), aborter)
+    token = aborter.begin()
+    stream.read(1)  # binds, then releases on the way out
+
+    outcome = aborter.abort(token)
+
+    assert outcome.aborted is True
+    assert reached == [], "abort() reached a stream that was no longer in use"
+    assert outcome.socket_torn_down is False
+    with pytest.raises(ProviderRequestAborted):
+        stream.read(1)  # the arm is what stops it now
