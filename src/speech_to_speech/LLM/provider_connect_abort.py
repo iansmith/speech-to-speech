@@ -57,14 +57,16 @@ so arming is sticky: the token is marked, and the next socket operation on it
 fails at once. A token whose window has closed is refused outright, so a late
 abort does nothing at all.
 
-Scope: this is wired into the speculative prefetch worker only, which is where
-the measured stall was. An ordinary (non-prefetch) turn still arms its abort
-only after ``request()`` returns, so a barge-in landing anywhere inside that
-call -- the connect *and* the wait for response headers, which is the same 15.6 s
-wait this ticket is named for -- is not interrupted. It is bounded by those
-timeouts instead: connect ``min(10.0, request_timeout_s)`` and read
-``request_timeout_s``, so up to about 30 s as configured. Same hole, different
-path; SOP-538 did not set out to close it, and it should have its own ticket.
+Scope: both request paths are wired to it -- the speculative prefetch worker and
+the ordinary one in ``_generate``. The ordinary path is the one that matters
+and it was nearly missed: a ``ResponsePrefetchTransaction`` is created in
+exactly one place in the codebase, for tool-follow-up speculation, so a *revised
+turn* -- the caller talking on past a transcript already sent upstream, which is
+what SOP-538 is about -- carries none and is cancelled through the
+``CancelScope`` on the ordinary path instead. Wiring only the prefetch worker
+left the mechanism inert in production: measured on the live call of
+2026-09-04 14:11, zero aborts logged while three turns lost 7.6 s, 14.1 s and
+20.1 s to exactly this. Verified engaged at 14:33, three aborts, no dead gaps.
 
 **Connection setup is not covered, and the boundary is exactly here.** Once a
 connection is established, every read is abortable, and that is where the
