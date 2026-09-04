@@ -1830,9 +1830,12 @@ def test_revision_does_not_wait_for_the_superseded_requests_stalled_provider(cap
             "no measurement line recorded how long the superseded request held the turn up; "
             f"saw: {[r.getMessage() for r in caplog.records]}"
         )
-        held_up_s = measured[0].args[0]
+        held_up_s, interrupted_now = measured[0].args
         assert isinstance(held_up_s, float)
         assert 0.0 <= held_up_s < 30.0
+        # The line must distinguish a request really interrupted from one merely
+        # marked, or a cancellation that changed nothing reads as a success.
+        assert interrupted_now is True
     finally:
         # Retire the revision too, so no pipeline thread outlives the test and
         # logs its provider error over a later one's output.
@@ -1875,13 +1878,16 @@ def test_an_aborted_request_on_an_uncancelled_turn_still_ends_the_response():
         with aborter._lock:
             live_tokens = set(aborter._open)
         assert len(live_tokens) == 1
-        assert aborter.abort(live_tokens.pop()) is True
+        assert aborter.abort(live_tokens.pop()).aborted is True
 
         worker.join(timeout=10.0)
         assert not worker.is_alive(), "process() never returned after its request was aborted"
-        assert [o for o in outputs if isinstance(o, EndOfResponse)], (
-            "no EndOfResponse was emitted, so the session is locked out of every later response"
-        )
+        ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+        assert ends, "no EndOfResponse was emitted, so the session is locked out of every later response"
+        # And it must be marked failed. Ending cleanly here would let
+        # _consume_streaming report success, and whatever text had arrived would
+        # be written to history as a complete assistant turn.
+        assert all(end.error is not None for end in ends), "the cut-short response was reported as a complete one"
     finally:
         worker.join(timeout=5.0)
         server.close()

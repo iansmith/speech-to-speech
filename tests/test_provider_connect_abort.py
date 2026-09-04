@@ -18,6 +18,7 @@ reading, so a design verified against a fake ``create`` that blocks on a
 from __future__ import annotations
 
 import socket
+import ssl
 import threading
 import time
 
@@ -30,6 +31,7 @@ from speech_to_speech.LLM.provider_connect_abort import (
     ProviderConnectAborter,
     ProviderRequestAborted,
     _TrackedStream,
+    _TrackingBackend,
 )
 from tests.stalling_provider import STALL_S, KeepAliveProvider, StallingProvider
 
@@ -95,7 +97,7 @@ def test_abort_unblocks_a_request_parked_waiting_for_response_headers(stalling_p
     assert stalling_provider.request_received.wait(5.0), "server never received the request"
     time.sleep(0.2)  # let the client settle into the header read
 
-    assert aborter.abort(outcome["token"]) is True
+    assert aborter.abort(outcome["token"]).socket_torn_down is True
     thread.join(timeout=2.0)
 
     assert not thread.is_alive(), "abort() did not unblock the parked request"
@@ -189,7 +191,7 @@ def test_an_abort_outside_a_request_window_is_refused(stalling_provider, keepali
     assert not thread.is_alive()
 
     # The worker has ended its window; a cancellation arriving now is refused...
-    assert aborter.abort(outcome["token"]) is False
+    assert aborter.abort(outcome["token"]).aborted is False
     assert not aborter.is_armed(outcome["token"])
 
     # ...and a thread inheriting that ident still gets a working request.
@@ -232,7 +234,7 @@ def test_a_late_abort_cannot_kill_the_request_that_replaced_it(stalling_provider
     )
 
     # The stale turn's cancellation finally fires. It must find nothing.
-    assert aborter.abort(stale["token"]) is False
+    assert aborter.abort(stale["token"]).aborted is False
     assert not aborter.is_armed(successor["token"])
     assert successor_thread.is_alive(), "the late abort killed the request that replaced it"
 
@@ -347,8 +349,8 @@ def test_abort_does_not_close_the_descriptor_out_from_under_the_reader():
     closed: list[str] = []
 
     class RecordingStream(httpcore.NetworkStream):
-        def __init__(self) -> None:
-            self.sock = socket.socket()
+        def __init__(self, sock: socket.socket) -> None:
+            self.sock = sock
 
         def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
             return b""
@@ -357,17 +359,30 @@ def test_abort_does_not_close_the_descriptor_out_from_under_the_reader():
             return None
 
         def close(self) -> None:
-            closed.append("closed")
+            closed.append("close")
 
         def get_extra_info(self, info: str) -> object | None:
             return self.sock if info == "socket" else None
 
-    inner = RecordingStream()
+    # A *connected* pair. On an unconnected socket shutdown() raises ENOTCONN,
+    # abort()'s `except OSError` swallows it, and every statement after the
+    # shutdown is skipped -- so the test would pass whatever followed it.
+    ours, peer = socket.socketpair()
     try:
-        _TrackedStream(inner, ProviderConnectAborter()).abort()
-        assert closed == [], "abort() closed the descriptor; only the owning thread may"
+        _TrackedStream(RecordingStream(ours), ProviderConnectAborter()).abort()
+
+        # The shutdown really happened, so the assertions below mean something.
+        peer.settimeout(2.0)
+        assert peer.recv(1) == b"", "abort() did not shut the connection down"
+
+        assert closed == [], "abort() closed the stream; only the owning thread may"
+        assert ours.fileno() != -1, (
+            "abort() closed the descriptor from the aborting thread; that races the "
+            "reader's poll and loses the wake-up entirely"
+        )
     finally:
-        inner.sock.close()
+        ours.close()
+        peer.close()
 
 
 def test_repeated_aborts_all_land_promptly(stalling_provider):
@@ -387,7 +402,12 @@ def test_repeated_aborts_all_land_promptly(stalling_provider):
     for attempt in range(40):
         outcome: dict = {}
         thread = _post_in_thread(client, url, outcome, aborter)
-        assert stalling_provider.request_received.wait(5.0)
+        # request_received latches, so waiting on it would gate only the first
+        # pass and let later ones abort before the read had even started.
+        deadline = time.monotonic() + 5.0
+        while len(stalling_provider.request_times) <= attempt and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert len(stalling_provider.request_times) == attempt + 1, f"the provider never received request {attempt}"
         time.sleep(0.005)
         aborter.abort(outcome["token"])
         thread.join(timeout=5.0)
@@ -396,3 +416,132 @@ def test_repeated_aborts_all_land_promptly(stalling_provider):
             f"abort {attempt} took {outcome['elapsed']:.2f}s -- it missed the reader "
             f"and the request sat until its read timeout"
         )
+
+
+def test_install_covers_the_transport_a_proxied_client_actually_uses(monkeypatch):
+    """A proxy must not quietly switch the whole mechanism off.
+
+    httpx picks a transport from `_mounts` before falling back to `_transport`,
+    and the SDK builds its client with trust_env, so `HTTPS_PROXY` in the
+    environment routes provider traffic through a mounted transport. Patching
+    only the default one left no tracked stream anywhere -- while abort() still
+    returned True and the log still announced success, because the token was
+    open. That is the silent degradation install() exists to prevent.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+
+    sdk_client = OpenAI(api_key="none", base_url="https://provider.example/v1")
+    aborter = ProviderConnectAborter()
+    aborter.install(sdk_client._client)
+
+    assert sdk_client._client._mounts, "expected the proxy env to produce mounted transports"
+    request = httpx.Request("POST", "https://provider.example/v1/responses")
+    chosen = sdk_client._client._transport_for_url(request.url)
+    assert isinstance(chosen._pool._network_backend, _TrackingBackend), (
+        "the transport this client would really use for provider traffic is untracked"
+    )
+
+
+def test_an_armed_request_never_reaches_the_socket_at_all():
+    """The sticky arm must stop the *next* operation, not just fail the current.
+
+    An abort can land between socket operations -- after the request is written,
+    before the response read begins. Nothing is in flight to tear down then, so
+    the mark is all that stops the request, and it has to be consulted on the
+    way in as well as on the way out.
+    """
+    performed: list[str] = []
+
+    class CountingStream(httpcore.NetworkStream):
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            performed.append("read")
+            return b"x"
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            performed.append("write")
+
+        def close(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object | None:
+            return None
+
+    aborter = ProviderConnectAborter()
+    stream = _TrackedStream(CountingStream(), aborter)
+    token = aborter.begin()
+
+    assert stream.read(1) == b"x"
+    assert performed == ["read"]
+
+    aborter.abort(token)  # nothing bound: only the mark takes effect
+    with pytest.raises(ProviderRequestAborted):
+        stream.read(1)
+    with pytest.raises(ProviderRequestAborted):
+        stream.write(b"x")
+    assert performed == ["read"], "an armed request still touched the socket"
+
+
+def test_an_armed_request_is_not_allowed_to_dial_a_fresh_connection(monkeypatch):
+    """A cancelled request must not open a new connection either.
+
+    The SDK decides on a retry before this layer sees it, so without this check
+    a cancelled request could still complete a TCP (and TLS) handshake it will
+    never use.
+    """
+    dialled: list[str] = []
+
+    def record(*_args: object, **_kwargs: object) -> httpcore.NetworkStream:
+        dialled.append("connect")
+        raise AssertionError("an armed request must not reach the real backend")
+
+    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", record)
+
+    aborter = ProviderConnectAborter()
+    backend = _TrackingBackend(aborter)
+    token = aborter.begin()
+    aborter.abort(token)
+
+    with pytest.raises(ProviderRequestAborted):
+        backend.connect_tcp("example.invalid", 443)
+    assert dialled == [], "an armed request dialled anyway"
+
+
+def test_the_documented_boundary_is_where_the_docstring_says_it_is():
+    """`wrap_socket` detaches the socket, which is why a handshake is not abortable.
+
+    This pins the reason, not the symptom. The module documents connection setup
+    as out of reach, and it would be easy for a later reader to assume
+    `start_tls` is covered simply because `_guarded` wraps it -- it is wrapped,
+    the stream does get bound, and `abort()` returns True. What actually defeats
+    it is that the socket object handed to `wrap_socket` is detached, so the
+    handle the aborter holds is already dead.
+    """
+    left, right = socket.socketpair()
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    handshake = threading.Thread(
+        target=lambda: _swallow(lambda: context.wrap_socket(left, server_hostname="x")),
+        daemon=True,
+    )
+    handshake.start()
+    time.sleep(0.2)
+
+    assert left.fileno() == -1, (
+        "wrap_socket no longer detaches its socket -- the TLS handshake may now be "
+        "abortable, and the module docstring's account of the boundary is stale"
+    )
+    with pytest.raises(OSError):
+        left.shutdown(socket.SHUT_RDWR)
+
+    right.close()
+    handshake.join(timeout=5.0)
+
+
+def _swallow(fn):
+    try:
+        fn()
+    except BaseException:
+        pass

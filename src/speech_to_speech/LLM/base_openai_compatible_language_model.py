@@ -75,7 +75,8 @@ PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try
 # took correlating four separate lines across two components. Tests pin this
 # object by identity, so rewording it is safe and deleting it is not.
 STALE_REQUEST_ABORT_LOG = (
-    "Aborted a superseded provider request %.2fs after starting it; the current revision no longer waits for it"
+    "Aborted a superseded provider request %.2fs after starting it (interrupted now: %s); "
+    "the current revision no longer waits for it"
 )
 
 
@@ -477,8 +478,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 abort_token = self._connect_aborter.begin()
 
                 def abort_connect() -> None:
-                    if abort_token is not None and self._connect_aborter.abort(abort_token):
-                        logger.info(STALE_REQUEST_ABORT_LOG, time.monotonic() - request_started_at)
+                    if abort_token is None:
+                        return
+                    outcome = self._connect_aborter.abort(abort_token)
+                    if outcome.aborted:
+                        logger.info(
+                            STALE_REQUEST_ABORT_LOG,
+                            time.monotonic() - request_started_at,
+                            outcome.socket_torn_down,
+                        )
 
                 transaction.register_abort(abort_connect)
                 api_response = request()
@@ -541,7 +549,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     # poll an empty queue forever on a turn nobody cancelled,
                     # _generate would never reach its EndOfResponse, and every
                     # later response would be locked out behind it.
-                    return
+                    #
+                    # Raising rather than returning, because the turn reaching
+                    # here was NOT cancelled -- the loop condition tests that
+                    # first -- so its answer really was cut short. Returning
+                    # would end the iterator the way a finished response does,
+                    # and _consume_streaming would report success: whatever text
+                    # had arrived would be committed to history as a complete
+                    # assistant turn, and the caller would hear a sentence stop
+                    # mid-thought with nothing marking it as failed.
+                    raise RuntimeError("Provider request ended before the response was complete.")
                 if not succeeded:
                     worker.join()
                     raise value
@@ -908,12 +925,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 )
                 error_message = f"Language model generation timed out after {self.request_timeout_s:.1f}s."
             except ProviderRequestAborted:
-                # A BaseException, so the `except Exception` below would not stop
-                # it escaping process() -- and an escape means no EndOfResponse
-                # and a session locked out of every later response. The prefetch
-                # worker handles its own, so reaching here means a request was
-                # aborted on this thread; end the response quietly, the way a
-                # cancelled turn does.
+                # Unreachable as things stand: only a thread that called begin()
+                # can raise this, and that is the prefetch worker, which handles
+                # its own at the point it is raised. It is here because the cost
+                # of being wrong is high and asymmetric -- this is a
+                # BaseException, so the `except Exception` below would not stop
+                # one escaping process(), and an escape means no EndOfResponse
+                # and a session locked out of every later response.
                 logger.info("Provider request aborted; ending the current response")
             except Exception as exc:
                 # Any other generation failure must still terminate the response: record
