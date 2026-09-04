@@ -11,13 +11,20 @@ it, so the abandoned request runs to completion on its own schedule and, because
 provider workers are capped, the turn the caller actually finished queues behind
 it. On the live call of 2026-09-03 that cost 15.6 s of a 24.2 s turn.
 
-Closing the httpx client does not help: ``httpx.Client.close()`` closes *idle*
-pooled connections and leaves alone the one another thread is actively reading.
-Nor does ``socket.close()`` from a second thread -- on macOS a thread already
-blocked in ``recv`` is not woken by the descriptor being closed. What does work
-is ``shutdown(SHUT_RDWR)``, which tears down both directions of the TCP
-connection and wakes the blocked reader immediately; following it with a close
-sends the FIN that tells the provider to stop generating.
+Closing does not help, and closing is in fact harmful. ``httpx.Client.close()``
+does close every pooled connection, active ones included, but closing a
+descriptor is not what wakes a thread already blocked reading it -- measured on
+macOS, the reader stays parked. Worse, ``socket.close()`` from a second thread
+races the reader: CPython's timed ``recv`` is a ``poll`` loop that copies
+``sock_fd`` into its pollfd, and ``close()`` sets that field to -1 first, so a
+close landing in the wrong moment leaves the reader polling fd -1 -- which POSIX
+ignores -- and it sleeps out the whole read timeout.
+
+``shutdown(SHUT_RDWR)`` is what works, and it is used alone. It tears down both
+directions, sends the FIN that tells the provider to stop generating, and wakes
+the blocked reader -- usually within a millisecond, though scheduling means
+"promptly", not "immediately". The descriptor is left for the owning thread to
+close on its way out, where nothing is racing it.
 
 Reaching the socket means reaching the network stream httpcore opened, which
 means installing a custom network backend. Two design constraints shaped this:
@@ -41,11 +48,20 @@ so arming is sticky: the token is marked, and the next socket operation on it
 fails at once. A token whose window has closed is refused outright, so a late
 abort does nothing at all.
 
+Scope: this is wired into the speculative prefetch worker only, which is where
+the measured stall was. An ordinary (non-prefetch) turn still arms its abort
+after ``request()`` returns, so a barge-in during *its* connect is bounded by
+the connect timeout rather than interrupted. Same hole, different path; SOP-538
+did not set out to close it.
+
 One case is deliberately *not* covered: a thread already parked inside
-``socket.create_connection`` cannot be interrupted, because there is no socket
-object yet to shut down. The backend refuses to dial on an armed token, so the
-exposure is one connect timeout on a provider that accepts TCP but never
-answers -- not the header wait this module exists to bound.
+``socket.create_connection`` cannot be interrupted, because no socket object
+exists yet to shut down. That is a peer which never completes the TCP handshake,
+and it is bounded by the connect timeout (10 s) rather than the read timeout.
+The case this module exists for is the opposite one -- a provider that accepts
+the connection promptly and then says nothing -- and there the socket exists, so
+the read is abortable. The backend also refuses to dial on an already-armed
+token, so a cancelled request cannot start a fresh connection.
 """
 
 from __future__ import annotations
@@ -74,7 +90,8 @@ class ProviderRequestAborted(BaseException):
 
 
 class ProviderConnectAborter:
-    """Aborts whatever provider request a given thread currently has in flight."""
+    """Aborts an in-flight provider request, addressed by the token :meth:`begin`
+    handed to whoever issued it."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -195,7 +212,8 @@ class ProviderConnectAborter:
 
 
 class _TrackedStream(httpcore.NetworkStream):
-    """A network stream that remembers which thread is using it right now."""
+    """A network stream that reports itself to the aborter while it is in use, so
+    the request currently reading it can be reached from another thread."""
 
     def __init__(self, inner: httpcore.NetworkStream, aborter: ProviderConnectAborter) -> None:
         self._inner = inner
@@ -207,7 +225,7 @@ class _TrackedStream(httpcore.NetworkStream):
             self.abort()
             raise ProviderRequestAborted("provider request aborted before it reached the socket")
         try:
-            return operation(*args)
+            result = operation(*args)
         except BaseException:
             # Tearing the socket down surfaces here as an ordinary read error,
             # indistinguishable to the SDK from a flaky network -- and so
@@ -218,6 +236,15 @@ class _TrackedStream(httpcore.NetworkStream):
         finally:
             if token is not None:
                 self._aborter._unbind(token)
+        # A shut-down socket does not always surface as an error: the read can
+        # just as well return b"" and let httpcore raise RemoteProtocolError one
+        # layer up, which is an ordinary Exception and so retryable -- the SDK
+        # would then sleep and re-issue the cancelled request on this very
+        # worker thread. Checking the arm on the way out as well as on the way
+        # through is what closes that door.
+        if token is not None and self._aborter.is_armed(token):
+            raise ProviderRequestAborted("provider request aborted mid-flight")
+        return result
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         return self._guarded(self._inner.read, max_bytes, timeout)
@@ -241,22 +268,29 @@ class _TrackedStream(httpcore.NetworkStream):
         return self._inner.get_extra_info(info)
 
     def abort(self) -> None:
-        """Tear the connection down hard enough to wake a blocked reader.
+        """Shut the connection down so the parked reader wakes and the provider
+        sees the hang-up.
 
-        ``shutdown`` is what unblocks the parked thread -- closing the socket
-        alone leaves it parked -- and the ``close`` that follows sends the FIN
-        that tells the provider to stop generating a response nobody will read.
+        ``shutdown`` and nothing else. Closing the socket from this thread is
+        actively harmful: CPython's timed ``recv`` is a ``poll`` loop that reads
+        ``sock_fd`` into its pollfd, and ``socket.close()`` sets that field to
+        -1 before closing the descriptor. A close landing between the reader's
+        ``settimeout`` and its ``poll`` therefore leaves it polling fd -1, which
+        POSIX ignores -- so the reader sleeps out the *entire* read timeout, 20s
+        here, having already missed the wake-up the shutdown would have given
+        it. Measured at ~7% of aborts, which is worse than the stall this module
+        exists to remove.
+
+        The descriptor is closed by the owning thread on its way out, through
+        httpcore's ordinary teardown, where nothing is racing it.
         """
         raw = self._inner.get_extra_info("socket")
-        if raw is not None:
-            try:
-                raw.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # already gone; the close below still tidies up
+        if raw is None:
+            return
         try:
-            self._inner.close()
-        except Exception:
-            pass
+            raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already gone
 
 
 class _TrackingBackend(httpcore.SyncBackend):

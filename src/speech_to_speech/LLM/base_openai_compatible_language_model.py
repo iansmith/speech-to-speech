@@ -75,7 +75,7 @@ PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try
 # took correlating four separate lines across two components. Tests pin this
 # object by identity, so rewording it is safe and deleting it is not.
 STALE_REQUEST_ABORT_LOG = (
-    "Aborted a superseded provider request %.2fs after sending it; the current revision no longer waits for it"
+    "Aborted a superseded provider request %.2fs after starting it; the current revision no longer waits for it"
 )
 
 
@@ -467,7 +467,6 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         def connect_and_read_events() -> None:
             api_response: Any = None
             abort_token: int | None = None
-            was_aborted = False
             try:
                 request_started_at = time.monotonic()
                 # Opened *before* request(), because until that returns there is
@@ -504,19 +503,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 publish((False, exc))
                 return
             finally:
+                # Closing the window before the slot is released means a late
+                # abort for this request cannot disturb its successor.
                 if abort_token is not None:
-                    # Read the arm before closing the window, which clears it.
-                    was_aborted = self._connect_aborter.is_armed(abort_token)
-                    # Closing before the slot is released means a late abort for
-                    # this request cannot disturb its successor.
                     self._connect_aborter.end(abort_token)
                 self._close_response(api_response)
-            if was_aborted:
-                # Tearing a socket down mid-body can end the event iterator
-                # cleanly rather than raising. Publishing `done` here would
-                # present a truncated answer as a whole one, and history would
-                # keep it.
-                return
             publish((True, done))
 
         worker = self._start_prefetch_worker(connect_and_read_events, name="realtime-tool-prefetch")

@@ -17,15 +17,18 @@ reading, so a design verified against a fake ``create`` that blocks on a
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 
+import httpcore
 import httpx
 import pytest
 from openai import OpenAI
 
 from speech_to_speech.LLM.provider_connect_abort import (
     ProviderConnectAborter,
+    ProviderRequestAborted,
     _TrackedStream,
 )
 from tests.stalling_provider import STALL_S, KeepAliveProvider, StallingProvider
@@ -283,3 +286,113 @@ def test_install_reaches_the_openai_sdk_clients_transport():
     aborter.install(sdk_client._client)  # must not raise
 
     assert aborter.installed_on is sdk_client._client
+
+
+def test_an_abort_that_surfaces_as_a_clean_eof_is_still_terminal():
+    """A torn-down socket does not always raise -- and the quiet path is the
+    dangerous one.
+
+    `read` returning b"" instead of erroring makes httpcore raise
+    RemoteProtocolError, an ordinary Exception, which the OpenAI SDK treats as a
+    flaky network: it sleeps and re-issues the cancelled request on the very
+    provider worker thread that is supposed to be freeing its slot. Checking the
+    arm only in the error path left that door open; measured at roughly one
+    abort in forty.
+    """
+
+    aborter = ProviderConnectAborter()
+    abort_during_read: list[int] = []
+
+    class SilentlyClosedStream(httpcore.NetworkStream):
+        """Reads clean EOF, the way a shut-down socket often does.
+
+        The abort lands *inside* the read, which is the real ordering: another
+        thread tears the socket down while this one is parked in it. Arming
+        before the read would only exercise the entry check.
+        """
+
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            for token in abort_during_read:
+                aborter.abort(token)
+            return b""
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object | None:
+            return None
+
+    stream = _TrackedStream(SilentlyClosedStream(), aborter)
+
+    token = aborter.begin()
+    assert stream.read(10) == b"", "a healthy request must still see its EOF"
+
+    abort_during_read.append(token)
+    with pytest.raises(ProviderRequestAborted):
+        stream.read(10)
+
+
+def test_abort_does_not_close_the_descriptor_out_from_under_the_reader():
+    """`abort` must shut the socket down and stop there.
+
+    Closing from the aborting thread races the reader: CPython's timed `recv`
+    polls a `sock_fd` that `close()` has already set to -1, and POSIX ignores a
+    negative fd -- so the reader misses the wake-up entirely and sleeps out the
+    full read timeout (20 s in production), which is worse than the stall this
+    module removes. Measured at ~7% of aborts before this.
+    """
+    closed: list[str] = []
+
+    class RecordingStream(httpcore.NetworkStream):
+        def __init__(self) -> None:
+            self.sock = socket.socket()
+
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            return b""
+
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            closed.append("closed")
+
+        def get_extra_info(self, info: str) -> object | None:
+            return self.sock if info == "socket" else None
+
+    inner = RecordingStream()
+    try:
+        _TrackedStream(inner, ProviderConnectAborter()).abort()
+        assert closed == [], "abort() closed the descriptor; only the owning thread may"
+    finally:
+        inner.sock.close()
+
+
+def test_repeated_aborts_all_land_promptly(stalling_provider):
+    """The abort must be reliable, not merely usually reliable.
+
+    A cancellation that silently fails to wake its reader leaves the worker slot
+    held for the full read timeout while the log line claims success -- the
+    original bug, invisible. One lost abort in a run of these is a real defect,
+    so this fails on the first, and a correct implementation cannot fail it.
+    """
+    aborter = ProviderConnectAborter()
+    # A short read timeout keeps a lost abort cheap to detect rather than slow.
+    client = httpx.Client(timeout=httpx.Timeout(1.0, connect=5.0))
+    aborter.install(client)
+
+    url = f"http://127.0.0.1:{stalling_provider.port}/v1/x"
+    for attempt in range(40):
+        outcome: dict = {}
+        thread = _post_in_thread(client, url, outcome, aborter)
+        assert stalling_provider.request_received.wait(5.0)
+        time.sleep(0.005)
+        aborter.abort(outcome["token"])
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), f"abort {attempt} never woke its reader"
+        assert outcome["elapsed"] < 0.9, (
+            f"abort {attempt} took {outcome['elapsed']:.2f}s -- it missed the reader "
+            f"and the request sat until its read timeout"
+        )
