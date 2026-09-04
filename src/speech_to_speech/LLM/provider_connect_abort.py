@@ -26,27 +26,31 @@ means installing a custom network backend. Two design constraints shaped this:
   request its own ``httpx.Client`` would also expose the socket, at the cost of
   a fresh TCP and TLS handshake on every single turn -- a latency regression
   inside a latency fix. Wrapping the shared client keeps connection reuse.
-* **Aborts are addressed to a thread, not to a request.** A provider worker is
-  dedicated to one request for its lifetime, so "the socket thread T is using"
-  identifies the request unambiguously, and it is knowable from outside without
-  threading a handle back out of the SDK.
+* **Aborts are addressed to a request, by token.** :meth:`begin` opens a window
+  and hands back a token; everything else -- arming, finding the socket,
+  closing the window -- is keyed on that token. Addressing a *thread* instead
+  is the obvious shortcut and it is wrong: provider workers are capped at one
+  and strictly sequential, so CPython hands the same ident to consecutive
+  workers essentially always (measured: 300 sequential threads, one distinct
+  ident). A cancellation that arrives just after its own worker finished would
+  then land on that worker's successor and kill a live turn.
 
-An abort that arrives when the thread is between socket operations -- during
-connect, or in the gap between writing the request and reading the response --
-must not be lost, so arming is sticky: the thread is marked, and the next socket
-operation it attempts fails at once.
+An abort that arrives when the thread is between socket operations -- in the gap
+between writing the request and reading the response, say -- must not be lost,
+so arming is sticky: the token is marked, and the next socket operation on it
+fails at once. A token whose window has closed is refused outright, so a late
+abort does nothing at all.
 
-Sticky marks make the request boundary load-bearing. A worker brackets its
-request with :meth:`ProviderConnectAborter.begin` and :meth:`end`, and an abort
-for a thread that is not between those two is refused rather than remembered.
-Without that, a cancellation racing a worker that had already finished would
-leave a mark on a dead thread's ident -- and CPython hands those idents out
-again, so the next worker to inherit it would fail its first socket operation
-for a request cancelled long before it existed.
+One case is deliberately *not* covered: a thread already parked inside
+``socket.create_connection`` cannot be interrupted, because there is no socket
+object yet to shut down. The backend refuses to dial on an armed token, so the
+exposure is one connect timeout on a provider that accepts TCP but never
+answers -- not the header wait this module exists to bound.
 """
 
 from __future__ import annotations
 
+import itertools
 import socket
 import threading
 from typing import Any
@@ -74,9 +78,11 @@ class ProviderConnectAborter:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._streams: dict[int, _TrackedStream] = {}
+        self._tokens = itertools.count(1)
+        self._token_of_thread: dict[int, int] = {}
+        self._stream_of_token: dict[int, _TrackedStream] = {}
         self._armed: set[int] = set()
-        self._active: set[int] = set()
+        self._open: set[int] = set()
         self.installed_on: httpx.Client | None = None
 
     # ── installation ──────────────────────────────────────────────────────────
@@ -84,8 +90,9 @@ class ProviderConnectAborter:
     def install(self, http_client: httpx.Client) -> None:
         """Route *http_client*'s connections through a stream we can abort.
 
-        This reaches through two private attributes of httpx and httpcore, which
-        expose no public hook for the network backend. That is deliberate and
+        This reaches through three private attributes -- httpx's ``_transport``
+        and ``_pool``, and httpcore's ``_network_backend`` -- which expose no
+        public hook for the network backend. That is deliberate and
         deliberately loud: if an upgrade moves them, cancellation would
         otherwise stop working silently and every revised turn would quietly go
         slow again, which is exactly the failure this module exists to end. Note
@@ -105,62 +112,86 @@ class ProviderConnectAborter:
 
     # ── arming ────────────────────────────────────────────────────────────────
 
-    def begin(self, thread_ident: int) -> None:
-        """Open the window in which *thread_ident* may be aborted.
+    def begin(self) -> int:
+        """Open an abort window for the request the calling thread is about to
+        issue, and return the token that addresses it.
 
-        Called by a provider worker before it issues its request, so that a
-        cancellation arriving during connect has something to act on.
+        Called before the request, so a cancellation arriving while the provider
+        is still silent has something to act on.
+        """
+        token = next(self._tokens)
+        with self._lock:
+            self._token_of_thread[threading.get_ident()] = token
+            self._open.add(token)
+        return token
+
+    def end(self, token: int) -> None:
+        """Close *token*'s window. Aborts for it are refused from here on."""
+        ident = threading.get_ident()
+        with self._lock:
+            self._open.discard(token)
+            self._armed.discard(token)
+            self._stream_of_token.pop(token, None)
+            if self._token_of_thread.get(ident) == token:
+                del self._token_of_thread[ident]
+
+    def abort(self, token: int) -> bool:
+        """Abort the request *token* addresses, and anything it starts next.
+
+        Returns whether the request was aborted at all -- true both when a
+        socket was torn down and when the request was between socket operations
+        and only the sticky arm took effect. False means the window is closed:
+        the request already finished and nothing was disturbed.
         """
         with self._lock:
-            self._armed.discard(thread_ident)
-            self._active.add(thread_ident)
-
-    def end(self, thread_ident: int) -> None:
-        """Close that window, disarming the thread for reuse."""
-        with self._lock:
-            self._active.discard(thread_ident)
-            self._armed.discard(thread_ident)
-
-    def abort(self, thread_ident: int) -> bool:
-        """Abort *thread_ident*'s in-flight request, and any it starts next.
-
-        Returns whether a socket was actually torn down. False can mean either
-        that the thread has no request in flight (nothing to do), or that it is
-        between socket operations -- in which case the arm stands and the next
-        operation it attempts fails at once.
-        """
-        with self._lock:
-            if thread_ident not in self._active:
+            if token not in self._open:
                 return False
-            self._armed.add(thread_ident)
-            stream = self._streams.get(thread_ident)
-        if stream is None:
-            return False
-        stream.abort()
+            self._armed.add(token)
+            stream = self._stream_of_token.get(token)
+            if stream is not None:
+                # Torn down while still holding the lock. Releasing it first
+                # leaves a window in which the request can finish and return
+                # its connection to the pool, and the teardown then lands on
+                # whichever request picked that pooled connection up next.
+                # ``shutdown``/``close`` are non-blocking syscalls, so holding
+                # the lock across them cannot stall another thread for long.
+                stream.abort()
         return True
 
-    def is_armed(self, thread_ident: int) -> bool:
+    def is_armed(self, token: int) -> bool:
         with self._lock:
-            return thread_ident in self._armed
+            return token in self._armed
+
+    def current_thread_is_armed(self) -> bool:
+        with self._lock:
+            token = self._token_of_thread.get(threading.get_ident())
+            return token is not None and token in self._armed
 
     # ── used by the tracked streams ───────────────────────────────────────────
 
-    def _bind(self, stream: _TrackedStream) -> bool:
-        """Register the calling thread as the owner of *stream*.
+    def _bind(self, stream: _TrackedStream) -> tuple[bool, int | None]:
+        """Claim *stream* for the calling thread's in-flight request.
 
-        Returns False when that thread's abort is already armed, in which case
-        the caller must not begin the socket operation.
+        Returns ``(allowed, token)``. ``allowed`` is false only when that
+        request's abort is already armed, in which case the caller must not
+        begin the socket operation. A thread with no open window is untracked
+        -- not every user of the shared httpx client is a provider worker -- and
+        is allowed through with no token.
         """
-        ident = threading.get_ident()
         with self._lock:
-            if ident in self._armed:
-                return False
-            self._streams[ident] = stream
-        return True
+            token = self._token_of_thread.get(threading.get_ident())
+            if token is None:
+                return True, None
+            if token in self._armed:
+                return False, token
+            self._stream_of_token[token] = stream
+        return True, token
 
-    def _unbind(self) -> None:
+    def _unbind(self, token: int) -> None:
+        """Release the stream, so an abort between operations arms rather than
+        reaching a connection that may already be back in the pool."""
         with self._lock:
-            self._streams.pop(threading.get_ident(), None)
+            self._stream_of_token.pop(token, None)
 
 
 class _TrackedStream(httpcore.NetworkStream):
@@ -171,8 +202,8 @@ class _TrackedStream(httpcore.NetworkStream):
         self._aborter = aborter
 
     def _guarded(self, operation: Any, *args: Any) -> Any:
-        ident = threading.get_ident()
-        if not self._aborter._bind(self):
+        allowed, token = self._aborter._bind(self)
+        if not allowed:
             self.abort()
             raise ProviderRequestAborted("provider request aborted before it reached the socket")
         try:
@@ -181,11 +212,12 @@ class _TrackedStream(httpcore.NetworkStream):
             # Tearing the socket down surfaces here as an ordinary read error,
             # indistinguishable to the SDK from a flaky network -- and so
             # retryable. Re-raise as the cancellation it actually is.
-            if self._aborter.is_armed(ident):
+            if token is not None and self._aborter.is_armed(token):
                 raise ProviderRequestAborted("provider request aborted mid-flight") from None
             raise
         finally:
-            self._aborter._unbind()
+            if token is not None:
+                self._aborter._unbind(token)
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         return self._guarded(self._inner.read, max_bytes, timeout)
@@ -237,7 +269,7 @@ class _TrackingBackend(httpcore.SyncBackend):
     def _connect(self, opener: Any, *args: Any, **kwargs: Any) -> httpcore.NetworkStream:
         # Refuse to dial at all on an armed thread, so a retry the SDK has
         # already decided on cannot open a connection that is doomed anyway.
-        if self._aborter.is_armed(threading.get_ident()):
+        if self._aborter.current_thread_is_armed():
             raise ProviderRequestAborted("provider request aborted before connecting")
         return _TrackedStream(opener(*args, **kwargs), self._aborter)
 

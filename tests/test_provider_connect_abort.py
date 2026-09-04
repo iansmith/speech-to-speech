@@ -24,7 +24,10 @@ import httpx
 import pytest
 from openai import OpenAI
 
-from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter
+from speech_to_speech.LLM.provider_connect_abort import (
+    ProviderConnectAborter,
+    _TrackedStream,
+)
 from tests.stalling_provider import STALL_S, KeepAliveProvider, StallingProvider
 
 
@@ -50,10 +53,13 @@ def _post_in_thread(
 ) -> threading.Thread:
     """Issue one request the way a provider worker does: bracketed by begin/end."""
 
+    started_flag = threading.Event()
+
     def run() -> None:
-        ident = threading.get_ident()
-        outcome["thread_ident"] = ident
-        aborter.begin(ident)
+        token = aborter.begin()
+        outcome["token"] = token
+        outcome["thread_ident"] = threading.get_ident()
+        started_flag.set()
         started = time.monotonic()
         try:
             client.post(url, json={"hello": "world"})
@@ -62,10 +68,11 @@ def _post_in_thread(
             outcome["result"] = type(exc).__name__
         finally:
             outcome["elapsed"] = time.monotonic() - started
-            aborter.end(ident)
+            aborter.end(token)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
+    started_flag.wait(2.0)  # the token exists before the caller may abort it
     return thread
 
 
@@ -85,7 +92,7 @@ def test_abort_unblocks_a_request_parked_waiting_for_response_headers(stalling_p
     assert stalling_provider.request_received.wait(5.0), "server never received the request"
     time.sleep(0.2)  # let the client settle into the header read
 
-    assert aborter.abort(outcome["thread_ident"]) is True
+    assert aborter.abort(outcome["token"]) is True
     thread.join(timeout=2.0)
 
     assert not thread.is_alive(), "abort() did not unblock the parked request"
@@ -108,7 +115,7 @@ def test_abort_disconnects_the_socket_before_the_server_sends_headers(stalling_p
     assert stalling_provider.request_received.wait(5.0)
     time.sleep(0.2)
 
-    aborter.abort(outcome["thread_ident"])
+    aborter.abort(outcome["token"])
     thread.join(timeout=2.0)
 
     assert stalling_provider.client_disconnected_before_headers.wait(2.0), (
@@ -132,9 +139,7 @@ def test_an_abort_armed_before_the_request_starts_still_stops_it(stalling_provid
     armed = threading.Event()
 
     def run() -> None:
-        ident = threading.get_ident()
-        outcome["thread_ident"] = ident
-        aborter.begin(ident)  # the window opens before the request, by design
+        outcome["token"] = aborter.begin()  # the window opens before the request
         ready.set()
         armed.wait(5.0)
         started = time.monotonic()
@@ -145,13 +150,13 @@ def test_an_abort_armed_before_the_request_starts_still_stops_it(stalling_provid
             outcome["result"] = type(exc).__name__
         finally:
             outcome["elapsed"] = time.monotonic() - started
-            aborter.end(ident)
+            aborter.end(outcome["token"])
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     assert ready.wait(2.0)
 
-    aborter.abort(outcome["thread_ident"])  # nothing in flight yet
+    aborter.abort(outcome["token"])  # nothing in flight yet
     armed.set()
     thread.join(timeout=3.0)
 
@@ -176,19 +181,60 @@ def test_an_abort_outside_a_request_window_is_refused(stalling_provider, keepali
     thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", outcome, aborter)
     assert stalling_provider.request_received.wait(5.0)
     time.sleep(0.2)
-    aborter.abort(outcome["thread_ident"])
+    aborter.abort(outcome["token"])
     thread.join(timeout=2.0)
     assert not thread.is_alive()
 
     # The worker has ended its window; a cancellation arriving now is refused...
-    assert aborter.abort(outcome["thread_ident"]) is False
-    assert not aborter.is_armed(outcome["thread_ident"])
+    assert aborter.abort(outcome["token"]) is False
+    assert not aborter.is_armed(outcome["token"])
 
     # ...and a thread inheriting that ident still gets a working request.
     inheritor: dict = {}
     reuse = _post_in_thread(client, f"http://127.0.0.1:{keepalive_provider.port}/v1/x", inheritor, aborter)
     reuse.join(timeout=5.0)
     assert inheritor["result"] == "returned"
+
+
+def test_a_late_abort_cannot_kill_the_request_that_replaced_it(stalling_provider, keepalive_provider):
+    """The successor case, which is the one that actually bites.
+
+    Provider workers are capped at one and strictly sequential, so CPython hands
+    the same thread ident to consecutive workers essentially always. If aborts
+    were addressed to a thread, this sequence -- a stale turn's abort callback
+    firing just after its own request finished and the revision's worker took
+    over the ident -- would tear down the *revision's* live request. The
+    revision is not cancelled, so nothing would re-issue it.
+    """
+    aborter = ProviderConnectAborter()
+    client = httpx.Client(timeout=httpx.Timeout(STALL_S * 3, connect=5.0))
+    aborter.install(client)
+
+    # A first request that completes normally, and whose window then closes.
+    stale: dict = {}
+    stale_thread = _post_in_thread(client, f"http://127.0.0.1:{keepalive_provider.port}/v1/x", stale, aborter)
+    stale_thread.join(timeout=5.0)
+    assert stale["result"] == "returned"
+
+    # A second request on a token issued after the first one's window closed.
+    successor: dict = {}
+    successor_thread = _post_in_thread(client, f"http://127.0.0.1:{stalling_provider.port}/v1/x", successor, aborter)
+    assert stalling_provider.request_received.wait(5.0)
+    time.sleep(0.2)
+
+    # Without this the test is vacuous: it only exercises the hazard if the two
+    # workers really did share an ident, which is the normal case here.
+    assert successor["thread_ident"] == stale["thread_ident"], (
+        "thread idents were not reused, so this run never exercised the hazard"
+    )
+
+    # The stale turn's cancellation finally fires. It must find nothing.
+    assert aborter.abort(stale["token"]) is False
+    assert not aborter.is_armed(successor["token"])
+    assert successor_thread.is_alive(), "the late abort killed the request that replaced it"
+
+    aborter.abort(successor["token"])  # tidy up: release the stalled request
+    successor_thread.join(timeout=2.0)
 
 
 def test_normal_requests_still_reuse_one_pooled_connection(keepalive_provider):
@@ -210,6 +256,12 @@ def test_normal_requests_still_reuse_one_pooled_connection(keepalive_provider):
     assert keepalive_provider.accepted_connections == 1, (
         f"pooling lost: {keepalive_provider.accepted_connections} TCP connections for 3 requests"
     )
+    # ...and that the pooled connection is one we could actually abort. Without
+    # this the test passes just as happily with install() removed, proving only
+    # that httpx pools.
+    pooled = list(client._transport._pool.connections)
+    assert pooled, "no pooled connection to inspect"
+    assert isinstance(pooled[0]._connection._network_stream, _TrackedStream)
 
 
 def test_install_reaches_the_openai_sdk_clients_transport():

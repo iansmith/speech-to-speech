@@ -1835,3 +1835,47 @@ def test_revision_does_not_wait_for_the_superseded_requests_stalled_provider(cap
         assert 0.0 <= held_up_s < 30.0
     finally:
         server.close()
+
+
+def test_an_aborted_request_on_an_uncancelled_turn_still_ends_the_response():
+    """A turn whose request is aborted must still terminate, not hang.
+
+    The prefetch worker reports an aborted request by dying quietly -- there is
+    normally no failure to announce, because the turn that owned it was
+    cancelled. But the consumer loop only ends on cancellation, an error, or the
+    completion sentinel, so a worker that dies having published none of the
+    three would leave it polling an empty queue forever. _generate would then
+    never reach its EndOfResponse, and `st.in_response` stays set: every later
+    response on the session is locked out behind a turn that can never finish.
+
+    Aborting a live request whose turn is *not* cancelled is the shortest way to
+    produce that worker death, so it is what this drives.
+    """
+    server = StallingProvider()
+    try:
+        handler = _make_handler(stream=True, cancel_scope=CancelScope())
+        handler._use_provider_client(OpenAI(api_key="none", base_url=f"http://127.0.0.1:{server.port}/v1"))
+
+        request = _make_request()
+        request.prefetch_transaction = ResponsePrefetchTransaction()
+        outputs: list[object] = []
+        worker = Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+        worker.start()
+        assert server.request_received.wait(5.0)
+        time.sleep(0.2)
+
+        # Reach past the transaction and abort the request directly, leaving the
+        # turn itself perfectly healthy.
+        aborter = handler._connect_aborter
+        with aborter._lock:
+            live_tokens = set(aborter._open)
+        assert len(live_tokens) == 1
+        assert aborter.abort(live_tokens.pop()) is True
+
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "process() never returned after its request was aborted"
+        assert [o for o in outputs if isinstance(o, EndOfResponse)], (
+            "no EndOfResponse was emitted, so the session is locked out of every later response"
+        )
+    finally:
+        server.close()
