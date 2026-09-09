@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Mapping
 from queue import Queue
 from threading import Event as ThreadingEvent
@@ -75,6 +76,17 @@ from speech_to_speech.pipeline.transcript_logging import log_exception, transcri
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
+
+# STUCK_CONVERSATION_S is how long tool results may sit in the model's context
+# with nothing generating before check_stuck_conversation says so.
+#
+# Above any legitimate gap: a client answers a tool call and sends its
+# response.create in the same breath, and even one that waits for the emitting
+# response to finish is waiting on that response's audio tail -- hundreds of
+# milliseconds on the calls measured, not seconds. Far below aatoolkit's
+# realtime idle guard (90s compiled, 120s on the sophie fleet), which is the
+# thing that used to notice, two minutes late and without saying why.
+STUCK_CONVERSATION_S = 10.0
 
 PIPELINE_SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 512
@@ -256,6 +268,57 @@ class ConnState(BaseModel):
     # frame has finished sending. Pipeline output is held behind this key so a
     # fast or already-buffered generation cannot overtake that lifecycle event.
     response_created_pending_key: str | None = None
+
+    # --- stuck-conversation detection -------------------------------------
+    #
+    # The three fields below exist because of one failure and are only ever
+    # read to describe or detect it. A client answered four tool calls, every
+    # response.create it sent was rejected because the response that emitted
+    # those calls was still generating, and the conversation was left with the
+    # results in context and nothing producing speech. Nothing said so: the
+    # rejections were ordinary error frames, and the call sat silent until the
+    # carrier's idle guard dropped it two minutes later.
+    #
+    # Detection is deliberately separate from correction. The server does not
+    # create a response the client did not ask for -- see
+    # maybe_start_tool_followup_prefetch, which speculatively GENERATES after a
+    # tool output without opening a response, precisely so the client's
+    # response.create stays the thing that does. These fields make the stuck
+    # state observable; they do not resolve it.
+
+    # response_started_at is when the active response began, for reporting how
+    # long a rejecting response has been running. None when idle.
+    response_started_at: float | None = None
+    # tool_output_awaiting_response_at is when a function_call_output first
+    # landed in the chat with no response since. None means nothing is owed.
+    tool_output_awaiting_response_at: float | None = None
+    # stuck_conversation_reported keeps the watchdog to one line per episode:
+    # it is checked on the audio path, which ticks every 20ms.
+    stuck_conversation_reported: bool = False
+
+    def mark_response_started(self) -> None:
+        """Open a response: the one place in_response becomes true."""
+        self.in_response = True
+        self.response_started_at = time.monotonic()
+        # A response is exactly what the pending tool outputs were waiting for.
+        self.tool_output_awaiting_response_at = None
+        self.stuck_conversation_reported = False
+
+    def mark_response_finished(self) -> None:
+        """Close a response. Paired with mark_response_started."""
+        self.in_response = False
+        self.response_started_at = None
+
+    def note_tool_output_awaiting_response(self) -> None:
+        """Record that a tool result is in context with nothing speaking it."""
+        if self.tool_output_awaiting_response_at is None:
+            self.tool_output_awaiting_response_at = time.monotonic()
+
+    def active_response_age_s(self) -> float | None:
+        """How long the active response has been running, or None when idle."""
+        if self.response_started_at is None:
+            return None
+        return time.monotonic() - self.response_started_at
 
     def mark_response_pending(self, response_key: str) -> None:
         """Track an implicit response from queueing until its first output."""
@@ -445,6 +508,46 @@ class RealtimeService:
         response_key: str | None = None,
     ) -> list[ServerEvent]:
         return self.response.finish_audio_output(conn_id, response_key)
+
+    def check_stuck_conversation(self, conn_id: str) -> bool:
+        """Report a conversation left with tool results and nothing speaking them.
+
+        This is the generic backstop for the failure that
+        ConnState's stuck-conversation fields describe. It catches the shape
+        rather than one cause: results in the model's context, no response
+        running, none queued, and nothing having changed for
+        STUCK_CONVERSATION_S. A client that never sends its response.create, or
+        sends one that is rejected and never retried, or loses the reply on the
+        wire, all land here alike.
+
+        It only ever LOGS. Creating a response the client did not ask for would
+        break the protocol's one guarantee about response.create -- that it
+        either opens a response or fails -- and would double-speak against a
+        client that correctly retries after seeing the error.
+
+        Called from the audio path, which ticks about every 20ms while a caller
+        is connected, so no timer or per-session task is needed. The early
+        return keeps that hot path to one None check in the ordinary case.
+        Returns whether it reported, for tests.
+        """
+        st = self._state(conn_id)
+        awaiting = st.tool_output_awaiting_response_at
+        if awaiting is None or st.stuck_conversation_reported:
+            return False
+        if st.in_response or st.response_pending:
+            return False
+        waited = time.monotonic() - awaiting
+        if waited < STUCK_CONVERSATION_S:
+            return False
+        st.stuck_conversation_reported = True
+        logger.warning(
+            "conversation %s is stuck: tool results have been in context %.1fs with no response "
+            "running or queued, so nothing will speak them. The client owes a response.create; "
+            "if it sent one it was rejected (see the response.create rejected lines above).",
+            st.conversation_id,
+            waited,
+        )
+        return True
 
     def handle_response_create(self, conn_id: str, event: ResponseCreateEvent) -> ServerEvent | None:
         return self.response.handle_response_create(conn_id, event)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Literal
 
 from openai.types.realtime import (
@@ -69,7 +70,7 @@ class ResponseHandler(RealtimeBaseHandler):
             st.current_response_id = _generate_id("resp")
             st.current_response_key = response_key
             self._start_item(conn_id)
-            st.in_response = True
+            st.mark_response_started()
         elif st.current_response_key is None:
             st.current_response_key = response_key
         st.clear_pending_response(effective_response_key)
@@ -119,7 +120,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.response_error_type = None
         st.current_item_id = None
         st.content_index = 0
-        st.in_response = False
+        st.mark_response_finished()
         self._service.close_response_key(conn_id, completed_response_key)
         st.current_response_params = None
         st.pending_assistant_item_id = None
@@ -133,6 +134,57 @@ class ResponseHandler(RealtimeBaseHandler):
         st.finished_function_call_indices = set()
         st.next_assistant_output_sequence = 0
         st.pending_early_tool_calls = {}
+
+    def _reject_create(self, conn_id: str, error_type: str, reason: str) -> ServerEvent:
+        """Refuse one response.create, saying what is holding the conversation.
+
+        The refusals themselves are unchanged and deliberate: the backend runs
+        one response at a time, and response.create either opens a response or
+        fails. What was missing is any account of WHY, in either the frame or
+        the log.
+
+        Measured on the demo call of 2026-09-09 11:01: four rejections in a
+        row, each carrying only the bare sentence, while the response that had
+        emitted the tool calls went on generating audio for another twenty
+        seconds. Nothing named that response, nothing said how long it had been
+        running, and nothing said that four tool results were sitting in the
+        conversation with nothing to speak them -- so the call read as an
+        unexplained silence and took an afternoon of log archaeology to place.
+
+        Detail goes in ``message`` and never in the error TYPE, which is what
+        clients branch on and must stay stable. It is prose for a person
+        reading a log, so nothing asserts on its wording.
+
+        The WARNING is reserved for the case that can actually strand the
+        conversation: a rejection while tool outputs are waiting to be spoken.
+        A rejection with nothing owed is ordinary contention -- a client racing
+        its own turn -- and logging every one at WARNING would bury the case
+        that matters.
+        """
+        st = self._state(conn_id)
+        detail = [reason]
+        if st.current_response_id is not None:
+            age = st.active_response_age_s()
+            running = f" running for {age:.1f}s" if age is not None else ""
+            detail.append(f"Active response is {st.current_response_id}{running}.")
+        elif st.response_pending:
+            detail.append("A response is queued and has not opened yet.")
+        awaiting = st.tool_output_awaiting_response_at
+        if awaiting is not None:
+            waited = time.monotonic() - awaiting
+            detail.append(
+                f"Tool results have been waiting {waited:.1f}s for a response; "
+                "retry the create once the active response is done."
+            )
+            logger.warning(
+                "response.create rejected (%s) with tool results waiting %.1fs: %s",
+                error_type,
+                waited,
+                " ".join(detail),
+            )
+        else:
+            logger.info("response.create rejected (%s): %s", error_type, " ".join(detail))
+        return self.make_error(message=" ".join(detail), _type=error_type)
 
     @staticmethod
     def _prefetch_matches(event: ResponseCreateEvent) -> bool:
@@ -274,7 +326,7 @@ class ResponseHandler(RealtimeBaseHandler):
         if origin_response_key is not None:
             st.generation_done_tool_calls.pop(origin_response_key, None)
             st.completed_tool_response_keys.pop(origin_response_key, None)
-        st.in_response = True
+        st.mark_response_started()
         st.clear_pending_response(request.response_key)
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -539,9 +591,10 @@ class ResponseHandler(RealtimeBaseHandler):
                 prefetch_request = None
         replacing_prefetch = prefetch_request is not None
         if st.in_response or (st.response_pending and not replacing_prefetch):
-            return self.make_error(
-                message="Cannot create response while another response is in progress or pending.",
-                _type="conversation_already_has_active_response",
+            return self._reject_create(
+                conn_id,
+                "conversation_already_has_active_response",
+                "Cannot create response while another response is in progress or pending.",
             )
 
         out_of_band = is_out_of_band(event.response)
@@ -563,9 +616,10 @@ class ResponseHandler(RealtimeBaseHandler):
             except ChatItemError as exc:
                 return self.make_error(message=str(exc), _type="invalid_input_item")
             if candidate_chat.has_pending_tool_calls():
-                return self.make_error(
-                    message="Cannot create a response while function call outputs are pending.",
-                    _type="function_call_output_pending",
+                return self._reject_create(
+                    conn_id,
+                    "function_call_output_pending",
+                    "Cannot create a response while function call outputs are pending.",
                 )
 
         if replacing_prefetch:
@@ -577,9 +631,10 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.generation_done_tool_calls.pop(origin_response_key, None)
                 st.completed_tool_response_keys.pop(origin_response_key, None)
             if st.response_pending:
-                return self.make_error(
-                    message="Cannot create response while another response is pending.",
-                    _type="conversation_already_has_active_response",
+                return self._reject_create(
+                    conn_id,
+                    "conversation_already_has_active_response",
+                    "Cannot create response while another response is pending.",
                 )
 
         if not out_of_band:
@@ -600,7 +655,7 @@ class ResponseHandler(RealtimeBaseHandler):
             turn_revision=None if out_of_band else st.speculative_user_turn_revision,
             speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
         )
-        st.in_response = True
+        st.mark_response_started()
         st.clear_pending_response(request.response_key)
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
