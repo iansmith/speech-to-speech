@@ -69,24 +69,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# HALF-DUPLEX MODE (env-gated, deployment-wide). When on, the server ignores all
-# incoming caller audio while a response is in flight and resumes only once the
-# response is complete — a "don't listen while I'm talking/thinking" mode for
-# noisy rooms, where background speech would otherwise start turns or barge in.
-# It is a strict superset of turn_detection.interrupt_response=false: audio is
-# dropped BEFORE the VAD ever sees it, so no speech_started/barge-in fires at
-# all. Read once at import; set the env from the voice server's fleet config.
-# Truthy values: 1/true/yes/on (case-insensitive).
-#
-# Known gap: the ~STT window between the caller's turn-commit (speech_stopped)
-# and the response being queued is not yet covered by in_response/response_pending
-# /response_playing, so a few hundred ms of audio can still be ingested there.
-# Closing it needs a per-session "turn committed" flag set at on_speech_stopped;
-# left out here to keep this to auto-resetting flags that cannot wedge the mic.
-HALF_DUPLEX = os.environ.get("SOPHIE_HALF_DUPLEX", "").strip().lower() in ("1", "true", "yes", "on")
-if HALF_DUPLEX:
-    logger.info("half-duplex mode ON (SOPHIE_HALF_DUPLEX): caller audio ignored while a response is in flight")
-
 MAX_AUDIO_BATCH_BYTES = 6400
 # How long the release path waits for SESSION_END to propagate through the
 # handler chain back to output_queue before warning that the unit is stuck.
@@ -448,20 +430,8 @@ async def _dispatch_client_event(
         # Caller audio is the only thing that arrives reliably on an otherwise
         # silent call -- roughly every 20ms -- which makes it the heartbeat the
         # stuck-conversation watchdog runs on, with no timer and no per-session
-        # task. BEFORE the half-duplex gate below, deliberately: that gate
-        # returns early while a response is in flight, and a conversation with
-        # a response in flight is the one case the watchdog would not report
-        # anyway, so putting the check after it would only make the two
-        # conditions look coupled when they are not.
+        # task.
         service.check_stuck_conversation(session_id)
-        if HALF_DUPLEX:
-            st = service._state(session_id)
-            if st.in_response or st.response_pending or unit.response_playing.is_set():
-                # Half-duplex: a response is in flight, so drop the caller audio
-                # before it is decoded or handed to the VAD. Resumes on its own
-                # when the response completes (these flags flip back at the
-                # existing "response complete, listening re-enabled" points).
-                return
         chunks = service.handle_audio_append(session_id, event)
         rt_cfg = service._state(session_id).runtime_config
         for chunk in chunks:
@@ -909,12 +879,6 @@ def create_app(
             await _dispatch_client_event(unit, session_id, raw, session, transport_kind="webrtc")
 
         def _on_audio(pcm: bytes) -> None:
-            if HALF_DUPLEX:
-                st = unit.service._state(session_id)
-                if st.in_response or st.response_pending or unit.response_playing.is_set():
-                    # Half-duplex: drop the caller audio while a response is in
-                    # flight (WebRTC mirror of the WS guard above).
-                    return
             chunks = unit.service.append_pcm(session_id, pcm, PIPELINE_SAMPLE_RATE)
             if not chunks:
                 return
