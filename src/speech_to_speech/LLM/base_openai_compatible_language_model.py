@@ -39,6 +39,7 @@ from speech_to_speech.LLM.chat import (
     make_user_audio_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.context_provider import fetch_context_items
 from speech_to_speech.LLM.provider_connect_abort import ProviderConnectAborter, ProviderRequestAborted
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
@@ -183,6 +184,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         request_timeout_s: float = 20.0,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
+        context_provider_url: str | None = None,
+        context_provider_timeout_ms: int = 300,
         compact_history: bool = False,
         audio_max_tokens: int = 256,
         audio_temperature: float = 0.0,
@@ -196,6 +199,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.stream = stream
         self.stream_batch_sentences = max(1, stream_batch_sentences)
         self.enable_lang_prompt = enable_lang_prompt
+        self.context_provider_url = context_provider_url
+        self.context_provider_timeout_ms = context_provider_timeout_ms
         self.gen_kwargs = dict(gen_kwargs)
         self.audio_max_tokens = audio_max_tokens
         self.audio_temperature = audio_temperature
@@ -1306,6 +1311,27 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         )
         wants_audio = response_wants_audio(response)
         self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
+
+        if self.context_provider_url:
+            # The one seam where a consumer's knowledge can reach the model: the
+            # transcript is final, generation has not started. Fails open by
+            # construction -- fetch_context_items never raises.
+            #
+            # Here and not in _process_audio, deliberately. That path sends the
+            # caller's audio to the model and adds it to the chat AFTER this
+            # point, so there is no final transcript to enrich against and the
+            # provider's wire protocol -- a conversation of role/text items --
+            # has nothing to say about it. The seam this module documents is a
+            # text one.
+            for item in fetch_context_items(
+                self.context_provider_url,
+                active_chat.to_transformers_chat(),
+                timeout_s=self.context_provider_timeout_ms / 1000.0,
+                turn_id=turn_id,
+                language_code=language_code,
+                instructions=instructions,
+            ):
+                active_chat.add_item(item)
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
