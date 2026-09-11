@@ -172,8 +172,6 @@ def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, rea
     handler.tools = None
     handler.tools_choice = None
     handler.enable_lang_prompt = False
-    handler.context_provider_url = None
-    handler.context_provider_timeout_ms = 300
     handler.compactor = None
     handler.audio_max_tokens = 80
     handler.audio_temperature = 0.0
@@ -2006,40 +2004,3 @@ def test_barge_in_aborts_an_ordinary_turn_still_waiting_for_headers():
         )
     finally:
         server.close()
-
-
-def test_setup_binds_the_context_provider_settings(monkeypatch):
-    """The context-provider settings must reach the handler, not vanish into **_kwargs.
-
-    setup() ends in `**_kwargs: Any`, so a renamed or misspelled field is
-    swallowed in silence: the flag would still parse, the pipeline would still
-    start, and every turn would generate without enrichment while the operator
-    believed the hook was live. That is the failure this asserts against --
-    the wiring, not the fetching, which test_context_provider.py covers.
-    """
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai({}))
-    monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
-
-    handler = object.__new__(ResponsesApiModelHandler)
-    handler.setup(
-        base_url="http://127.0.0.1:8080/v1",
-        api_key=None,
-        compact_history=False,
-        context_provider_url="http://127.0.0.1:9999/context",
-        context_provider_timeout_ms=250,
-    )
-
-    assert handler.context_provider_url == "http://127.0.0.1:9999/context"
-    assert handler.context_provider_timeout_ms == 250
-
-
-def test_setup_leaves_the_context_provider_off_by_default(monkeypatch):
-    """Unset means the feature does not exist -- no URL, and the default timeout."""
-    monkeypatch.setattr(base_openai_compatible_language_model, "OpenAI", _capturing_openai({}))
-    monkeypatch.setattr(ResponsesApiModelHandler, "warmup", lambda self: None)
-
-    handler = object.__new__(ResponsesApiModelHandler)
-    handler.setup(base_url="http://127.0.0.1:8080/v1", api_key=None, compact_history=False)
-
-    assert handler.context_provider_url is None
-    assert handler.context_provider_timeout_ms == 300
