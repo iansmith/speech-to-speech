@@ -159,6 +159,14 @@ class ConversationHandler(RealtimeBaseHandler):
         if not item:
             return []
         st = self._state(conn_id)
+        if isinstance(item, RealtimeConversationItemFunctionCallOutput):
+            # A tool result is now in the model's context with nothing asking
+            # it to be spoken. Ordinary: the client's response.create follows
+            # immediately. The watchdog exists for when it does not -- see
+            # ConnState.note_tool_output_awaiting_response. Stamped here
+            # because _apply_item is the one funnel through which an item
+            # actually reaches the chat.
+            st.note_tool_output_awaiting_response()
         if defer_acknowledgement:
             # The prefetching LM strips consumed images from Chat in place.
             # Keep the protocol echo immutable until it can be acknowledged in

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -67,6 +68,7 @@ except ImportError:
     WEBRTC_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
 MAX_AUDIO_BATCH_BYTES = 6400
 # How long the release path waits for SESSION_END to propagate through the
 # handler chain back to output_queue before warning that the unit is stuck.
@@ -425,6 +427,11 @@ async def _dispatch_client_event(
                 ]
             )
             return
+        # Caller audio is the only thing that arrives reliably on an otherwise
+        # silent call -- roughly every 20ms -- which makes it the heartbeat the
+        # stuck-conversation watchdog runs on, with no timer and no per-session
+        # task.
+        service.check_stuck_conversation(session_id)
         chunks = service.handle_audio_append(session_id, event)
         rt_cfg = service._state(session_id).runtime_config
         for chunk in chunks:

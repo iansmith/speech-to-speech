@@ -22,6 +22,7 @@ from openai import OpenAI
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
+    RealtimeConversationItemFunctionCallOutput,
 )
 from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
@@ -68,7 +69,7 @@ WARMUP_MAX_RETRIES = 6
 PREFETCH_PROVIDER_WORKER_LIMIT = 1
 PREFETCH_STREAM_QUEUE_MAXSIZE = 16
 PREFETCH_WORKER_ACQUIRE_TIMEOUT_S = 0.05
-PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try again."
+PROVIDER_FAILURE_FALLBACK = "My brain may be down right now. It's not you. Give me a minute."
 
 # SOP-538: the one line that makes "how long did the abandoned request hold this
 # turn up?" answerable from the voice log alone. Diagnosing the original 15.6 s
@@ -1010,9 +1011,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 and not self._generation_is_stale(turn.gen)
                 and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
             ):
+                # SOP-598: when a tool succeeded but the confirmation generation
+                # failed, speak the tool's own result — it is already a complete,
+                # speakable sentence by design contract.
+                fallback_text = PROVIDER_FAILURE_FALLBACK
+                with original_chat._lock:
+                    tool_outputs = [
+                        item.output
+                        for item in original_chat.buffer
+                        if isinstance(item, RealtimeConversationItemFunctionCallOutput) and item.output
+                    ]
+                if tool_outputs:
+                    fallback_text = " ".join(tool_outputs)
+
                 state.output_emitted = True
                 yield LLMResponseChunk(
-                    text=PROVIDER_FAILURE_FALLBACK,
+                    text=fallback_text,
                     runtime_config=turn.runtime_config,
                     response=turn.response,
                     turn_id=turn.turn_id,
