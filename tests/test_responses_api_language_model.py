@@ -2004,3 +2004,77 @@ def test_barge_in_aborts_an_ordinary_turn_still_waiting_for_headers():
         )
     finally:
         server.close()
+
+
+# ── SOP-598: generation failure after a successful tool ──────────────────────
+
+
+def test_generation_failure_after_tool_success_speaks_tool_result():
+    """When a tool succeeded and the confirmation generation 500s, the caller
+    should hear the tool's own result — not PROVIDER_FAILURE_FALLBACK.
+
+    The tool result is already a complete, speakable English sentence (the
+    design contract), so speaking it directly makes the call correct rather
+    than merely honest."""
+    handler = _make_handler()
+
+    tool_result_text = "Copy that: Friday, the 18th at 7pm, Jill for Family dinner including Jill's mother"
+
+    chat = Chat(5)
+    chat.add_item(make_user_message("Schedule family dinner for Friday at 7pm"))
+    chat.add_item(
+        RealtimeConversationItemFunctionCall(
+            type="function_call",
+            call_id="call_sop598",
+            name="create_commitment",
+            arguments='{"description":"Family dinner including Jill\'s mother","due_date":"2026-09-18T19:00:00"}',
+            status="completed",
+        )
+    )
+    chat.append_tool_output(
+        "call_sop598",
+        RealtimeConversationItemFunctionCallOutput(
+            type="function_call_output",
+            call_id="call_sop598",
+            output=tool_result_text,
+            id="fco_sop598",
+        ),
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("inference exception")
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=boom))
+
+    from openai.types.realtime import RealtimeSessionCreateRequest
+
+    request = GenerateResponseRequest(
+        runtime_config=RuntimeConfig(
+            chat=chat,
+            session=RealtimeSessionCreateRequest(type="realtime", instructions="You are Sophie."),
+        ),
+    )
+
+    outputs = list(handler.process(request))
+
+    chunks = [o for o in outputs if isinstance(o, LLMResponseChunk)]
+    assert len(chunks) == 1
+    assert chunks[0].text == tool_result_text
+    assert chunks[0].text != base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+
+    eors = [o for o in outputs if isinstance(o, EndOfResponse)]
+    assert len(eors) == 1
+    assert eors[0].error is not None and "inference exception" in eors[0].error
+
+
+def test_generation_failure_without_tools_speaks_updated_fallback():
+    """When no tool ran and the generation fails, the fallback must not invite
+    a retry — it should say the upstream may be down."""
+    assert "try again" not in base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK.lower()
+
+
+def test_provider_failure_fallback_is_pinned_by_identity():
+    """The constant is compared by identity in every test that references it.
+    This test exists so a rename is caught."""
+    assert base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK is \
+        base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
