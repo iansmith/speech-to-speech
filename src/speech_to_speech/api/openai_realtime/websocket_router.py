@@ -343,6 +343,20 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
 _release_tasks: set[asyncio.Task[None]] = set()
 
 
+def claim_idle_unit(pool: list[PipelineUnit], transport: SessionTransport | None) -> PipelineUnit | None:
+    """Reserve the first idle unit and drop any Sophie call id it still holds.
+
+    The clear is the claim half of the pool cycle. Release clears too; this
+    one is what a reused unit hits if that release did not.
+    """
+    for unit in pool:
+        if unit.session is None:
+            unit.session = SessionState(transport=transport)
+            clear_sophie_call_id(unit)
+            return unit
+    return None
+
+
 def _release_session(unit: PipelineUnit, session_id: str) -> None:
     """Start the release of a unit after its client disconnected.
 
@@ -570,12 +584,7 @@ def create_app(
         session_id after RealtimeService.register(). The WebRTC route claims
         with transport=None and attaches the session object once constructed.
         """
-        for unit in pool:
-            if unit.session is None:
-                unit.session = SessionState(transport=transport)
-                clear_sophie_call_id(unit)
-                return unit
-        return None
+        return claim_idle_unit(pool, transport)
 
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:

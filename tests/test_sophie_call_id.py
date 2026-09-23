@@ -9,12 +9,12 @@ import pytest
 
 from speech_to_speech.api.openai_realtime.sophie_call import (
     SOPHIE_CALL_HEADER,
-    clear_sophie_call_id,
     client_session_id,
 )
 from speech_to_speech.api.openai_realtime.websocket_router import (
     _dispatch_client_event,
     _release_unit_after_drain,
+    claim_idle_unit,
 )
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
@@ -45,7 +45,9 @@ def test_claim_release_claim_does_not_keep_the_first_id() -> None:
     assert handler.sophie_call_headers() == {}
 
     handler.set_sophie_call_id("stale-if-claim-forgets")
-    clear_sophie_call_id(unit)
+    unit.session = None
+    claimed = claim_idle_unit([unit], None)
+    assert claimed is unit
     assert handler.sophie_call_headers() == {}
 
     handler.set_sophie_call_id("second")
