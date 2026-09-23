@@ -164,6 +164,7 @@ def _request_chat_completions(
     messages: list[dict[str, Any]],
     stream: bool,
     extra_body: dict[str, Any] | None,
+    extra_headers: dict[str, str] | None,
     timeout: Any,
     optional_kwargs: dict[str, Any],
 ) -> Any:
@@ -171,6 +172,8 @@ def _request_chat_completions(
     create_kwargs = dict(optional_kwargs)
     if stream:
         create_kwargs["stream_options"] = {"include_usage": True}
+    if extra_headers:
+        create_kwargs["extra_headers"] = extra_headers
     return client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -351,6 +354,7 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
             messages=api_input,
             stream=self.stream,
             extra_body=self._extra_body,
+            extra_headers=self.sophie_call_headers(),
             timeout=self.request_timeout,
             optional_kwargs=optional_kwargs,
         )
@@ -366,4 +370,5 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         yield from _tool_calls_from_accum(tool_accum)
 
     def on_session_end(self) -> None:
+        self.set_sophie_call_id("")
         logger.debug("Chat Completions API language model session state reset")

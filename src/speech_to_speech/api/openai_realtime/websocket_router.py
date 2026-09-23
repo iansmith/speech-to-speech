@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -26,6 +25,11 @@ from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, Ses
 from speech_to_speech.api.openai_realtime.service import (
     PIPELINE_SAMPLE_RATE,
     build_error_event,
+)
+from speech_to_speech.api.openai_realtime.sophie_call import (
+    clear_sophie_call_id,
+    client_session_id,
+    set_sophie_call_id,
 )
 from speech_to_speech.api.openai_realtime.transports import (
     SessionTransport,
@@ -328,6 +332,7 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
         try:
             _safe_unregister(unit, session_id)
         finally:
+            clear_sophie_call_id(unit)
             unit.session = None
         recovered = " after quarantine" if session.quarantined_at is not None else ""
         logger.info(f"Pipeline {unit.index} released{recovered} (session {session_id} ended)")
@@ -336,6 +341,20 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
 # Strong references to in-flight drain-and-release tasks (asyncio only
 # holds tasks weakly); each task removes itself on completion.
 _release_tasks: set[asyncio.Task[None]] = set()
+
+
+def claim_idle_unit(pool: list[PipelineUnit], transport: SessionTransport | None) -> PipelineUnit | None:
+    """Reserve the first idle unit and drop any Sophie call id it still holds.
+
+    The clear is the claim half of the pool cycle. Release clears too; this
+    one is what a reused unit hits if that release did not.
+    """
+    for unit in pool:
+        if unit.session is None:
+            unit.session = SessionState(transport=transport)
+            clear_sophie_call_id(unit)
+            return unit
+    return None
 
 
 def _release_session(unit: PipelineUnit, session_id: str) -> None:
@@ -461,6 +480,9 @@ async def _dispatch_client_event(
         if err:
             await send_correlated([err])
         else:
+            carried = client_session_id(raw)
+            if carried is not None:
+                set_sophie_call_id(unit, carried)
             await send_correlated([service.build_session_updated(session_id)])
 
     elif isinstance(event, ConversationItemCreateEvent):
@@ -562,11 +584,7 @@ def create_app(
         session_id after RealtimeService.register(). The WebRTC route claims
         with transport=None and attaches the session object once constructed.
         """
-        for unit in pool:
-            if unit.session is None:
-                unit.session = SessionState(transport=transport)
-                return unit
-        return None
+        return claim_idle_unit(pool, transport)
 
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:

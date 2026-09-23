@@ -136,6 +136,7 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
             messages=api_input,
             stream=self.stream,
             extra_body=self._extra_body,
+            extra_headers=self.sophie_call_headers(),
             timeout=self.request_timeout,
             optional_kwargs=optional_kwargs,
         )
@@ -160,6 +161,9 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         return optional_kwargs
 
     def _request(self, api_input: Any, optional_kwargs: dict[str, Any]) -> Any:
+        headers = self.sophie_call_headers()
+        if headers:
+            optional_kwargs = {**optional_kwargs, "extra_headers": headers}
         return self.client.responses.create(
             model=self.model_name,
             input=api_input,
@@ -211,4 +215,5 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 logger.warning(f"Not supported message type: {message.type}")
 
     def on_session_end(self) -> None:
+        self.set_sophie_call_id("")
         logger.debug("OpenAI API language model session state reset")
