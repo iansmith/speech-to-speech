@@ -222,11 +222,28 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._connect_aborter = ProviderConnectAborter()
         self._use_provider_client(OpenAI(api_key=api_key, base_url=base_url))
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
+        self._sophie_call_id = ""
         self._prefetch_worker_slots = BoundedSemaphore(PREFETCH_PROVIDER_WORKER_LIMIT)
         self._prefetch_workers_lock = Lock()
         self._prefetch_workers: set[Thread] = set()
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
         self.warmup()
+
+    def set_sophie_call_id(self, call_id: str | None) -> None:
+        """Remember which Sophie call this pooled unit is serving.
+
+        Empty clears it. A unit that keeps the previous session's id attributes
+        the next session's turns to that caller.
+        """
+        self._sophie_call_id = (call_id or "").strip()
+
+    def sophie_call_headers(self) -> dict[str, str]:
+        call_id = getattr(self, "_sophie_call_id", "")
+        if not call_id:
+            return {}
+        from speech_to_speech.api.openai_realtime.sophie_call import SOPHIE_CALL_HEADER
+
+        return {SOPHIE_CALL_HEADER: call_id}
 
     def _use_provider_client(self, client: OpenAI) -> None:
         """Adopt *client* and make requests issued on it abortable mid-connect.
