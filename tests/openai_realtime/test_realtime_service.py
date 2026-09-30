@@ -4437,6 +4437,28 @@ class TestTranscriptionTurnIdentity:
         frame = self._complete(service, conn_id, "hello again", turn_revision=1)
         assert frame["chat_action"] == "added"
 
+    @staticmethod
+    def _evict_speculative_item(service, conn_id):
+        # Stands in for trim/compaction taking the turn's user message out of the chat.
+        st = service._state(conn_id)
+        assert st.runtime_config.chat.remove_user_message(st.speculative_user_item_id)
+
+    def test_revision_of_evicted_message_is_added(self, tracked):
+        service, conn_id, tracker = tracked
+        self._complete(service, conn_id, "Where does.")
+        self._evict_speculative_item(service, conn_id)
+        tracker.observe("turn_1", 1)
+        frame = self._complete(service, conn_id, "Where's Jim work?", turn_revision=1)
+        assert frame["chat_action"] == "added"
+
+    def test_empty_revision_of_evicted_message_changes_nothing(self, tracked):
+        service, conn_id, tracker = tracked
+        self._complete(service, conn_id, "hello")
+        self._evict_speculative_item(service, conn_id)
+        tracker.observe("turn_1", 1)
+        frame = self._complete(service, conn_id, "", turn_revision=1)
+        assert frame["chat_action"] == "none"
+
     def test_turnless_pipeline_reports_null_turn(self, service, conn_id):
         service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
         service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=1.0))

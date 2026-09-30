@@ -764,9 +764,9 @@ class RealtimeService:
                 st.speculative_user_item_id = item.id
                 chat_action = "added"
         elif same_speculative_turn and st.speculative_user_item_id:
-            cfg.chat.remove_user_message(st.speculative_user_item_id)
+            if cfg.chat.remove_user_message(st.speculative_user_item_id):
+                chat_action = "removed"
             st.speculative_user_item_id = None
-            chat_action = "removed"
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 
