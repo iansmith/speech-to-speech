@@ -95,6 +95,7 @@ CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 
 _ResponseStatus = Literal["completed", "cancelled", "failed", "incomplete", "in_progress"]
 _StatusReason = Literal["turn_detected", "client_cancelled", "max_output_tokens", "content_filter"]
+_ChatAction = Literal["added", "replaced", "removed", "none"]
 
 _EVENT_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "input_audio_buffer.append": InputAudioBufferAppendEvent,
@@ -750,16 +751,14 @@ class RealtimeService:
 
         cfg = st.runtime_config
         transcript = event.transcript
-        chat_action = "none"
+        chat_action: _ChatAction = "none"
         if transcript:
-            if same_speculative_turn and st.speculative_user_item_id:
-                replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, transcript)
-                if replaced:
-                    chat_action = "replaced"
-                else:
-                    item = cfg.chat.add_item(make_user_message(transcript))
-                    st.speculative_user_item_id = item.id
-                    chat_action = "added"
+            if (
+                same_speculative_turn
+                and st.speculative_user_item_id
+                and cfg.chat.replace_user_message_text(st.speculative_user_item_id, transcript)
+            ):
+                chat_action = "replaced"
             else:
                 item = cfg.chat.add_item(make_user_message(transcript))
                 st.speculative_user_item_id = item.id
