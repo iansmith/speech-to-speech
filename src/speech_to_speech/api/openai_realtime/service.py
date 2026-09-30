@@ -750,18 +750,24 @@ class RealtimeService:
 
         cfg = st.runtime_config
         transcript = event.transcript
+        chat_action = "none"
         if transcript:
             if same_speculative_turn and st.speculative_user_item_id:
                 replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, transcript)
-                if not replaced:
+                if replaced:
+                    chat_action = "replaced"
+                else:
                     item = cfg.chat.add_item(make_user_message(transcript))
                     st.speculative_user_item_id = item.id
+                    chat_action = "added"
             else:
                 item = cfg.chat.add_item(make_user_message(transcript))
                 st.speculative_user_item_id = item.id
+                chat_action = "added"
         elif same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
             st.speculative_user_item_id = None
+            chat_action = "removed"
         elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 
@@ -782,6 +788,16 @@ class RealtimeService:
             st.mark_response_pending(request.response_key)
             queue.put(request)
 
+        # Extension fields (the SDK model allows extras): a reopened turn is
+        # re-transcribed under a new item_id, so a client mirroring the chat
+        # needs the turn and what this final did to the user message.
+        completed_events[0] = completed_events[0].model_copy(
+            update={
+                "turn_id": event.turn_id,
+                "turn_revision": event.turn_revision,
+                "chat_action": chat_action,
+            }
+        )
         return [*completed_events]
 
     def _on_transcription_failed(self, conn_id: str, event: TranscriptionFailedEvent) -> list[ServerEvent]:
