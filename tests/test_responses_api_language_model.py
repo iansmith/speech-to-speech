@@ -2076,5 +2076,7 @@ def test_generation_failure_without_tools_speaks_updated_fallback():
 def test_provider_failure_fallback_is_pinned_by_identity():
     """The constant is compared by identity in every test that references it.
     This test exists so a rename is caught."""
-    assert base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK is \
+    assert (
         base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+        is base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+    )
