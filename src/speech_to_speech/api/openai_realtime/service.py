@@ -797,7 +797,7 @@ class RealtimeService:
                 "chat_action": chat_action,
             }
         )
-        return completed_events
+        return [*completed_events]
 
     def _on_transcription_failed(self, conn_id: str, event: TranscriptionFailedEvent) -> list[ServerEvent]:
         """Surface a final STT failure without creating conversation or LLM work."""
