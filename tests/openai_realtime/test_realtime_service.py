@@ -4351,6 +4351,101 @@ class TestDispatchPipelineEvent:
 # ===================================================================
 
 
+class TestTranscriptionTurnIdentity:
+    """The completed frame says which turn it belongs to and what it did to the chat.
+
+    A reopened turn is re-transcribed under a new item_id, so a client that
+    mirrors the chat cannot tell a revision from a new utterance by item_id.
+    turn_id, turn_revision and chat_action carry that; clients that ignore
+    unknown fields are unaffected.
+    """
+
+    @pytest.fixture
+    def tracked(self, runtime_config, should_listen):
+        tracker = SpeculativeTurnTracker()
+        service = RealtimeService(
+            text_prompt_queue=Queue(),
+            should_listen=should_listen,
+            speculative_turns=tracker,
+        )
+        conn_id = service.register()
+        service._state(conn_id).runtime_config = runtime_config
+        yield service, conn_id, tracker
+        service.unregister(conn_id)
+
+    @staticmethod
+    def _complete(service, conn_id, transcript, turn_id="turn_1", turn_revision=0):
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id=turn_id, turn_revision=turn_revision, reopened=turn_revision > 0),
+        )
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(duration_s=1.0, turn_id=turn_id, turn_revision=turn_revision),
+        )
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript=transcript, turn_id=turn_id, turn_revision=turn_revision),
+        )
+        assert len(events) == 1
+        return events[0].model_dump()
+
+    def test_new_turn_is_added(self, tracked):
+        service, conn_id, _ = tracked
+        frame = self._complete(service, conn_id, "hello")
+        assert frame["type"] == "conversation.item.input_audio_transcription.completed"
+        assert frame["turn_id"] == "turn_1"
+        assert frame["turn_revision"] == 0
+        assert frame["chat_action"] == "added"
+
+    def test_second_turn_is_added_not_replaced(self, tracked):
+        service, conn_id, tracker = tracked
+        self._complete(service, conn_id, "No.")
+        tracker.observe("turn_2", 0)
+        frame = self._complete(service, conn_id, "Nobody told me", turn_id="turn_2")
+        assert frame["turn_id"] == "turn_2"
+        assert frame["chat_action"] == "added"
+
+    def test_same_turn_revision_is_replaced(self, tracked):
+        service, conn_id, tracker = tracked
+        first = self._complete(service, conn_id, "Where does.")
+        tracker.observe("turn_1", 1)
+        frame = self._complete(service, conn_id, "Where's Jim work?", turn_revision=1)
+        assert frame["item_id"] != first["item_id"]
+        assert frame["turn_id"] == "turn_1"
+        assert frame["turn_revision"] == 1
+        assert frame["chat_action"] == "replaced"
+
+    def test_empty_same_turn_revision_is_removed(self, tracked):
+        service, conn_id, tracker = tracked
+        self._complete(service, conn_id, "hello")
+        tracker.observe("turn_1", 1)
+        frame = self._complete(service, conn_id, "", turn_revision=1)
+        assert frame["turn_revision"] == 1
+        assert frame["chat_action"] == "removed"
+
+    def test_empty_new_turn_changes_nothing(self, tracked):
+        service, conn_id, _ = tracked
+        frame = self._complete(service, conn_id, "")
+        assert frame["turn_id"] == "turn_1"
+        assert frame["chat_action"] == "none"
+
+    def test_revision_after_empty_revision_is_added(self, tracked):
+        service, conn_id, tracker = tracked
+        self._complete(service, conn_id, "")
+        tracker.observe("turn_1", 1)
+        frame = self._complete(service, conn_id, "hello again", turn_revision=1)
+        assert frame["chat_action"] == "added"
+
+    def test_turnless_pipeline_reports_null_turn(self, service, conn_id):
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=1.0))
+        frame = service.dispatch_pipeline_event(conn_id, TranscriptionCompletedEvent(transcript="hi"))[0].model_dump()
+        assert frame["turn_id"] is None
+        assert frame["turn_revision"] is None
+        assert frame["chat_action"] == "added"
+
+
 class TestMakeError:
     def test_make_error(self, service):
         err = service.make_error("oops", "my_error")
