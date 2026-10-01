@@ -244,9 +244,7 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 tts_input.turn_id,
                 tts_input.turn_revision,
             ):
-                if tts_input.response_key is None:
-                    return
-                tts_input.cleanup_only = True
+                return
             yield AUDIO_RESPONSE_DONE
             return
 

@@ -15,7 +15,8 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ WHISPER_LANGUAGE_TO_FACEBOOK_LANGUAGE = {
     "ar": "ara",  # Arabic
     "hy": "hyw",  # Armenian
     "az": "azb",  # Azerbaijani
-    "bg": "bul",  # Bulgarian
+    "bu": "bul",  # Bulgarian
     "ca": "cat",  # Catalan
     "nl": "nld",  # Dutch
     "fi": "fin",  # Finnish
@@ -40,22 +41,22 @@ WHISPER_LANGUAGE_TO_FACEBOOK_LANGUAGE = {
     "hu": "hun",  # Hungarian
     "is": "isl",  # Icelandic
     "id": "ind",  # Indonesian
-    "kn": "kan",  # Kannada (Whisper uses "kn"; "ka" is Georgian)
+    "ka": "kan",  # Kannada
     "kk": "kaz",  # Kazakh
     "lv": "lav",  # Latvian
-    "ms": "zlm",  # Malay
-    "mr": "mar",  # Marathi
+    "zl": "zlm",  # Malay
+    "ma": "mar",  # Marathi
     "fa": "fas",  # Persian
-    "pl": "pol",  # Polish
+    "po": "pol",  # Polish
     "pt": "por",  # Portuguese
     "ro": "ron",  # Romanian
     "ru": "rus",  # Russian
     "sw": "swh",  # Swahili
     "sv": "swe",  # Swedish
-    "tl": "tgl",  # Tagalog (Whisper uses "tl"; "tg" is Tajik)
+    "tg": "tgl",  # Tagalog
     "ta": "tam",  # Tamil
     "th": "tha",  # Thai
-    "tr": "tur",  # Turkish
+    "tu": "tur",  # Turkish
     "uk": "ukr",  # Ukrainian
     "ur": "urd",  # Urdu
     "vi": "vie",  # Vietnamese
@@ -67,7 +68,6 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
     def setup(
         self,
         should_listen: Event,
-        model_name: str | None = None,
         device: str = "cuda",
         torch_dtype: str = "float32",
         language: str = "en",
@@ -87,19 +87,15 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.language = language
 
         self._initial_language = self.language
-        self._initial_model_name = model_name
-        self.load_model(self.language, model_name)
+        self.load_model(self.language)
         self.warmup()
 
-    def load_model(self, language_code: str, model_name: str | None = None) -> None:
+    def load_model(self, language_code: str) -> None:
         try:
-            resolved_model_name = model_name or (
-                f"facebook/mms-tts-{WHISPER_LANGUAGE_TO_FACEBOOK_LANGUAGE[language_code]}"
-            )
-            logger.info(f"Loading model: {resolved_model_name}")
-            self.model = VitsModel.from_pretrained(resolved_model_name).to(self.device)  # type: ignore[arg-type]
-            self.tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
-            self.model_name = resolved_model_name
+            model_name = f"facebook/mms-tts-{WHISPER_LANGUAGE_TO_FACEBOOK_LANGUAGE[language_code]}"
+            logger.info(f"Loading model: {model_name}")
+            self.model = VitsModel.from_pretrained(model_name).to(self.device)  # type: ignore[arg-type]
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.language = language_code
         except KeyError:
             logger.warning(f"Unsupported language: {language_code}. Falling back to English.")
@@ -115,7 +111,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             return None
 
         try:
-            logger.debug("Tokenizing text: %s", transcript_for_log(text))
+            logger.debug(f"Tokenizing text: {text}")
             logger.debug(f"Current language: {self.language}")
             logger.debug(f"Tokenizer: {self.tokenizer}")
 
@@ -124,7 +120,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
             attention_mask = inputs.attention_mask.to(self.device)
 
             logger.debug(f"Input IDs shape: {input_ids.shape}, dtype: {input_ids.dtype}")
-            logger.debug("Input IDs: %s", transcript_for_log(input_ids))
+            logger.debug(f"Input IDs: {input_ids}")
 
             if input_ids.numel() == 0:
                 logger.error("Input IDs tensor is empty")
@@ -135,8 +131,9 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             logger.debug(f"Output waveform shape: {output.waveform.shape}")
             return output.waveform
-        except Exception as exc:
-            log_exception(logger, "Error in generate_audio", exc)
+        except Exception as e:
+            logger.error(f"Error in generate_audio: {str(e)}")
+            logger.exception("Full traceback:")
             return None
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
@@ -146,9 +143,7 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 tts_input.turn_id,
                 tts_input.turn_revision,
             ):
-                if tts_input.response_key is None:
-                    return
-                tts_input.cleanup_only = True
+                return
             yield AUDIO_RESPONSE_DONE
             return
 
@@ -166,19 +161,13 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
         text = tts_input.text
 
         console.print(f"[green]ASSISTANT: {text}")
-        logger.debug("Processing text: %s", transcript_for_log(text))
+        logger.debug(f"Processing text: {text}")
         logger.debug(f"Language code: {language_code}")
 
-        restore_initial_model = (
-            language_code == self._initial_language
-            and self._initial_model_name is not None
-            and self.model_name != self._initial_model_name
-        )
-        if language_code is not None and (self.language != language_code or restore_initial_model):
+        if language_code is not None and self.language != language_code:
             try:
-                logger.info("Loading TTS model for language %s", language_code)
-                model_name = self._initial_model_name if language_code == self._initial_language else None
-                self.load_model(language_code, model_name)
+                logger.info(f"Switching language from {self.language} to {language_code}")
+                self.load_model(language_code)
             except KeyError:
                 console.print(
                     f"[red]Language {language_code} not supported by Facebook MMS. Using {self.language} instead."
@@ -218,7 +207,6 @@ class FacebookMMSTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 )
 
     def on_session_end(self) -> None:
-        custom_model_changed = self._initial_model_name is not None and self.model_name != self._initial_model_name
-        if self.language != self._initial_language or custom_model_changed:
-            self.load_model(self._initial_language, self._initial_model_name)
+        if self.language != self._initial_language:
+            self.load_model(self._initial_language)
         logger.debug("Facebook MMS TTS session state reset")

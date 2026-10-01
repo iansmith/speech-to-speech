@@ -228,10 +228,5 @@ dmypy.json
 .coverage
 cover/
 .tox/
-uv.lock
-
-# JavaScript dependencies
-node_modules/
-
-# slopstop tooling state — never part of a branch
+uv.lock.DS_Store
 .slopstop/

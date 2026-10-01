@@ -34,19 +34,21 @@ Available tools:
 {{ tool.to_code_prompt() }}
 
 {% endfor %}
-To call tools, put each named-argument function call inside its own {{ enter_code }}...{{ end_code }} block:
+To call a tool, put exactly one named-argument function call inside {{ enter_code }}...{{ end_code }}:
 {{ enter_code }}function_name(required_arg='value'){{ end_code }}
 
 Rules:
-- Keep tags out of prose. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
+- You may say one brief natural sentence before the tool call; for slow information tools, briefly say that you will check.
+- For expression/background tools, always speak first. For requested expressions, use a short pattern like "Sure, here's my best <emotion>."; otherwise use a fitting empathetic sentence.
+- Do not mention tags, functions, or tools. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Keep every tool call in a separate block and preserve the intended text/tool order.\
+- Only one tool call may appear in a response.\
 """,
     keep_trailing_newline=True,
 )
 
-# Text-channel variant: same call format and structural rules, with explicit
-# guidance to skip a preamble before a tool call.
+# Text-channel variant: same call format and structural rules, without the
+# voice-specific "speak first" prose.
 TEXT_TOOL_PROMPT_TEMPLATE = Template(
     """\
 Available tools:
@@ -55,14 +57,14 @@ Available tools:
 {{ tool.to_code_prompt() }}
 
 {% endfor %}
-To call tools, put each named-argument function call inside its own {{ enter_code }}...{{ end_code }} block:
+To call a tool, put exactly one named-argument function call inside {{ enter_code }}...{{ end_code }}:
 {{ enter_code }}function_name(required_arg='value'){{ end_code }}
 
 Rules:
 - Call a tool directly when it helps fulfill the request; no preamble sentence is required.
 - Do not mention tags, functions, or tools in your prose, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
-- Keep every tool call in a separate block and preserve the intended text/tool order.\
+- Only one tool call may appear in a response.\
 """,
     keep_trailing_newline=True,
 )
@@ -84,7 +86,7 @@ def build_tool_system_prompt(
 
     Returns an empty string when *tools* is empty so it can be
     unconditionally appended to a base system prompt.  When *text_only* is set,
-    the written-channel variant adds explicit no-preamble guidance.
+    the written-channel variant is used (no voice "speak first" prose).
     """
     if not tools:
         return ""

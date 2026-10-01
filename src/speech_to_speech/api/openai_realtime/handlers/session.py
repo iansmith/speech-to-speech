@@ -6,7 +6,6 @@ from typing import Optional
 from openai.types.realtime import (
     RealtimeErrorEvent,
     SessionCreatedEvent,
-    SessionUpdatedEvent,
     SessionUpdateEvent,
 )
 from openai.types.realtime.realtime_transcription_session_create_request import (
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class SessionHandler(RealtimeBaseHandler):
-    """Owns session lifecycle: config updates and lifecycle events."""
+    """Owns session lifecycle: config updates and session.created events."""
 
     def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
         """Apply session config changes.
@@ -61,20 +60,6 @@ class SessionHandler(RealtimeBaseHandler):
         session = cfg.session.model_copy(update={"id": conn_id})
         return SessionCreatedEvent(
             type="session.created",
-            event_id=self._next_event_id(),
-            session=session,
-        )
-
-    def build_session_updated(self, conn_id: str) -> SessionUpdatedEvent:
-        """Build a SessionUpdatedEvent populated with the current config.
-
-        Sent after a successful session.update, per the OpenAI Realtime
-        protocol: https://platform.openai.com/docs/api-reference/realtime-server-events/session/updated
-        """
-        cfg = self._state(conn_id).runtime_config
-        session = cfg.session.model_copy(update={"id": conn_id})
-        return SessionUpdatedEvent(
-            type="session.updated",
             event_id=self._next_event_id(),
             session=session,
         )

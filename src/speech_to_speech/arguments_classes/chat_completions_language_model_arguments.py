@@ -13,9 +13,8 @@ class ChatCompletionsLanguageModelHandlerArguments(ResponsesApiLanguageModelHand
     Inherits the OpenAI-compatible connection fields from the Responses-API
     arguments (``responses_api_base_url`` / ``responses_api_api_key`` /
     ``responses_api_stream`` / ``responses_api_disable_thinking``) so the same
-    CLI flags and launcher env vars drive both backends. Chat Completions keeps
-    the reasoning-effort default unset so provider-specific disable-thinking
-    behavior remains unchanged.
+    CLI flags and launcher env vars drive both backends, and adds the
+    Chat-Completions-only ``reasoning_effort`` knob.
     """
 
     responses_api_reasoning_effort: Optional[str] = field(

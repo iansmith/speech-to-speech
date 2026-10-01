@@ -16,7 +16,6 @@ Identity:
 import logging
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
 
 import limiter
 
@@ -30,7 +29,6 @@ OAUTH_LOGOUT_PATH = "/oauth/huggingface/logout"
 
 ANON_COOKIE = "s2s_anon"
 _COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
-_OAUTH_EXPIRY_SKEW = timedelta(seconds=30)
 
 
 # Members of these orgs get unlimited usage (like PRO) out of the box. The
@@ -88,9 +86,9 @@ def _field(obj, name, default=None):
 # verifying org gating on the live Space without guessing.
 AUTH_DEBUG = bool(os.environ.get("AUTH_DEBUG"))
 
-# whoami-v2 profiles are cached for the process lifetime, keyed by token, so
-# tier and org resolution across /api/me + /api/session share one Hub request.
-_whoami_cache: "dict[str, dict]" = {}
+# whoami-v2 org lookups are cached for the process lifetime, keyed by token, so
+# /api/me + /api/session don't each hit the Hub.
+_orgs_cache: "dict[str, set[str]]" = {}
 
 
 def current_oauth(request):
@@ -103,49 +101,9 @@ def current_oauth(request):
         return None
 
 
-def _oauth_token_expired(info, *, now=None) -> bool:
-    """Whether the OAuth access token is expired (including clock skew)."""
-    expires_at = _field(info, "access_token_expires_at")
-    if expires_at is None:
-        # Older huggingface_hub versions did not expose this field. Preserve
-        # compatibility and let the upstream service validate those tokens.
-        return False
-    if not isinstance(expires_at, datetime):
-        logger.warning("Unexpected OAuth expiry value; requiring a fresh login.")
-        return True
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.astimezone(timezone.utc)
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.astimezone(timezone.utc)
-    return expires_at <= current + _OAUTH_EXPIRY_SKEW
-
-
-def _oauth_token(info) -> "str | None":
-    token = _field(info, "access_token")
-    if token is None:
-        return None
-    return str(token).strip() or None
-
-
-def oauth_login_required_reason(request) -> "str | None":
-    """Why a cached signed-in session cannot authenticate, if applicable."""
-    info = current_oauth(request)
-    if not _field(info, "user_info"):
-        return None
-    if _oauth_token_expired(info):
-        return "token_expired"
-    if not _oauth_token(info):
-        return "token_invalid"
-    return None
-
-
 def current_user(request):
     """The signed-in HF user-info, or None."""
-    info = current_oauth(request)
-    if _oauth_token_expired(info) or not _oauth_token(info):
-        return None
-    return _field(info, "user_info")
+    return _field(current_oauth(request), "user_info")
 
 
 def current_access_token(request) -> "str | None":
@@ -154,10 +112,10 @@ def current_access_token(request) -> "str | None":
     Keep this server-side: the demo uses it to attribute load-balancer session
     requests to the signed-in HF account, but never returns it to the browser.
     """
-    info = current_oauth(request)
-    if _oauth_token_expired(info):
+    token = _field(current_oauth(request), "access_token")
+    if token is None:
         return None
-    return _oauth_token(info)
+    return str(token).strip() or None
 
 
 def _user_org_names(user) -> "set[str]":
@@ -171,12 +129,14 @@ def _user_org_names(user) -> "set[str]":
     return names
 
 
-def _whoami_via_token(token: str) -> dict:
-    """The authenticated Hub `whoami-v2` profile, cached by OAuth token."""
+def _orgs_via_token(token: str) -> "set[str]":
+    """Fallback org lookup via the Hub `whoami-v2` API, using the user's OAuth
+    access token. Covers the case where the userinfo claim omits `orgs`."""
     if not token:
-        return {}
-    if token in _whoami_cache:
-        return _whoami_cache[token]
+        return set()
+    if token in _orgs_cache:
+        return _orgs_cache[token]
+    names: "set[str]" = set()
     try:
         import httpx
 
@@ -186,36 +146,24 @@ def _whoami_via_token(token: str) -> dict:
             timeout=5.0,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, dict):
-            raise ValueError("whoami-v2 returned a non-object response")
+        for org in resp.json().get("orgs", []) or []:
+            for key in ("name", "fullname"):
+                val = org.get(key)
+                if val:
+                    names.add(str(val).lower())
     except Exception as exc:  # pragma: no cover - network/permission dependent
-        logger.info("whoami-v2 profile lookup failed: %r", exc)
-        return {}
-    _whoami_cache[token] = data
-    return data
-
-
-def _orgs_via_token(token: str, profile=None) -> "set[str]":
-    """Org names from the cached authenticated Hub profile."""
-    if profile is None:
-        profile = _whoami_via_token(token)
-    names: "set[str]" = set()
-    for org in profile.get("orgs", []) or []:
-        for key in ("name", "fullname"):
-            val = _field(org, key)
-            if val:
-                names.add(str(val).lower())
+        logger.info("whoami-v2 org lookup failed: %r", exc)
+    _orgs_cache[token] = names
     return names
 
 
-def _org_names(user, token=None, allow=None, profile=None) -> "set[str]":
+def _org_names(user, token=None, allow=None) -> "set[str]":
     """The user's org usernames from the OAuth userinfo claim. If that doesn't
     already satisfy `allow`, fall back to the Hub `whoami-v2` API (the claim is
     often empty or partial), so membership is resolved either way."""
     names = _user_org_names(user)
     if token and (allow is None or not (allow & names)):
-        names = names | _orgs_via_token(token, profile)
+        names = names | _orgs_via_token(token)
     return names
 
 
@@ -224,33 +172,26 @@ def resolve_tier(user, token=None) -> str:
     member, unlimited), or 'free'. PRO wins over org if both apply."""
     if bool(_field(user, "is_pro", False)):
         return "pro"
-    profile = _whoami_via_token(token)
-    if bool(profile.get("isPro", False)):
-        return "pro"
     allow = _unlimited_orgs()
-    names = _org_names(user, token, allow, profile)
+    names = _org_names(user, token, allow)
     tier = "org" if (allow & names) else "free"
     if AUTH_DEBUG:
         logger.info("tier=%s orgs=%s allow=%s", tier, sorted(names), sorted(allow))
     return tier
 
 
-def user_view(request, tier=None) -> dict:
+def user_view(request) -> dict:
     """Public profile for /api/me."""
     info = current_oauth(request)
     user = _field(info, "user_info")
     if not user:
         return {"loggedIn": False, "tier": "anon"}
-    if _oauth_token_expired(info):
-        return {"loggedIn": False, "tier": "anon", "reason": "token_expired"}
-    token = _oauth_token(info)
-    if not token:
-        return {"loggedIn": False, "tier": "anon", "reason": "token_invalid"}
+    token = _field(info, "access_token")
     out = {
         "loggedIn": True,
         "username": _field(user, "preferred_username") or _field(user, "name") or "you",
         "avatar": _field(user, "picture"),
-        "tier": tier if tier is not None else resolve_tier(user, token),
+        "tier": resolve_tier(user, token),
     }
     if AUTH_DEBUG:
         out["orgs"] = sorted(_org_names(user, token))
@@ -275,9 +216,9 @@ def resolve_identity(request):
     """
     info = current_oauth(request)
     user = _field(info, "user_info")
-    token = _oauth_token(info)
-    if user and token and not _oauth_token_expired(info):
+    if user:
         sub = _field(user, "sub") or _field(user, "preferred_username")
+        token = _field(info, "access_token")
         return resolve_tier(user, token), [limiter.hash_key(f"sub:{sub}")], None
 
     # Anonymous: key by IP and a signed cookie id, minting the cookie if absent.

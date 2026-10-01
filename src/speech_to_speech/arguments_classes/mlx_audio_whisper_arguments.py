@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -13,8 +12,4 @@ class MLXAudioWhisperSTTHandlerArguments:
     mlx_audio_whisper_gen_kwargs: dict = field(
         default_factory=dict,
         metadata={"help": "Additional generation kwargs to pass to the model. Default is an empty dict."},
-    )
-    language: Optional[str] = field(
-        default="en",
-        metadata={"help": "The conversation language, or 'auto' to detect it per utterance. Default is 'en'."},
     )

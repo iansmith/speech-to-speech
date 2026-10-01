@@ -37,11 +37,12 @@ services:
       dockerfile: ${DOCKERFILE:-Dockerfile}
     command:
       - speech-to-speech
-      - serve
-      - --host
+      - --mode
+      - socket
+      - --recv_host
       - 0.0.0.0
-      - --port
-      - "8765"
+      - --send_host
+      - 0.0.0.0
       - --llm_backend
       - responses-api
       - --model_name
@@ -55,9 +56,11 @@ services:
       - --init_chat_prompt
       - "You are a helpful assistant"
     expose:
-      - 8765/tcp
+      - 12345/tcp
+      - 12346/tcp
     ports:
-      - 8765:8765/tcp
+      - 12345:12345/tcp
+      - 12346:12346/tcp
     volumes:
       - ./cache/:/root/.cache/
     deploy:

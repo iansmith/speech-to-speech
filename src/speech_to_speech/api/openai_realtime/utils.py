@@ -114,11 +114,7 @@ def resolve_format(fmt: Any, default_rate: int) -> tuple[Optional[str], int]:
     An unrecognised or absent format is treated as linear PCM at
     ``default_rate``, preserving the behaviour that predates G.711 support.
     """
-    # getattr off an untyped fmt yields Any | None; the codec table is keyed by
-    # str, so narrow before the lookup. A non-str (or absent) type is not a known
-    # codec and resolves to linear PCM below -- the same result .get(None) gave.
-    fmt_type = getattr(fmt, "type", None)
-    codec = _FORMAT_CODECS.get(fmt_type) if isinstance(fmt_type, str) else None
+    codec = _FORMAT_CODECS.get(getattr(fmt, "type", None))
     if codec is not None:
         return codec, G711_SAMPLE_RATE
     return None, getattr(fmt, "rate", None) or default_rate

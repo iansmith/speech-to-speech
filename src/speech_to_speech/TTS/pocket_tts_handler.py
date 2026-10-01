@@ -13,7 +13,6 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.pipeline.transcript_logging import transcript_for_log
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -30,8 +29,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         should_listen: Event,
         device: str = "cpu",
         voice: str = "alba",  # Default voice from catalog
-        language: str = "english",
-        sample_rate: int = 16000,  # Match the pipeline's native audio output rate.
+        sample_rate: int = 16000,  # Match the pipeline's audio output (LocalAudioStreamer uses 16kHz)
         blocksize: int = 512,
         max_tokens: int = 50,
         gen_kwargs: dict[str, Any] | None = None,  # For compatibility with pipeline, not used
@@ -48,7 +46,6 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 - A preset name: 'alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma'
                 - A local audio file path
                 - A Hugging Face path like "hf://kyutai/tts-voices/..."
-            language: PocketTTS language/model configuration to load
             sample_rate: Output sample rate (pocket-tts generates at 24kHz and will be resampled to this rate). Default 16kHz matches the pipeline's audio output.
             blocksize: Size of audio blocks to yield
             max_tokens: Maximum tokens to generate
@@ -58,7 +55,6 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.speculative_turns = speculative_turns
         self.device = device
         self.voice = voice
-        self.language = language
         self.sample_rate = sample_rate
         self.blocksize = blocksize
         self.max_tokens = max_tokens
@@ -71,8 +67,8 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         # Import and load model
         from pocket_tts import TTSModel
 
-        logger.info(f"Loading Pocket TTS model for language: {self.language}")
-        self.model = TTSModel.load_model(language=self.language)
+        logger.info("Loading Pocket TTS model")
+        self.model = TTSModel.load_model()
 
         # Move model to specified device
         if device == "cuda":
@@ -106,9 +102,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 tts_input.turn_id,
                 tts_input.turn_revision,
             ):
-                if tts_input.response_key is None:
-                    return
-                tts_input.cleanup_only = True
+                return
             yield AUDIO_RESPONSE_DONE
             return
 
@@ -129,7 +123,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         console.print(f"[green]ASSISTANT: {text}")
 
         # Generate audio stream
-        logger.debug("Generating audio: %s", transcript_for_log(text))
+        logger.debug(f"Generating audio for: {text[:50]}...")
 
         pipeline_start = perf_counter()
         first_chunk = True

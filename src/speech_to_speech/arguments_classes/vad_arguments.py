@@ -48,7 +48,7 @@ class VADHandlerArguments:
     audio_enhancement: bool = field(
         default=False,
         metadata={
-            "help": "improves sound quality by applying techniques like noise reduction and equalization. Default is False."
+            "help": "improves sound quality by applying techniques like noise reduction, equalization, and echo cancellation. Default is False."
         },
     )
     enable_realtime_transcription: bool = field(
@@ -61,16 +61,28 @@ class VADHandlerArguments:
             "help": "Interval (in seconds) for releasing progressive audio chunks during speech. Default is 0.5s."
         },
     )
-    speculative_reopen_ms: int = field(
-        default=800,
+    stall_audio_dir: str | None = field(
+        default=None,
         metadata={
-            "help": "Keep a soft-ended Realtime turn reopenable for this many milliseconds unless a response commits it. Default is 800 ms."
+            "help": "Directory of recorded holding phrases (raw PCM s16le mono at the pipeline rate, *.pcm). When set, one is played if the caller has been waiting stall_after_ms with no audio. Unset means silence, as before."
+        },
+    )
+    stall_after_ms: int = field(
+        default=5000,
+        metadata={
+            "help": "How long a caller may wait in silence before a holding phrase plays. Only consulted when stall_audio_dir is set."
+        },
+    )
+    speculative_reopen_ms: int = field(
+        default=1000,
+        metadata={
+            "help": "In realtime mode, keep a soft-ended turn reopenable for this many milliseconds unless a response commits it."
         },
     )
     unanswered_reopen_ms: int = field(
         default=7000,
         metadata={
-            "help": "Sanity cap (ms) for reopening a soft-ended speculative turn that has not yet been answered by any assistant output. While a turn is uncommitted, resumed speech within this window reopens the same turn instead of starting a new one. Has no effect below speculative_reopen_ms and is clamped to smart_turn_max_wait_ms when Smart Turn is enabled."
+            "help": "Sanity cap (ms) for reopening a soft-ended speculative turn that has not yet been answered by any assistant output. While a turn is uncommitted, resumed speech within this window reopens the same turn instead of starting a new one. Has no effect below speculative_reopen_ms."
         },
     )
     short_segment_merge_ms: int = field(
@@ -78,38 +90,4 @@ class VADHandlerArguments:
         metadata={
             "help": "When greater than 0, adjacent VAD segments below min_speech_ms are held and stitched for this many milliseconds before being discarded. Fragments shorter than 100 ms of active speech are never held. Useful with very low min_silence_ms values."
         },
-    )
-    smart_turn: bool = field(
-        default=True,
-        metadata={
-            "help": "Use Smart Turn v3.2 after Silero finalizes a Realtime turn to choose how long assistant output remains speculative. Enabled by default; pass --no_smart_turn to disable it."
-        },
-    )
-    smart_turn_model_path: str | None = field(
-        default=None,
-        metadata={
-            "help": "Optional path to a Smart Turn v3.x CPU ONNX model. When omitted, the latest supported v3.2 CPU model is downloaded from pipecat-ai/smart-turn-v3."
-        },
-    )
-    smart_turn_threshold: float = field(
-        default=0.5,
-        metadata={
-            "help": "Smart Turn completion probability threshold. Higher values wait more readily on ambiguous pauses. Default is 0.5."
-        },
-    )
-    smart_turn_max_wait_ms: int = field(
-        default=2000,
-        metadata={
-            "help": "Speculative reopen grace used when Smart Turn reports an incomplete turn. Resumed speech creates a newer turn revision; otherwise output may commit after this delay. Default is 2000 ms."
-        },
-    )
-    smart_turn_incomplete_delay_ms: int = field(
-        default=600,
-        metadata={
-            "help": "Delay STT and LLM processing after Smart Turn reports an incomplete turn, allowing resumed speech to invalidate the revision before expensive work begins. This delay runs within smart_turn_max_wait_ms. Default is 600 ms."
-        },
-    )
-    smart_turn_cpu_count: int = field(
-        default=1,
-        metadata={"help": "Number of CPU threads ONNX Runtime may use for each Smart Turn inference. Default is 1."},
     )

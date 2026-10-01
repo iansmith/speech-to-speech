@@ -552,25 +552,28 @@ class TestUsageSection:
 
 
 class TestProxyConfigFollowsBackendSettings:
-    def test_config_reads_the_normalized_selected_backend(self):
-        # Regression: the proxy and pipeline must consume the same normalized
-        # selected config, including non-default provider connection settings.
-        from speech_to_speech.arguments_classes.chat_completions_language_model_arguments import (
-            ChatCompletionsLanguageModelHandlerArguments,
-        )
+    def test_config_reads_the_renamed_connection_fields(self):
+        # Regression: main() runs prepare_all_args() before the proxy config
+        # is built, and rename_args() pops responses_api_base_url/api_key
+        # into base_url/api_key. Reading the raw names afterwards silently
+        # returned the dataclass class defaults (None), so the proxy hit the
+        # OpenAI default upstream with no key regardless of the flags while
+        # the pipeline LM used the configured provider.
         from speech_to_speech.arguments_classes.module_arguments import ModuleArguments
-        from speech_to_speech.backend_registry import LLM_BACKENDS, select_backend
-        from speech_to_speech.s2s_pipeline import build_llm_proxy_config
+        from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
+            ResponsesApiLanguageModelHandlerArguments,
+        )
+        from speech_to_speech.s2s_pipeline import build_llm_proxy_config, rename_args
 
         module_kwargs = ModuleArguments(enable_llm_proxy=True, llm_backend="chat-completions")
-        lm_kwargs = ChatCompletionsLanguageModelHandlerArguments(
+        lm_kwargs = ResponsesApiLanguageModelHandlerArguments(
             model_name="google/gemma-test",
             responses_api_base_url="https://router.huggingface.co/v1",
             responses_api_api_key="hf_secret",
         )
-        selection = select_backend(LLM_BACKENDS, "chat-completions", lm_kwargs)
+        rename_args(lm_kwargs, "responses_api")  # what prepare_all_args() does before the config is built
 
-        config = build_llm_proxy_config(module_kwargs, selection)
+        config = build_llm_proxy_config(module_kwargs, lm_kwargs)
 
         assert config.enabled is True
         assert config.llm_backend == "chat-completions"

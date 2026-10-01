@@ -9,9 +9,9 @@ from typing import Any, Callable, TypeVar
 
 import numpy as np
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from openai.types.realtime import RealtimeFunctionTool
 from openai.types.realtime import (
     ConversationItemCreateEvent,
-    ConversationItemTruncateEvent,
     InputAudioBufferAppendEvent,
     InputAudioBufferCommitEvent,
     OutputAudioBufferClearEvent,
@@ -20,40 +20,32 @@ from openai.types.realtime import (
     SessionUpdateEvent,
 )
 
+from speech_to_speech.LLM.chat_completions_language_model import _to_chat_tools
+from speech_to_speech.LLM.language_model import compose_system_prompt
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import (
     PIPELINE_SAMPLE_RATE,
     build_error_event,
 )
-from speech_to_speech.api.openai_realtime.sophie_call import (
-    clear_sophie_call_id,
-    client_session_id,
-    set_sophie_call_id,
-)
 from speech_to_speech.api.openai_realtime.transports import (
     SessionTransport,
     WebSocketTransport,
     send_ws_event,
 )
+from speech_to_speech.stall import StallClips, StallTimer
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
-    AssistantOutputEvent,
-    AssistantResponseDoneEvent,
-    AssistantToolCallReadyEvent,
-    AudioInputCompletedEvent,
+    AssistantTextEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
-    ResponseFailedEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
     TranscriptionCompletedEvent,
-    TranscriptionFailedEvent,
 )
 from speech_to_speech.pipeline.log_context import pipeline_log_ctx
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
-from speech_to_speech.pipeline.transcript_logging import log_exception
 
 # aiortc (the 'webrtc' extra) is optional. Import it here, at module load,
 # rather than lazily in the calls endpoint: the av/cryptography C extensions
@@ -72,7 +64,6 @@ except ImportError:
     WEBRTC_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
 MAX_AUDIO_BATCH_BYTES = 6400
 # How long the release path waits for SESSION_END to propagate through the
 # handler chain back to output_queue before warning that the unit is stuck.
@@ -92,27 +83,17 @@ SESSION_END_QUARANTINE_TIMEOUT_S = 180.0
 QItem = TypeVar("QItem")
 
 
-def _keep_cancel_bookkeeping(item: Any) -> bool:
-    # Usage and lifecycle sentinels must survive cancellation queue flushes.
-    # Dropping SESSION_END would leave the release path waiting forever.
-    return isinstance(item, TokenUsageEvent) or _is_audio_done(item) or is_control_message(item, SESSION_END.kind)
+def _keep_audio_sentinel(item: Any) -> bool:
+    # SESSION_END must survive barge-in flushes of output_queue: dropping it
+    # would leave the release path waiting forever for the drain signal.
+    return _is_audio_done(item) or is_control_message(item, SESSION_END.kind)
 
 
 def _keep_user_text_event(item: Any) -> bool:
     return isinstance(
         item,
-        (
-            SpeechStoppedEvent,
-            PartialTranscriptionEvent,
-            TranscriptionCompletedEvent,
-            TranscriptionFailedEvent,
-            AudioInputCompletedEvent,
-        ),
+        (SpeechStoppedEvent, PartialTranscriptionEvent, TranscriptionCompletedEvent, TokenUsageEvent),
     )
-
-
-def _keep_pipeline_control(item: Any) -> bool:
-    return isinstance(item, (PipelineControlMessage, bytes))
 
 
 def _audio_payload(item: Any) -> Any:
@@ -123,77 +104,7 @@ def _audio_generation(item: Any) -> int | None:
     return item.cancel_generation if isinstance(item, AudioOutput) else None
 
 
-def _audio_response_key(item: Any) -> str | None:
-    return item.response_key if isinstance(item, AudioOutput) else None
-
-
-def _audio_cleanup_only(item: Any) -> bool:
-    return item.cleanup_only if isinstance(item, AudioOutput) else False
-
-
-_RESPONSE_PIPELINE_EVENTS = (
-    AssistantOutputEvent,
-    AssistantResponseDoneEvent,
-    ResponseFailedEvent,
-)
-
-
-def _keep_non_audio_output(item: Any) -> bool:
-    """Preserve response bookkeeping when WebRTC clears buffered audio."""
-    return _keep_cancel_bookkeeping(item) or isinstance(item, _RESPONSE_PIPELINE_EVENTS)
-
-
-def _response_event_key(item: Any) -> str | None:
-    if isinstance(item, _RESPONSE_PIPELINE_EVENTS):
-        return item.response_key
-    return None
-
-
-def _response_key_is_obsolete(unit: PipelineUnit, session_id: str, response_key: str | None) -> bool:
-    """Whether *response_key* belongs to a closed response rather than a queued one."""
-    if response_key is None:
-        return False
-    st = unit.service._state(session_id)
-    if response_key in st.closed_response_keys:
-        return True
-    return (
-        st.in_response
-        and st.current_response_key not in (None, response_key)
-        and response_key not in st.pending_response_keys
-    )
-
-
-def _output_response_key(item: Any) -> str | None:
-    if isinstance(item, AudioOutput):
-        return item.response_key
-    if isinstance(item, PipelineEvent):
-        return getattr(item, "response_key", None)
-    return None
-
-
-def _response_key_output_is_blocked(
-    unit: PipelineUnit,
-    session_id: str,
-    response_key: str | None,
-) -> bool:
-    if response_key is None:
-        return False
-    return unit.service.response.is_response_output_blocked(session_id, response_key)
-
-
-def _discard_obsolete_response_key(unit: PipelineUnit, session_id: str, response_key: str | None) -> None:
-    if response_key is None:
-        return
-    unit.service.close_response_key(session_id, response_key)
-    logger.debug("Pipeline %d: discarded obsolete response %s output", unit.index, response_key)
-
-
-def _flush_queue(
-    q: Queue[QItem],
-    *,
-    preserve: Callable[[QItem], bool] | None = None,
-    on_discard: Callable[[QItem], None] | None = None,
-) -> None:
+def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
     """Drain a queue, optionally preserving items matching *preserve*.
 
     Preserved items are re-inserted at the **front** of the queue
@@ -206,8 +117,6 @@ def _flush_queue(
             item = q.get_nowait()
             if preserve and preserve(item):
                 preserved.append(item)
-            elif on_discard is not None:
-                on_discard(item)
         except Empty:
             break
     if preserved:
@@ -217,11 +126,57 @@ def _flush_queue(
             q.not_empty.notify(len(preserved))
 
 
-def _clean_unit(
+async def _drain_pending_response_events(
+    transport: SessionTransport | None,
     unit: PipelineUnit,
-    preserve: Callable[[Any], bool] | None = None,
-    on_discard: Callable[[Any], None] | None = None,
+    session_id: str | None,
 ) -> None:
+    if session_id is None:
+        return
+
+    preserved: list[Any] = []
+    drained_assistant = 0
+    drained_usage = 0
+    drain_assistant_events = True
+    try:
+        while True:
+            try:
+                item = unit.text_output_queue.get_nowait()
+            except Empty:
+                break
+            # Usage is accounting-only, so keep the old whole-queue drain behavior.
+            # Assistant events are client-visible response output and stop at the
+            # first non-response boundary to preserve normal text-event ordering.
+            if isinstance(item, TokenUsageEvent):
+                unit.service.dispatch_pipeline_event(session_id, item)
+                drained_usage += 1
+            elif drain_assistant_events and isinstance(item, AssistantTextEvent):
+                drained_assistant += 1
+                if _generation_is_discardable(unit, item.cancel_generation):
+                    continue
+                events = unit.service.dispatch_pipeline_event(session_id, item)
+                if transport is not None and events:
+                    await transport.send_events(events)
+            else:
+                preserved.append(item)
+                drain_assistant_events = False
+    finally:
+        if preserved:
+            with unit.text_output_queue.mutex:
+                for item in reversed(preserved):
+                    unit.text_output_queue.queue.appendleft(item)
+                unit.text_output_queue.not_empty.notify(len(preserved))
+
+    if drained_assistant or drained_usage:
+        logger.debug(
+            "Pipeline %d: drained %d assistant event(s) and %d token usage event(s) before response completion",
+            unit.index,
+            drained_assistant,
+            drained_usage,
+        )
+
+
+def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = None) -> None:
     """Cancel in-flight work and flush queues for a single pipeline unit.
 
     All four pipeline queues are drained — input audio, transcript-to-LM,
@@ -234,8 +189,8 @@ def _clean_unit(
     unit.cancel_scope.cancel()
     _flush_queue(unit.input_queue)
     _flush_queue(unit.text_prompt_queue)
-    _flush_queue(unit.output_queue, preserve=preserve, on_discard=on_discard)
-    _flush_queue(unit.text_output_queue, preserve=preserve, on_discard=on_discard)
+    _flush_queue(unit.output_queue, preserve=preserve)
+    _flush_queue(unit.text_output_queue, preserve=preserve)
     unit.response_playing.clear()
     unit.cancel_scope.reset()
     unit.should_listen.set()
@@ -332,7 +287,6 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
         try:
             _safe_unregister(unit, session_id)
         finally:
-            clear_sophie_call_id(unit)
             unit.session = None
         recovered = " after quarantine" if session.quarantined_at is not None else ""
         logger.info(f"Pipeline {unit.index} released{recovered} (session {session_id} ended)")
@@ -341,20 +295,6 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
 # Strong references to in-flight drain-and-release tasks (asyncio only
 # holds tasks weakly); each task removes itself on completion.
 _release_tasks: set[asyncio.Task[None]] = set()
-
-
-def claim_idle_unit(pool: list[PipelineUnit], transport: SessionTransport | None) -> PipelineUnit | None:
-    """Reserve the first idle unit and drop any Sophie call id it still holds.
-
-    The clear is the claim half of the pool cycle. Release clears too; this
-    one is what a reused unit hits if that release did not.
-    """
-    for unit in pool:
-        if unit.session is None:
-            unit.session = SessionState(transport=transport)
-            clear_sophie_call_id(unit)
-            return unit
-    return None
 
 
 def _release_session(unit: PipelineUnit, session_id: str) -> None:
@@ -370,30 +310,7 @@ def _release_session(unit: PipelineUnit, session_id: str) -> None:
         # Already released (e.g. duplicate close callbacks racing).
         return
     old_session.released_at = time.monotonic()
-    # The send loop can be parked on output from an unclaimed internal
-    # prefetch. Invalidate that response while its connection state is still
-    # registered, and drop the per-session held item so SESSION_END can drain.
-    try:
-        unit.service.close_pending_responses(session_id)
-    except KeyError:
-        pass
-
-    def account_usage(item: Any) -> None:
-        if not isinstance(item, TokenUsageEvent):
-            return
-        try:
-            unit.service.dispatch_pipeline_event(session_id, item)
-        except KeyError:
-            # A duplicate close callback may race the drain task's unregister.
-            logger.debug("Skipped late usage for unregistered session %s", session_id)
-
-    if old_session.pending_output_item is not None:
-        account_usage(old_session.pending_output_item)
-        old_session.pending_output_item = None
-    for item in old_session.pending_text_output_items:
-        account_usage(item)
-    old_session.pending_text_output_items.clear()
-    _clean_unit(unit, on_discard=account_usage)
+    _clean_unit(unit)
     # Tag SESSION_END with this session's id so that, after a force
     # release, a late arrival can't satisfy the next session's drain.
     unit.input_queue.put(PipelineControlMessage(SESSION_END.kind, session_id=session_id))
@@ -419,25 +336,16 @@ async def _dispatch_client_event(
     audio sits client-side).
     """
     service = unit.service
-    client_event_id = raw.get("event_id")
-
-    async def send_correlated(events: list[Any]) -> None:
-        if isinstance(client_event_id, str):
-            for outgoing in events:
-                if getattr(outgoing, "type", None) == "error":
-                    outgoing.error.event_id = client_event_id
-        await transport.send_events(events)
-
     event = service.parse_client_event(raw)
     if event is None:
-        await send_correlated(
+        await transport.send_events(
             [service.make_error(f"Unknown or invalid event: {raw.get('type')}", "unknown_or_invalid_event")]
         )
         return
 
     if isinstance(event, InputAudioBufferAppendEvent):
         if transport_kind == "webrtc":
-            await send_correlated(
+            await transport.send_events(
                 [
                     service.make_error(
                         "In WebRTC mode audio arrives via the media track; input_audio_buffer.append is not supported.",
@@ -446,11 +354,6 @@ async def _dispatch_client_event(
                 ]
             )
             return
-        # Caller audio is the only thing that arrives reliably on an otherwise
-        # silent call -- roughly every 20ms -- which makes it the heartbeat the
-        # stuck-conversation watchdog runs on, with no timer and no per-session
-        # task.
-        service.check_stuck_conversation(session_id)
         chunks = service.handle_audio_append(session_id, event)
         rt_cfg = service._state(session_id).runtime_config
         for chunk in chunks:
@@ -459,11 +362,11 @@ async def _dispatch_client_event(
     elif isinstance(event, InputAudioBufferCommitEvent):
         err = service.handle_audio_commit(session_id)
         if err:
-            await send_correlated([err])
+            await transport.send_events([err])
 
     elif isinstance(event, OutputAudioBufferClearEvent):
         if transport_kind != "webrtc":
-            await send_correlated(
+            await transport.send_events(
                 [
                     service.make_error(
                         "output_audio_buffer.clear is only supported on the WebRTC transport.",
@@ -472,74 +375,54 @@ async def _dispatch_client_event(
                 ]
             )
             return
-        _flush_queue(unit.output_queue, preserve=_keep_non_audio_output)
+        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
         transport.discard_pending_audio()
 
     elif isinstance(event, SessionUpdateEvent):
         err = service.handle_session_update(session_id, event)
         if err:
-            await send_correlated([err])
-        else:
-            carried = client_session_id(raw)
-            if carried is not None:
-                set_sophie_call_id(unit, carried)
-            await send_correlated([service.build_session_updated(session_id)])
+            await transport.send_events([err])
 
     elif isinstance(event, ConversationItemCreateEvent):
         events = service.handle_conversation_item_create(session_id, event)
         if events:
-            await send_correlated(events)
-
-    elif isinstance(event, ConversationItemTruncateEvent):
-        # The stock Agents SDK sends this after an audible WebSocket
-        # interruption. An explicit response.cancel or automatic server-VAD
-        # cancellation has already discarded provisional generation, and
-        # client-side playback owns the unheard tail, so there is no additional
-        # server state to mutate.
-        logger.debug("Accepted conversation.item.truncate for %s", event.item_id)
+            await transport.send_events(events)
 
     elif isinstance(event, ResponseCreateEvent):
         result = service.handle_response_create(session_id, event)
         if result:
-            response_key = None
             if result.type != "error":
                 unit.cancel_scope.new_response()
-                response_key = service._state(session_id).current_response_key
-            await send_correlated([result])
-            if result.type == "response.created":
-                service.response.mark_response_created_sent(session_id, response_key)
+            await transport.send_events([result])
 
     elif isinstance(event, ResponseCancelEvent):
-        st = service._state(session_id)
-        had_response = st.in_response or st.response_pending
-        if had_response:
+        was_active = service._state(session_id).in_response
+        if was_active:
             unit.cancel_scope.cancel()
-            _flush_queue(unit.text_prompt_queue, preserve=_keep_pipeline_control)
-        _flush_queue(unit.output_queue, preserve=_keep_cancel_bookkeeping)
+        _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
         _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
         transport.discard_pending_audio()
         events = service.handle_response_cancel(session_id)
         if events:
-            await send_correlated(events)
+            await transport.send_events(events)
         unit.response_playing.clear()
 
 
 def _first_llm_handler(pool: list[PipelineUnit]) -> Any | None:
-    """The pool's chat-completions handler, or None if it has no mlx path.
+    """The first pipeline unit's chat-completions handler, or None.
 
-    An EXACT type check, not duck-typing on client/model_name: those live on the
-    shared BaseOpenAICompatibleHandler and ResponsesApiModelHandler carries them
-    too. Warming that one would fire a chat-completions request at a handler
-    whose real turns go through responses.create -- a prefix no turn will ever
-    match, reported as warmed:true. A deployment with no chat-completions
-    handler at all (only the Responses path, or none) simply has nothing to
-    warm this way, and /v1/warm declines rather than pretending otherwise.
-
-    Any pool unit's handler serves: the prefix cache is the backing model's, not
-    a unit's, so warming through one warms it for all.
+    Any unit will do: the warm targets the BACKING model's prefix cache, which
+    is shared across units, so this deliberately does not try to claim an idle
+    one. Claiming would make a cache warm compete with a real call for a
+    pipeline, which is exactly backwards.
     """
     from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
 
+    # An exact type check, not duck-typing on client/model_name: those live on
+    # the shared base and ResponsesApiModelHandler has them too. Warming that
+    # one would fire a chat-completions request at a handler whose real turns
+    # go through responses.create -- a prefix no turn will ever match, reported
+    # as warmed:true.
     for unit in pool:
         for h in unit.handlers:
             if isinstance(h, ChatCompletionsApiModelHandler):
@@ -551,7 +434,14 @@ def create_app(
     pool: list[PipelineUnit],
     stop_event: ThreadingEvent,
     llm_proxy_config: LLMProxyConfig | None = None,
+    stall_audio_dir: str | None = None,
+    stall_after_ms: int = 5000,
 ) -> FastAPI:
+    # Loaded once, shared across units: the clips are immutable bytes and the
+    # per-session state that is NOT shared (which phrase came last, when the
+    # wait began) lives in StallTimer, one per unit, below.
+    stall_clips = StallClips.load(stall_audio_dir)
+    stall_after_s = stall_after_ms / 1000.0
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # One send loop per pipeline unit; each polls its own queues and forwards
@@ -584,14 +474,15 @@ def create_app(
         session_id after RealtimeService.register(). The WebRTC route claims
         with transport=None and attaches the session object once constructed.
         """
-        return claim_idle_unit(pool, transport)
+        for unit in pool:
+            if unit.session is None:
+                unit.session = SessionState(transport=transport)
+                return unit
+        return None
 
     @app.websocket("/v1/realtime")
     async def realtime_endpoint(ws: WebSocket) -> None:
-        offered_subprotocols = {
-            protocol.strip() for protocol in ws.headers.get("sec-websocket-protocol", "").split(",")
-        }
-        await ws.accept(subprotocol="realtime" if "realtime" in offered_subprotocols else None)
+        await ws.accept()
 
         transport = WebSocketTransport(ws)
         unit = _claim_unit(transport)
@@ -635,8 +526,8 @@ def create_app(
 
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected from pipeline {unit.index}")
-        except Exception as exc:
-            log_exception(logger, f"Client {session_id} on pipeline {unit.index} error", exc)
+        except Exception as e:
+            logger.error(f"Client {session_id} on pipeline {unit.index} error: {type(e).__name__}: {e}", exc_info=True)
         finally:
             # Hold the session reference: the send loop's snapshot will still resolve
             # to this object until we clear unit.session, so any handler output that
@@ -711,107 +602,101 @@ def create_app(
 
     @app.post("/v1/warm")
     async def warm_endpoint(request: Request) -> dict[str, Any]:
-        """Prefill the backing model's prefix cache for a session not yet started.
+        """Prefill the backing model's prefix cache for a session that has not started.
 
-        A caller that knows a conversation is coming -- but is busy first, such
-        as playing a recorded introduction down the phone, or has just cold-
-        booted the model plane -- can spend that dead time here instead of
-        making the caller spend it on the first greeting.
+        A caller that knows a conversation is coming -- but is busy doing
+        something else first, such as playing a recorded introduction down the
+        phone -- can spend that dead time here instead of making the caller
+        spend it later.
 
-        The system message is composed by build_voice_system_prompt, the SAME
-        function BaseOpenAICompatibleHandler._apply_config runs for a real turn,
-        and that sharing is the whole job, not tidiness: the backing model
-        matches a cached prefix from position 0, the system message IS position
-        0, and a warm built from a second copy of that logic would match
-        nothing while reporting warmed:true. The tools travel structurally --
-        as chat-completions tool params -- exactly as the live mlx path sends
-        them, NOT as prose in the prompt; a `session.update`'s tools reach here
-        unchanged and go through the same _to_chat_tools the real request uses.
+        Measured on the consumer that asked for this: the system message alone
+        is ~12.5KB, about 3100 of a first turn's 4244 tokens, and a cold prefill
+        of that runs ~47 seconds at the observed 89 tok/s. The caller hears
+        silence for all of it and reasonably concludes the line is dead.
 
-        The byte-perfect match assumes the live turn composes the same way:
-        default `enable_lang_prompt=False` (so `_apply_config` passes
-        `language_name=None`, as this does) and an audio-modality turn (so it
-        uses the voice builder, not the text one). A phone greeting is both. If
-        a deployment enables the language prompt and a language is detected, the
-        live prefix gains a language block after the session prompt -- the
-        expensive session-prompt prefill still hits, only the tail past it does
-        not.
+        The prompt is composed by compose_system_prompt, the same function the
+        real turn uses, and that sharing is not tidiness -- prefix matching
+        starts at position 0 and the system message IS position 0, so a warm
+        built from a second copy of that logic would match nothing while
+        appearing to succeed.
 
         Fails open. A warm is an optimisation; nothing it can do is worth
         failing a call that has not started yet, so every error becomes a
         reported status rather than a raised one.
         """
-        from speech_to_speech.LLM.chat_completions_language_model import _to_chat_tools
-        from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
-
         try:
             body = await request.json()
         except Exception as exc:
             return {"warmed": False, "reason": f"bad request body: {exc}"}
-        # Fail open on a non-object body too: valid JSON that is null/list/scalar
-        # would otherwise make body.get raise AttributeError and 500 -- the exact
-        # thing a warm must never do to a call that has not started.
-        if not isinstance(body, dict):
-            return {"warmed": False, "reason": "body is not a JSON object"}
 
         instructions = body.get("instructions")
         if not isinstance(instructions, str) or not instructions:
             return {"warmed": False, "reason": "no instructions"}
 
         raw_tools = body.get("tools") or []
+        try:
+            tools = [RealtimeFunctionTool(**t) if isinstance(t, dict) else t for t in raw_tools]
+        except Exception as exc:
+            return {"warmed": False, "reason": f"tools did not parse: {exc}"}
 
         handler = _first_llm_handler(pool)
         if handler is None:
             return {"warmed": False, "reason": "no chat-completions handler in the pool"}
 
         try:
-            # No tool_section: the mlx chat-completions path puts tool prose
-            # nowhere in the system message and sends the tools structurally
-            # below. language_name is left at its default -- a warm has no
-            # session-language yet, and a session with none composes the same
-            # way, so the lead + session-prompt prefix (the expensive ~12.5KB)
-            # matches regardless.
-            system_prompt = build_voice_system_prompt(instructions)
+            # tool_choice="none" so the tool PROSE is left out of the system
+            # message, and the tools are passed structurally below instead.
+            #
+            # This mirrors what a real turn sends, and matching it is the whole
+            # job. Measured 2026-08-28, the first version of this endpoint got
+            # it wrong in exactly the way that is invisible: it composed the
+            # prose into the system message and sent no tools array, giving
+            # sys=15927b against the real turn's sys=12504b + tools=3664b. Both
+            # requests succeeded, the warm reported warmed:true, and the call it
+            # was meant to help matched 1024 of 4244 tokens -- a disk chunk,
+            # nothing to do with the warm. Different bytes at position 0 match
+            # nothing, and nothing says so.
+            system_prompt, function_tools, _, _, _ = compose_system_prompt(
+                instructions, tools, "none", wants_audio=True
+            )
         except Exception as exc:
             logger.warning("warm: could not compose the system prompt: %s", exc)
             return {"warmed": False, "reason": f"compose failed: {exc}"}
 
         started = time.monotonic()
         try:
+            # max_tokens=1: the point is the prefill, not the answer. The
+            # response is discarded; what is wanted is the KV state the backing
+            # model keeps behind it.
+            chat_tools = _to_chat_tools(function_tools)
             create_kwargs: dict[str, Any] = {}
-
-            # Tools structurally, through the SAME converter a real turn uses
-            # (_build_chat_optional_kwargs -> _to_chat_tools), so the rendered
-            # prefix carries the identical tools block.
-            chat_tools = _to_chat_tools(raw_tools)
             if chat_tools is not None:
                 create_kwargs["tools"] = chat_tools
 
             # extra_body, because a real turn sends it and this must match a
-            # real turn or it warms a prefix nothing looks up. On this
-            # deployment it carries chat_template_kwargs, which the serving
-            # stack's chat template consumes -- so omitting it renders the
-            # prefix under different template kwargs than every actual request.
+            # real turn byte for byte or it warms a prefix nothing will look up.
+            #
+            # On this deployment it carries chat_template_kwargs
+            # ({"enable_thinking": False}), which the serving stack's chat
+            # template consumes -- so omitting it renders the prefix under
+            # different template kwargs than every actual request. That is the
+            # same silent no-op the tools/prose split already caused once:
+            # succeeds, reports warmed:true, buys nothing.
             extra_body = getattr(handler, "_extra_body", None)
             if extra_body:
                 create_kwargs["extra_body"] = extra_body
 
-            # A warm must not hold a thread for the SDK's 600s default: it runs
-            # off the event loop in a worker thread, so a wedged backend would
-            # otherwise starve the pool that live calls draw on.
+            # A warm must not be able to hold a thread for the SDK's 600s
+            # default. It runs in asyncio's shared executor, so a slow or wedged
+            # backend would otherwise starve the pool that live calls draw on.
             timeout = getattr(handler, "request_timeout", None)
             if timeout is not None:
                 create_kwargs["timeout"] = timeout
 
-            # max_tokens=1: the point is the prefill, not the answer. The
-            # response is discarded; the KV state behind it is what is wanted.
             await asyncio.to_thread(
                 lambda: handler.client.chat.completions.create(
                     model=handler.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "hi"},
-                    ],
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": "hi"}],
                     max_tokens=1,
                     stream=False,
                     **create_kwargs,
@@ -822,7 +707,7 @@ def create_app(
             return {"warmed": False, "reason": f"prefill failed: {exc}"}
 
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(raw_tools), elapsed_ms)
+        logger.info("warm: prefilled sys=%db tools=%d in %dms", len(system_prompt), len(function_tools), elapsed_ms)
         return {"warmed": True, "system_prompt_chars": len(system_prompt), "elapsed_ms": elapsed_ms}
 
     @app.post("/v1/realtime/calls")
@@ -977,6 +862,17 @@ def create_app(
         no stale sentinel can leak into the next claim.
         """
         pipeline_log_ctx.set(unit.index)
+
+        # One timer per SESSION, not per unit, and the distinction is the whole
+        # of a bug this replaced. A unit outlives the caller on it: it is
+        # released and reclaimed by the next call. A timer built out here kept
+        # the previous caller's state, so a caller could inherit an already-armed
+        # timer and hear "let me look that up" before waiting at all -- or
+        # inherit a fired one and never hear it. stall_session tracks whose
+        # timer this is, and a change rebuilds it.
+        stall_timer = StallTimer(stall_after_s)
+        stall_session: str | None = None
+
         while not stop_event.is_set():
             try:
                 # Snapshot the session once per iteration; if the route releases the
@@ -988,45 +884,7 @@ def create_app(
 
                 # Text events first (speech_started cancels active response).
                 try:
-                    text_msg = None
-                    if session is not None and session_id is not None:
-                        for index, pending in enumerate(session.pending_text_output_items):
-                            if not _response_key_output_is_blocked(
-                                unit,
-                                session_id,
-                                _output_response_key(pending),
-                            ):
-                                text_msg = session.pending_text_output_items.pop(index)
-                                break
-                    if text_msg is None:
-                        text_msg = unit.text_output_queue.get_nowait()
-
-                    if (
-                        session is not None
-                        and session_id is not None
-                        and _response_key_output_is_blocked(
-                            unit,
-                            session_id,
-                            _output_response_key(text_msg),
-                        )
-                    ):
-                        # Response-dependent side-channel events share the same
-                        # exposure barrier as audio/output events. In particular,
-                        # an early tool call must never overtake response.created.
-                        # Unlike the serial output hold, this list does not stall
-                        # the origin response whose completion enables the claim.
-                        session.pending_text_output_items.append(text_msg)
-                        text_msg = None
-                    if text_msg is None:
-                        raise Empty
-                    if isinstance(text_msg, AssistantToolCallReadyEvent):
-                        generation = text_msg.cancel_generation
-                        response_key = text_msg.response_key
-                        if _generation_is_discardable(unit, generation):
-                            continue
-                        if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                            _discard_obsolete_response_key(unit, session_id, response_key)
-                            continue
+                    text_msg = unit.text_output_queue.get_nowait()
                     is_speech_start = isinstance(text_msg, SpeechStartedEvent)
 
                     was_in_response = False
@@ -1036,12 +894,16 @@ def create_app(
                         was_in_response = st.in_response
                         was_response_pending = st.response_pending
 
-                    if transport is not None and isinstance(text_msg, PipelineEvent) and session_id:
+                    if isinstance(text_msg, AssistantTextEvent) and _generation_is_discardable(
+                        unit, text_msg.cancel_generation
+                    ):
+                        pass
+                    elif transport is not None and isinstance(text_msg, PipelineEvent) and session_id:
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
                         if events:
                             await transport.send_events(events)
 
-                    if isinstance(text_msg, SpeechStartedEvent) and session_id:
+                    if is_speech_start and session_id:
                         active_cfg = unit.service._state(session_id).runtime_config
                         interrupt_enabled = text_msg.interrupt_response and (
                             active_cfg is None or active_cfg.interrupt_response_enabled
@@ -1056,9 +918,8 @@ def create_app(
                         if was_in_response or was_response_pending:
                             if interrupt_enabled:
                                 unit.cancel_scope.cancel()
-                                unit.service.close_pending_responses(session_id)
-                                _flush_queue(unit.text_prompt_queue, preserve=_keep_pipeline_control)
-                                _flush_queue(unit.output_queue, preserve=_keep_cancel_bookkeeping)
+                                unit.service._state(session_id).response_pending = False
+                                _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
                                 _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
                                 if unit.response_playing.is_set():
                                     unit.response_playing.clear()
@@ -1074,6 +935,69 @@ def create_app(
                 except Empty:
                     pass
 
+                # A holding phrase for a caller who has been waiting in silence.
+                #
+                # Armed while a response is expected and nothing has been heard;
+                # disarmed the moment anything goes out. Sent through
+                # encode_audio_chunk, the same path synthesized speech takes, so
+                # the transport needs no special case and the clip is converted
+                # to the client's format like any other audio.
+                #
+                # It does not touch the cancel scope or should_listen.
+                #
+                # It DOES open the response: encode_audio_chunk goes through
+                # begin_audio_response, which allocates a response id and emits
+                # response.created when none exists. On the implicit
+                # VAD->STT->LLM->TTS path there is no prior response.create, so
+                # the holding phrase is what opens the response the real answer
+                # then joins. That is benign -- the answer joins an open
+                # response rather than opening its own -- but it is not
+                # "touches nothing", which this comment claimed until it was
+                # traced.
+                #
+                # AND IT RESETS THE CALLER-FACING IDLE TIMEOUT. This was
+                # asserted to be impossible and is not. The phrase goes out as
+                # response.output_audio.delta, a backend event; a consumer's
+                # bridge signals activity on every successful backend read and
+                # resets its idle guard on that signal. So a hung backend is
+                # masked for one extra stall_after_ms per pending response.
+                #
+                # Bounded today: StallTimer fires once per pending response, so
+                # the cost is one threshold, not an indefinite reprieve. It
+                # would become unbounded the moment the phrase is made to
+                # repeat, which is why a second-stall feature must solve this
+                # first rather than inherit it.
+                if len(stall_clips) and session_id and transport is not None:
+                    if session_id != stall_session:
+                        stall_timer = StallTimer(stall_after_s)
+                        stall_session = session_id
+
+                    # _state is a bare dict lookup and the conn can be gone
+                    # while unit.session is still set -- the quarantine path
+                    # pops the conn and leaves both in place. An unguarded
+                    # lookup here raised KeyError every tick, and because this
+                    # block sits BEFORE the audio-queue drain, the aborted
+                    # iteration stopped the loop ever observing SESSION_END,
+                    # which is the exact thing quarantine waits on. The unit
+                    # could then never be reclaimed.
+                    st = unit.service._conns.get(session_id)
+                    if st is None:
+                        stall_timer.disarm()
+                    elif st.response_pending and not unit.response_playing.is_set():
+                        stall_timer.arm(time.monotonic())
+                    else:
+                        stall_timer.disarm()
+
+                    if stall_timer.due(time.monotonic()):
+                        clip = stall_clips.next_clip()
+                        if clip is not None:
+                            try:
+                                await transport.send_events(unit.service.audio.encode_audio_chunk(session_id, clip))
+                                logger.info("Pipeline %d: holding phrase played (%d bytes)", unit.index, len(clip))
+                            except Exception as exc:
+                                # Never let comfort audio end a call.
+                                logger.warning("Pipeline %d: holding phrase failed: %s", unit.index, exc)
+
                 try:
                     if session is not None and session.pending_output_item is not None:
                         audio_chunk = session.pending_output_item
@@ -1081,92 +1005,26 @@ def create_app(
                     else:
                         audio_chunk = unit.output_queue.get_nowait()
 
-                    if (
-                        session is not None
-                        and session_id is not None
-                        and _response_key_output_is_blocked(
-                            unit,
-                            session_id,
-                            _output_response_key(audio_chunk),
-                        )
-                    ):
-                        # Generation and TTS may complete before the client sends
-                        # response.create, or before response.created finishes
-                        # sending. Keep every lifecycle event private until the
-                        # response is publicly announced.
-                        session.pending_output_item = audio_chunk
-                        await asyncio.sleep(0.01)
-                        continue
-
-                    if isinstance(audio_chunk, TokenUsageEvent):
-                        if transport is not None and session_id is not None:
-                            await transport.send_events(unit.service.dispatch_pipeline_event(session_id, audio_chunk))
-                        continue
-
-                    if isinstance(audio_chunk, _RESPONSE_PIPELINE_EVENTS):
-                        generation = getattr(audio_chunk, "cancel_generation", None)
-                        response_key = _response_event_key(audio_chunk)
-                        if _generation_is_discardable(unit, generation):
-                            continue
-                        if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                            _discard_obsolete_response_key(unit, session_id, response_key)
-                            continue
-                        if transport is not None and session_id is not None:
-                            await transport.send_events(unit.service.dispatch_pipeline_event(session_id, audio_chunk))
-                        continue
-
                     if _is_pipeline_end(audio_chunk):
+                        await _drain_pending_response_events(transport, unit, session_id)
                         if transport is not None and session_id:
                             await transport.send_events(unit.service.finish_response(session_id))
                         break
 
                     if _is_audio_done(audio_chunk):
                         audio_generation = _audio_generation(audio_chunk)
-                        response_key = _audio_response_key(audio_chunk)
-                        if _audio_cleanup_only(audio_chunk):
-                            if response_key is None:
-                                logger.warning("Ignoring unkeyed stale response cleanup terminal")
-                                continue
-                            cleaned_active_response = False
-                            if session_id:
-                                st = unit.service._state(session_id)
-                                if st.in_response and st.current_response_key in (None, response_key):
-                                    cleaned_active_response = True
-                                    events = unit.service.finish_response(
-                                        session_id,
-                                        status="cancelled",
-                                        response_key=response_key,
-                                    )
-                                    if transport is not None and events:
-                                        await transport.send_events(events)
-                                else:
-                                    unit.service.close_response_key(session_id, response_key)
-                                if cleaned_active_response:
-                                    unit.response_playing.clear()
-                                if not (st.in_response or st.response_pending):
-                                    unit.should_listen.set()
-                            unit.cancel_scope.response_done(audio_generation)
-                            logger.info(
-                                "Pipeline %d: stale response lifecycle cleaned up",
-                                unit.index,
-                            )
-                            continue
                         if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
                             if session_id:
-                                unit.service.close_response_key(session_id, response_key)
+                                unit.service._state(session_id).response_pending = False
                             unit.cancel_scope.response_done(audio_generation)
                             unit.should_listen.set()
                             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
                             continue
-                        if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                            _discard_obsolete_response_key(unit, session_id, response_key)
-                            continue
+                        await _drain_pending_response_events(transport, unit, session_id)
                         if transport is not None and session_id:
-                            await transport.send_events(
-                                unit.service.finish_response(session_id, response_key=response_key)
-                            )
+                            await transport.send_events(unit.service.finish_response(session_id))
                         if session_id:
-                            unit.service._state(session_id).clear_pending_response(response_key)
+                            unit.service._state(session_id).response_pending = False
                         unit.response_playing.clear()
                         unit.cancel_scope.response_done(audio_generation)
                         unit.should_listen.set()
@@ -1191,11 +1049,6 @@ def create_app(
                     if _should_discard_audio(unit, audio_chunk):
                         continue
 
-                    response_key = _audio_response_key(audio_chunk)
-                    if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
-                        _discard_obsolete_response_key(unit, session_id, response_key)
-                        continue
-
                     audio_chunk = _to_audio_bytes(audio_chunk)
 
                     audio_batch = bytearray(audio_chunk)
@@ -1208,7 +1061,6 @@ def create_app(
                         if (
                             _is_pipeline_end(next_chunk)
                             or _is_audio_done(next_chunk)
-                            or isinstance(next_chunk, PipelineEvent)
                             or is_control_message(next_chunk, SESSION_END.kind)
                         ):
                             # Only stash if we still have a session; otherwise drop it.
@@ -1218,11 +1070,6 @@ def create_app(
 
                         if _should_discard_audio(unit, next_chunk):
                             continue
-
-                        if _audio_response_key(next_chunk) != response_key:
-                            if session is not None:
-                                session.pending_output_item = next_chunk
-                            break
 
                         next_audio = _to_audio_bytes(next_chunk)
                         if len(audio_batch) + len(next_audio) > MAX_AUDIO_BATCH_BYTES:
@@ -1236,12 +1083,7 @@ def create_app(
                         unit.should_listen.set()
 
                     if transport is not None and session_id:
-                        await transport.send_audio_chunk(
-                            unit.service,
-                            session_id,
-                            bytes(audio_batch),
-                            response_key,
-                        )
+                        await transport.send_audio_chunk(unit.service, session_id, bytes(audio_batch))
                 except Empty:
                     pass
 
