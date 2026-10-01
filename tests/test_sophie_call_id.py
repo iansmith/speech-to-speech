@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from speech_to_speech.api.openai_realtime.sophie_call import (
-    SOPHIE_CALL_HEADER,
+    CLIENT_SESSION_HEADER,
     client_session_id,
 )
 from speech_to_speech.api.openai_realtime.websocket_router import (
@@ -23,6 +23,13 @@ from speech_to_speech.LLM.chat_completions_language_model import (
 
 def _handler() -> ChatCompletionsApiModelHandler:
     return ChatCompletionsApiModelHandler.__new__(ChatCompletionsApiModelHandler)
+
+
+def test_client_session_header_pins_the_wire_name() -> None:
+    # Sophie's LLM proxy reads this exact header (aatoolkit
+    # realtime.XClientSessionID, AATK-140). A rename on one side alone drops
+    # every voice call's spliced context, so the string is pinned, not derived.
+    assert CLIENT_SESSION_HEADER == "X-Client-Session-Id"
 
 
 def test_session_update_carries_the_client_id() -> None:
@@ -51,7 +58,7 @@ def test_claim_release_claim_does_not_keep_the_first_id() -> None:
     assert handler.sophie_call_headers() == {}
 
     handler.set_sophie_call_id("second")
-    assert handler.sophie_call_headers() == {SOPHIE_CALL_HEADER: "second"}
+    assert handler.sophie_call_headers() == {CLIENT_SESSION_HEADER: "second"}
 
 
 def test_chat_request_stamps_the_header_and_omits_it_when_clear() -> None:
@@ -73,7 +80,7 @@ def test_chat_request_stamps_the_header_and_omits_it_when_clear() -> None:
     handler._request([{"role": "user", "content": "hi"}], {})
     headers = seen.get("extra_headers")
     assert isinstance(headers, dict)
-    assert headers[SOPHIE_CALL_HEADER] == "call-1"
+    assert headers[CLIENT_SESSION_HEADER] == "call-1"
 
     handler.on_session_end()
     handler._request([{"role": "user", "content": "hi"}], {})
@@ -106,4 +113,4 @@ async def test_dispatch_stores_the_id_from_the_raw_event() -> None:
         "session": {"type": "realtime", "model": "unused", "client_session_id": "from-wire"},
     }
     await _dispatch_client_event(unit, "srv", raw, _Transport())
-    assert handler.sophie_call_headers() == {SOPHIE_CALL_HEADER: "from-wire"}
+    assert handler.sophie_call_headers() == {CLIENT_SESSION_HEADER: "from-wire"}

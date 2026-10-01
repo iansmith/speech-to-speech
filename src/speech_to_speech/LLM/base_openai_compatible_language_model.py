@@ -241,9 +241,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         call_id = getattr(self, "_sophie_call_id", "")
         if not call_id:
             return {}
-        from speech_to_speech.api.openai_realtime.sophie_call import SOPHIE_CALL_HEADER
+        from speech_to_speech.api.openai_realtime.sophie_call import CLIENT_SESSION_HEADER
 
-        return {SOPHIE_CALL_HEADER: call_id}
+        return {CLIENT_SESSION_HEADER: call_id}
 
     def _use_provider_client(self, client: OpenAI) -> None:
         """Adopt *client* and make requests issued on it abortable mid-connect.
