@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SOPHIE_CALL_HEADER = "X-Sophie-Call-Id"
+CLIENT_SESSION_HEADER = "X-Client-Session-Id"
 
 
 def client_session_id(raw: dict[str, Any]) -> str | None:
