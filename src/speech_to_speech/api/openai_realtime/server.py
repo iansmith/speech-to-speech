@@ -27,8 +27,6 @@ class RealtimeServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         llm_proxy_config: LLMProxyConfig | None = None,
-        stall_audio_dir: str | None = None,
-        stall_after_ms: int = 5000,
     ) -> None:
         if not pool:
             raise ValueError("RealtimeServer requires at least one PipelineUnit in the pool")
@@ -37,18 +35,10 @@ class RealtimeServer:
         self.host = host
         self.port = port
         self.llm_proxy_config = llm_proxy_config
-        self.stall_audio_dir = stall_audio_dir
-        self.stall_after_ms = stall_after_ms
 
     def run(self) -> None:
         """Start the FastAPI/uvicorn server (called from a ThreadManager thread)."""
-        app = create_app(
-            pool=self.pool,
-            stop_event=self.stop_event,
-            llm_proxy_config=self.llm_proxy_config,
-            stall_audio_dir=self.stall_audio_dir,
-            stall_after_ms=self.stall_after_ms,
-        )
+        app = create_app(pool=self.pool, stop_event=self.stop_event, llm_proxy_config=self.llm_proxy_config)
 
         logger.info(
             f"OpenAI Realtime API starting on ws://{self.host}:{self.port}/v1/realtime (pool size {len(self.pool)})"
@@ -71,4 +61,9 @@ class RealtimeServer:
         watcher = threading.Thread(target=_watch_stop, daemon=True)
         watcher.start()
 
-        server.run()
+        try:
+            server.run()
+        finally:
+            # A bind/startup failure must also stop the model threads. During a
+            # normal shutdown the event is already set by ThreadManager.
+            self.stop_event.set()
