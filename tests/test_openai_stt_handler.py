@@ -3,14 +3,20 @@ from __future__ import annotations
 import io
 import json
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 
 import numpy as np
 import pytest
-from openai.types.realtime import ConversationItemInputAudioTranscriptionDeltaEvent
+from openai.types.realtime import (
+    ConversationItemInputAudioTranscriptionDeltaEvent,
+    RealtimeSessionCreateRequest,
+    SessionUpdateEvent,
+)
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.pipeline.events import SpeechStartedEvent
 from speech_to_speech.pipeline.messages import (
@@ -30,6 +36,7 @@ from speech_to_speech.STT.openai_compatible_handler import (
     TranscriptionRequestError,
 )
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
+from tests.turns import reopen
 
 
 class _TranscriptionServer(BaseHTTPRequestHandler):
@@ -183,7 +190,10 @@ class _FakeOperation:
         self.kwargs = kwargs
         type(self).instances.append(self)
 
-    def run(self):
+    def cancel(self, reason="superseded"):
+        self.cancel_reason = reason
+
+    def run(self, cancel_check=lambda: False):
         if type(self).error is not None:
             raise type(self).error
         return type(self).results.pop(0)
@@ -209,13 +219,25 @@ def _handler(
     return handler
 
 
-def _audio(mode: str = "final", *, revision: int = 0) -> VADAudio:
+def _audio(mode: str = "final", *, revision: int = 0, samples: int = 160) -> VADAudio:
     return VADAudio(
-        audio=np.zeros(160, dtype=np.float32),
+        audio=np.zeros(samples, dtype=np.float32),
         mode=mode,
-        turn_id="turn-1",
+        turn_id="turn_1",
         turn_revision=revision,
     )
+
+
+def _run_final(handler: OpenAICompatibleSTTHandler) -> list:
+    assert list(handler.process(_audio())) == []
+    thread = handler._final_thread
+    assert thread is not None
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    outputs = []
+    while not handler.queue_out.empty():
+        outputs.append(handler.queue_out.get_nowait())
+    return outputs
 
 
 def _run_progressive(handler: OpenAICompatibleSTTHandler) -> list[PartialTranscription]:
@@ -279,7 +301,7 @@ def test_openai_stt_returns_final_transcription(monkeypatch):
     handler = _handler(monkeypatch)
     _FakeOperation.results = [HttpTranscriptionResult(text="hello", language="en")]
 
-    outputs = list(handler.process(_audio()))
+    outputs = _run_final(handler)
 
     assert len(outputs) == 1
     assert isinstance(outputs[0], Transcription)
@@ -287,6 +309,119 @@ def test_openai_stt_returns_final_transcription(monkeypatch):
     assert outputs[0].language_code == "en"
     assert _FakeOperation.instances[-1].kwargs["endpoint_url"].endswith("/v1/audio/transcriptions")
     assert _FakeOperation.instances[-1].kwargs["wav_bytes"].startswith(b"RIFF")
+
+
+def test_first_turn_uses_session_selected_language(monkeypatch):
+    service = RealtimeService()
+    conn_id = service.register()
+    update = SessionUpdateEvent.model_validate(
+        {
+            "type": "session.update",
+            "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": "es"}}}},
+        }
+    )
+    assert service.handle_session_update(conn_id, update) is None
+
+    handler = _handler(monkeypatch, language="en")
+    _FakeOperation.results = [HttpTranscriptionResult(text="hola", language="es")]
+    source = _audio()
+    source.runtime_config = service._state(conn_id).runtime_config
+    assert list(handler.process(source)) == []
+    assert handler._final_thread is not None
+    handler._final_thread.join(timeout=1)
+
+    assert _FakeOperation.instances[-1].kwargs["language"] == "es"
+
+
+def test_explicit_auto_removes_setup_language_from_stt_request(monkeypatch):
+    handler = _handler(monkeypatch, language="en")
+    _FakeOperation.results = [HttpTranscriptionResult(text="hola", language="es")]
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(
+            type="realtime",
+            audio={"input": {"transcription": {"language": "auto"}}},
+        )
+    )
+    source = _audio()
+    source.runtime_config = config
+
+    assert list(handler.process(source)) == []
+    assert handler._final_thread is not None
+    handler._final_thread.join(timeout=1)
+
+    assert _FakeOperation.instances[-1].kwargs["language"] is None
+    assert handler.language == "en"
+
+
+def test_mid_turn_session_update_applies_to_pending_stt_request(monkeypatch):
+    handler = _handler(monkeypatch, language="en")
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(type="realtime", audio={"input": {"transcription": {"language": "es"}}})
+    )
+    config.session.audio.input.transcription.language = "de"
+    _FakeOperation.results = [HttpTranscriptionResult(text="hallo", language="de")]
+    first = _audio()
+    first.runtime_config = config
+
+    assert list(handler.process(first)) == []
+    assert handler._final_thread is not None
+    handler._final_thread.join(timeout=1)
+
+    assert _FakeOperation.instances[-1].kwargs["language"] == "de"
+
+
+def test_open_sessions_and_reused_worker_keep_selections_isolated(monkeypatch):
+    service = RealtimeService()
+    first_conn = service.register()
+    second_conn = service.register()
+    handler = _handler(monkeypatch, language="en")
+    turn_number = 0
+
+    def select(conn_id: str, language: str) -> None:
+        update = SessionUpdateEvent.model_validate(
+            {
+                "type": "session.update",
+                "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": language}}}},
+            }
+        )
+        assert service.handle_session_update(conn_id, update) is None
+        assert service.build_session_updated(conn_id).session.audio.input.transcription.language == language
+
+    def transcribe(conn_id: str) -> None:
+        nonlocal turn_number
+        turn_number += 1
+        source = _audio()
+        source.turn_id = f"turn-{turn_number}"
+        source.runtime_config = service._state(conn_id).runtime_config
+        _FakeOperation.results.append(HttpTranscriptionResult(text="hello", language="en"))
+        assert list(handler.process(source)) == []
+        assert handler._final_thread is not None
+        handler._final_thread.join(timeout=1)
+        assert not handler._final_thread.is_alive()
+
+    select(first_conn, "auto")
+    select(second_conn, "fr")
+    transcribe(first_conn)
+    transcribe(second_conn)
+    select(first_conn, "es")
+    transcribe(first_conn)
+    select(first_conn, "de")
+    transcribe(first_conn)
+    select(first_conn, "auto")
+    transcribe(first_conn)
+    service.unregister(first_conn)
+    next_conn = service.register()
+    transcribe(next_conn)
+
+    assert [operation.kwargs["language"] for operation in _FakeOperation.instances[1:]] == [
+        None,
+        "fr",
+        "es",
+        "de",
+        None,
+        "en",
+    ]
+    assert handler.language == "en"
 
 
 def test_remote_progressive_hypotheses_remain_cumulative(monkeypatch):
@@ -299,8 +434,8 @@ def test_remote_progressive_hypotheses_remain_cumulative(monkeypatch):
     first = _run_progressive(handler)
     second = _run_progressive(handler)
 
-    assert first == [PartialTranscription(text="hello", turn_id="turn-1", turn_revision=0)]
-    assert second == [PartialTranscription(text="hello world", turn_id="turn-1", turn_revision=0)]
+    assert first == [PartialTranscription(text="hello", turn_id="turn_1", turn_revision=0)]
+    assert second == [PartialTranscription(text="hello world", turn_id="turn_1", turn_revision=0)]
 
 
 def test_remote_progressive_hypothesis_corrections_reach_the_router(monkeypatch):
@@ -310,8 +445,8 @@ def test_remote_progressive_hypothesis_corrections_reach_the_router(monkeypatch)
         HttpTranscriptionResult(text="hello their"),
     ]
 
-    assert _run_progressive(handler) == [PartialTranscription(text="hello there", turn_id="turn-1", turn_revision=0)]
-    assert _run_progressive(handler) == [PartialTranscription(text="hello their", turn_id="turn-1", turn_revision=0)]
+    assert _run_progressive(handler) == [PartialTranscription(text="hello there", turn_id="turn_1", turn_revision=0)]
+    assert _run_progressive(handler) == [PartialTranscription(text="hello their", turn_id="turn_1", turn_revision=0)]
 
 
 def test_remote_progressive_hypotheses_emit_realtime_deltas(monkeypatch):
@@ -329,7 +464,7 @@ def test_remote_progressive_hypotheses_emit_realtime_deltas(monkeypatch):
     conn_id = service.register()
     service.dispatch_pipeline_event(
         conn_id,
-        SpeechStartedEvent(turn_id="turn-1", turn_revision=0),
+        SpeechStartedEvent(turn_id="turn_1", turn_revision=0),
     )
 
     wire_events = []
@@ -347,12 +482,12 @@ def test_final_transport_failure_does_not_create_a_transcription(monkeypatch):
     handler = _handler(monkeypatch)
     _FakeOperation.error = TranscriptionRequestError("transcription request timed out")
 
-    outputs = list(handler.process(_audio()))
+    outputs = _run_final(handler)
 
     assert len(outputs) == 1
     assert isinstance(outputs[0], TranscriptionFailure)
     assert outputs[0].message == "transcription request timed out"
-    assert outputs[0].turn_id == "turn-1"
+    assert outputs[0].turn_id == "turn_1"
 
 
 def test_progressive_transport_failure_is_discarded(monkeypatch):
@@ -368,14 +503,14 @@ def test_final_request_does_not_wait_for_in_flight_progressive(monkeypatch):
     release_progressive = Event()
     final_started = Event()
 
-    class _BlockingProgressiveOperation:
-        def run(self):
+    class _BlockingProgressiveOperation(_FakeOperation):
+        def run(self, cancel_check=lambda: False):
             progressive_started.set()
             assert release_progressive.wait(timeout=2)
             return HttpTranscriptionResult(text="partial")
 
-    class _FinalOperation:
-        def run(self):
+    class _FinalOperation(_FakeOperation):
+        def run(self, cancel_check=lambda: False):
             final_started.set()
             return HttpTranscriptionResult(text="final", language="en")
 
@@ -394,7 +529,7 @@ def test_final_request_does_not_wait_for_in_flight_progressive(monkeypatch):
         assert isinstance(output, Transcription)
         assert output.text == "final"
         assert output.language_code == "en"
-        assert output.turn_id == "turn-1"
+        assert output.turn_id == "turn_1"
         assert output.turn_revision == 0
         assert not release_progressive.is_set()
 
@@ -412,38 +547,65 @@ def test_final_request_does_not_wait_for_in_flight_progressive(monkeypatch):
     assert not handler_thread.is_alive()
 
 
-def test_additional_progressive_requests_are_dropped_while_one_is_in_flight(monkeypatch):
+def test_final_requests_from_pipelines_using_the_same_endpoint_can_overlap(monkeypatch):
+    handlers = [_handler(monkeypatch, api_key="shared-endpoint-key") for _ in range(2)]
+    both_requests_started = Barrier(2)
+
+    class _ConcurrentOperation(_FakeOperation):
+        def run(self, cancel_check=lambda: False):
+            both_requests_started.wait(timeout=2)
+            return HttpTranscriptionResult(text="final", language="en")
+
+    for handler in handlers:
+        monkeypatch.setattr(handler, "_make_operation", lambda _audio: _ConcurrentOperation())
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(lambda handler=handler: _run_final(handler)) for handler in handlers]
+            outputs = [future.result(timeout=3) for future in futures]
+        for output in outputs:
+            assert len(output) == 1
+            assert isinstance(output[0], Transcription)
+            assert output[0].text == "final"
+    finally:
+        for handler in handlers:
+            handler.cleanup()
+
+
+def test_pending_progressive_requests_keep_only_the_latest_window(monkeypatch):
     handler = _handler(monkeypatch)
     progressive_started = Event()
     release_progressive = Event()
-    operation_count = 0
+    dispatched_samples = []
 
-    class _BlockingProgressiveOperation:
-        def run(self):
+    class _BlockingProgressiveOperation(_FakeOperation):
+        def run(self, cancel_check=lambda: False):
             progressive_started.set()
             assert release_progressive.wait(timeout=2)
             return HttpTranscriptionResult(text="partial")
 
     def make_operation(_audio):
-        nonlocal operation_count
-        operation_count += 1
+        dispatched_samples.append(len(_audio))
         return _BlockingProgressiveOperation()
 
     monkeypatch.setattr(handler, "_make_operation", make_operation)
 
     assert list(handler.process(_audio("progressive"))) == []
     assert progressive_started.wait(timeout=1)
-    assert list(handler.process(_audio("progressive"))) == []
-    assert operation_count == 1
+    assert list(handler.process(_audio("progressive", samples=320))) == []
+    assert list(handler.process(_audio("progressive", samples=480))) == []
+    assert dispatched_samples == [160]
 
     release_progressive.set()
     thread = handler._progressive_thread
     assert thread is not None
     thread.join(timeout=1)
     assert not thread.is_alive()
+    assert dispatched_samples == [160, 480]
+    assert handler.queue_out.qsize() == 2
     assert handler.queue_out.get_nowait() == PartialTranscription(
         text="partial",
-        turn_id="turn-1",
+        turn_id="turn_1",
         turn_revision=0,
     )
 
@@ -453,8 +615,8 @@ def test_session_end_suppresses_in_flight_progressive_result(monkeypatch):
     progressive_started = Event()
     release_progressive = Event()
 
-    class _BlockingProgressiveOperation:
-        def run(self):
+    class _BlockingProgressiveOperation(_FakeOperation):
+        def run(self, cancel_check=lambda: False):
             progressive_started.set()
             assert release_progressive.wait(timeout=2)
             return HttpTranscriptionResult(text="old session")
@@ -473,19 +635,91 @@ def test_session_end_suppresses_in_flight_progressive_result(monkeypatch):
     assert handler.queue_out.empty()
 
 
+@pytest.mark.parametrize("superseded_by", ["final", "new_revision", "session_end", "shutdown", "cleanup"])
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_obsolete_progressive_request_is_not_sent_before_worker_starts(monkeypatch, superseded_by):
+    tracker = SpeculativeTurnTracker()
+    tracker.start_turn()
+    handler = _handler(monkeypatch, tracker=tracker)
+    worker_started = Event()
+    release_worker = Event()
+    relevance_checked = Event()
+    cancellation_done = Event()
+    run_request = handler._run_request
+    cancel_request = handler._cancel_request
+
+    def delayed_worker(request):
+        if request.source.mode == "progressive":
+            worker_started.set()
+            release_worker.wait()
+        run_request(request)
+        if request.source.mode == "progressive":
+            relevance_checked.set()
+
+    def observe_cancel(request, reason):
+        cancel_request(request, reason)
+        if reason == "shutdown":
+            cancellation_done.set()
+
+    monkeypatch.setattr(handler, "_run_request", delayed_worker)
+    monkeypatch.setattr(handler, "_cancel_request", observe_cancel)
+    _FakeOperation.results = [HttpTranscriptionResult(text="final")]
+    _FakeOperation.instances = []
+    thread = None
+    cleanup_thread = None
+    try:
+        assert list(handler.process(_audio("progressive"))) == []
+        thread = handler._progressive_thread
+        assert thread is not None
+        assert worker_started.wait(timeout=1)
+
+        if superseded_by == "final":
+            outputs = _run_final(handler)
+            assert len(outputs) == 1
+            assert isinstance(outputs[0], Transcription)
+            assert outputs[0].text == "final"
+        elif superseded_by == "new_revision":
+            reopen(tracker)
+        elif superseded_by == "session_end":
+            handler.on_session_end()
+        elif superseded_by == "shutdown":
+            handler.stop_event.set()
+        else:
+            cleanup_thread = Thread(target=handler.cleanup, daemon=True)
+            cleanup_thread.start()
+            assert cancellation_done.wait(timeout=1)
+
+        release_worker.set()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert relevance_checked.is_set()
+        if cleanup_thread is not None:
+            cleanup_thread.join(timeout=1)
+            assert not cleanup_thread.is_alive()
+        assert len(_FakeOperation.instances) == (1 if superseded_by == "final" else 0)
+        assert handler.queue_out.empty()
+    finally:
+        release_worker.set()
+        if thread is not None:
+            thread.join(timeout=1)
+        if cleanup_thread is not None:
+            cleanup_thread.join(timeout=1)
+        handler.cleanup()
+
+
 def test_stale_revision_is_dropped_after_request(monkeypatch):
     tracker = SpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     handler = _handler(monkeypatch, tracker=tracker)
 
     class _ReopeningOperation(_FakeOperation):
-        def run(self):
-            tracker.observe("turn-1", 1)
+        def run(self, cancel_check=lambda: False):
+            reopen(tracker)
             return HttpTranscriptionResult(text="stale")
 
     monkeypatch.setattr(stt_module, "HttpTranscriptionOperation", _ReopeningOperation)
 
-    assert list(handler.process(_audio())) == []
+    assert _run_final(handler) == []
 
 
 def test_openai_api_key_is_not_sent_to_other_endpoints(monkeypatch):

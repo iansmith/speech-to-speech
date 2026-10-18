@@ -14,7 +14,9 @@
 
 </div>
 
-A low-latency, fully modular voice-agent pipeline: **VAD -> STT -> LLM -> TTS**, exposed through the **core OpenAI Realtime GA event set over WebSocket and WebRTC**. Every component is swappable. The LLM slot speaks OpenAI-compatible protocols, so you can point it at a hosted provider, at [HF Inference Providers](https://huggingface.co/inference-providers), or at a vLLM or llama.cpp server on your own hardware for a fully local, fully open stack.
+A low-latency voice agent built from open models that **runs entirely on your computer**. One command starts a conversation: no API key, no cloud service.
+
+The default pipeline is **Silero VAD → Parakeet TDT → Qwen3.5-4B → Qwen3-TTS**, and every stage is swappable. The server speaks the **OpenAI Realtime protocol** over WebSocket and WebRTC, so apps built for OpenAI's Realtime API can point at your own machine instead.
 
 This pipeline runs in production as the conversation backend for thousands of [Reachy Mini](https://huggingface.co/blog/reachy-mini) robots.
 
@@ -28,47 +30,50 @@ This pipeline runs in production as the conversation backend for thousands of [R
 
 ## Quickstart
 
+Use Python 3.10+ (3.11 recommended):
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install speech-to-speech
-export OPENAI_API_KEY=...
-speech-to-speech serve
-```
-
-This starts an OpenAI Realtime-compatible server at `ws://localhost:8765/v1/realtime` using Parakeet TDT for local STT, an OpenAI-compatible LLM, and Qwen3-TTS for local speech output.
-
-Talk to it from a second terminal:
-
-```bash
-speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
-```
-
-To start the server and packaged microphone/speaker client in one command:
-
-```bash
 speech-to-speech local
 ```
 
-Prefer to keep the LLM on your own machine? Serve Gemma 4 with llama.cpp:
+Then talk: speak, pause, and the assistant answers through your speakers. Stop with `Ctrl+C`. The first run downloads the models, so give it a few minutes. Use headphones so the assistant does not hear itself, or add `--local_audio_block_mic_during_playback`.
+
+On Ubuntu, first install the audio libraries with `sudo apt-get install libportaudio2 libsndfile1`. The default Linux Qwen3-TTS wheel targets CUDA 12.8 and Ubuntu 24.04; see the [CUDA note](#cuda-note-for-qwen3-tts) for other systems. On Windows, activate the environment with `.venv\Scripts\Activate.ps1`.
+
+The command picks local models for your platform:
+
+| Platform | LLM | Plan for |
+|---|---|---|
+| Apple Silicon Mac | [Qwen3.5-4B 4-bit](https://huggingface.co/mlx-community/Qwen3.5-4B-4bit) via MLX LM | 16 GB of unified memory |
+| Linux / Windows with NVIDIA | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) via Transformers | 24 GB of VRAM |
+| Other machines | Qwen3.5-4B via Transformers on CPU | Slow replies |
+
+Speech recognition and synthesis run locally too. After the first run, everything works [offline](#offline-operation). To use another model, a llama.cpp server, or a hosted provider, see [LLM backends](#llm-backends).
+
+### Connect your own app
+
+`local` runs a server and a microphone client in one process. To run only the server:
 
 ```bash
-llama-server -hf ggml-org/gemma-4-E4B-it-GGUF -np 2 -c 65536 -fa on --swa-full
+speech-to-speech serve
 ```
 
-Then point the OpenAI-compatible LLM backend at it:
+It listens at `ws://127.0.0.1:8765/v1/realtime`. Connect with:
 
-```bash
-speech-to-speech serve \
-    --model_name "ggml-org/gemma-4-E4B-it-GGUF" \
-    --responses_api_base_url "http://127.0.0.1:8080/v1" \
-    --responses_api_api_key ""
-```
-
-Clients using the implemented core Realtime event set can connect. The official OpenAI Agents SDK is tested over both stock transports; see [Realtime API](#realtime-api) for the tested surface and [LLM backends](#llm-backends) for provider and local-server options.
+- the packaged audio client: `speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime`
+- the [browser demo](./demo/README.md#quick-start-local)
+- any client using the core OpenAI Realtime events; the OpenAI Agents SDK is tested over both transports (see [Realtime API](#realtime-api))
+- [LiveKit Agents](./demo/livekit/README.md), as the agent's realtime model
 
 ## Index
 
 * [How it works](#how-it-works)
+* [Quickstart](#quickstart)
 * [Installation](#installation)
+* [YAML configuration API](./docs/configuration.md)
 * [Offline operation](#offline-operation)
 * [Supported components](#supported-components)
 * [Commands](#commands)
@@ -93,22 +98,37 @@ The pipeline is a cascade of four components, each running in its own thread and
 
 Every stage has multiple interchangeable backends, selected via CLI flags. The code is designed for easy modification, with a focus on models available through Transformers and the Hugging Face Hub.
 
+Optional speech-to-viseme extraction adds timed mouth shapes for avatar and robot
+clients after TTS. Enable it with `--enable_visemes`; see the
+[viseme guide](src/speech_to_speech/STV/README.md) for client events and timing.
+
 ## Installation
 
-Requires Python 3.10+.
+`pip install speech-to-speech` (see the [Quickstart](#quickstart)) includes everything the default pipeline needs:
+
+- Silero VAD and Parakeet TDT for listening
+- Qwen3.5-4B for replies: MLX LM on macOS, Transformers elsewhere
+- Qwen3-TTS for speech: `mlx-audio` on Apple Silicon, GGML elsewhere
+- the local audio client and the Realtime server
+
+Platform-specific dependencies are resolved automatically.
+
+See the [configuration guide](./docs/configuration.md) for reusable blocks,
+named pipelines, environment references, and explicit Python startup.
+The [Mac example](./example_configs/mac.yaml) runs fully locally on Apple Silicon.
+From a repository checkout, run its audio client and server together, or start
+only the server:
 
 ```bash
-pip install speech-to-speech
+speech-to-speech local -f example_configs/mac.yaml
+speech-to-speech serve -f example_configs/mac.yaml --name mac
 ```
 
-The default install covers the standard realtime path:
-
-- Parakeet TDT for STT
-- OpenAI-compatible API for the language model
-- Qwen3-TTS for speech output, using the GGML backend by default on non-macOS platforms and `mlx-audio` on Apple Silicon
-- local audio and realtime server modes
-
-macOS and non-macOS dependencies are resolved automatically via platform markers in `pyproject.toml`.
+`local` runs one selected pipeline with the packaged loopback audio client.
+`talk -f example_configs/mac.yaml` uses only the file's client settings.
+Configured server startup currently supports one named definition per invocation; its
+`num_pipelines` controls the number of isolated instances.
+Existing Python interfaces, CLI commands, and flat JSON configuration remain available.
 
 ### CUDA Note for Qwen3-TTS
 
@@ -138,12 +158,15 @@ Optional components are installed with pip extras:
 
 ```bash
 pip install "speech-to-speech[kokoro]"          # Kokoro-82M TTS on non-macOS
+pip install "speech-to-speech[kitten]"          # KittenTTS
 pip install "speech-to-speech[pocket]"          # Pocket TTS
 pip install "speech-to-speech[chattts]"         # ChatTTS
 pip install "speech-to-speech[omnivoice]"       # OmniVoice TTS (CUDA, Intel XPU, or Apple Silicon)
 pip install "speech-to-speech[faster-whisper]"  # Faster Whisper STT
 pip install "speech-to-speech[whisper-mlx]"     # Lightning Whisper MLX STT on macOS
 pip install "speech-to-speech[paraformer]"      # Paraformer STT through FunASR
+pip install "speech-to-speech[fireredvad]"      # FireRed streaming VAD
+pip install "speech-to-speech[nemo]"            # Parakeet Unified, Nemotron, and Orukeet STT through NeMo
 pip install "speech-to-speech[mlx-lm]"          # mlx-vlm support for vision models on macOS
 ```
 
@@ -153,36 +176,55 @@ Deprecated implementations, including MeloTTS, live in [`archive/`](./archive) a
 
 ### From Source
 
+To work on the code, install [Git](https://git-scm.com/downloads) and [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
+
 ```bash
 git clone https://github.com/huggingface/speech-to-speech.git
 cd speech-to-speech
-uv sync
+uv sync --python 3.11
+source .venv/bin/activate
 ```
 
-This installs the package in editable mode and makes the `speech-to-speech` CLI available.
+This installs the package in editable mode. With the environment activated, use the same `speech-to-speech` commands shown above.
 
 ## Supported Components
 
 | Component | Backend | Platforms | Install |
 |---|---|---|---|
 | VAD | [Silero VAD v5](https://github.com/snakers4/silero-vad) | all | built-in |
+| VAD | [FireRed Stream-VAD](https://huggingface.co/FireRedTeam/FireRedVAD) | CUDA / CPU | `fireredvad` |
 | STT | [Parakeet TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (default) | CUDA / CPU through nano-parakeet, Apple Silicon through MLX | built-in |
+| STT | [Parakeet Unified](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) | CUDA / CPU | `nemo` |
+| STT | [Nemotron Speech Streaming](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) | CUDA / CPU | `nemo` |
+| STT | [Nemotron Streaming Farsi](https://huggingface.co/mehdi-hf/nemotron-asr-streaming-farsi), selected with `--stt nemotron-streaming --nemotron_streaming_model_name mehdi-hf/nemotron-asr-streaming-farsi` | CUDA / CPU | `nemo`, NeMo >=3.0, Python >=3.11 |
+| STT | [Orukeet](https://huggingface.co/oruk/orukeet) | CUDA / CPU | `nemo` |
 | STT | [Whisper](https://huggingface.co/docs/transformers/en/model_doc/whisper) through Transformers | CUDA / CPU | built-in |
 | STT | [Faster Whisper](https://github.com/SYSTRAN/faster-whisper) | CUDA / CPU | `faster-whisper` |
 | STT | [Lightning Whisper MLX](https://github.com/mustafaaljadery/lightning-whisper-mlx) | Apple Silicon | `whisper-mlx` |
 | STT | [MLX Audio Whisper](https://github.com/huggingface/mlx-audio) | Apple Silicon | built-in on macOS |
 | STT | [Paraformer](https://github.com/modelscope/FunASR) | CUDA / CPU | `paraformer` |
+| STT | [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) through Transformers | CUDA / CPU, Apple Silicon | built-in |
 | STT | OpenAI-compatible `/v1/audio/transcriptions` endpoint | local or remote HTTP server | built-in |
-| LLM | OpenAI-compatible API (`responses-api`, `chat-completions`) | hosted providers or self-hosted servers | built-in |
-| LLM | [Transformers](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) | CUDA / CPU | built-in |
-| LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) | Apple Silicon | built-in on macOS |
+| STT | OpenAI Realtime transcription | hosted or compatible WebSocket server | built-in |
+| STT | vLLM Realtime transcription (experimental) | local or remote vLLM server | built-in |
+| LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) (default on macOS) | Apple Silicon | built-in on macOS |
+| LLM | [Transformers](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) (default elsewhere) | supported accelerators / CPU | built-in |
+| LLM | OpenAI-compatible API (`responses-api`, `chat-completions`) | optional hosted providers or self-hosted servers | built-in |
 | TTS | [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) (default) | GGML / CUDA on Linux, mlx-audio on macOS | built-in |
 | TTS | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) | CUDA / CPU, Apple Silicon | `kokoro` on non-macOS; built-in on macOS |
+| TTS | [KittenTTS](https://github.com/KittenML/KittenTTS) | CPU | `kitten` |
 | TTS | [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) | CPU / CUDA | `pocket` |
 | TTS | [ChatTTS](https://github.com/2noise/ChatTTS) | CUDA / CPU | `chattts` |
 | TTS | [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) | CUDA / Intel XPU / Apple Silicon | `omnivoice` |
 | TTS | [MMS TTS](https://huggingface.co/docs/transformers/model_doc/mms) | CUDA / CPU | built-in |
 | TTS | OpenAI-compatible `/v1/audio/speech` endpoint | local or remote HTTP server | built-in |
+| TTS | [MiniMax](https://platform.minimax.io/docs/api-reference/speech-t2a-http) | hosted HTTP streaming | built-in |
+
+Optional [streaming speaker diarization](./examples/streaming-diarization/README.md)
+adds speaker labels to transcribed turns. Enable it with `--diarization` after
+installing the supporting Transformers build; the linked guide has the current
+model revision and setup while the merged [Transformers PR #49056](https://github.com/huggingface/transformers/pull/49056)
+is awaiting a package release.
 
 Select implementations with `--stt`, `--llm_backend`, and `--tts`. The CLI constructs configuration only for the selected backends; known options for inactive backends remain accepted for compatibility but are ignored with a warning. JSON configuration may likewise include extra inactive-backend keys, which are ignored. Run `speech-to-speech serve -h` for the defaults, or pass selectors before `-h` to see another combination's backend-specific flags (for example, `speech-to-speech serve --stt mlx-audio-whisper -h`).
 
@@ -192,6 +234,8 @@ For client-only TTS serving with vLLM-Omni or another compatible server, see
 For client-only speech recognition with vLLM, OpenAI's hosted Transcription API,
 or another compatible server, see
 [OpenAI-compatible STT](./docs/openai-compatible-stt.md).
+For native incremental audio and partial transcripts, see
+[stateful streaming STT](./docs/openai-compatible-stt.md#stateful-streaming-stt).
 
 ## Commands
 
@@ -203,6 +247,8 @@ or another compatible server, see
 
 `serve` binds to `127.0.0.1` by default; pass `--host 0.0.0.0` explicitly for network exposure. `local` always binds to loopback and connects the same packaged client at `ws://127.0.0.1:<port>/v1/realtime`.
 
+The command only decides how the server and client run. Where replies are generated is set by `--llm_backend`, which is local by default for every command.
+
 The packaged `local` client buffers 196 ms of received audio when using the
 OpenAI-compatible TTS backend, which absorbs short delivery gaps from HTTP
 speech inference. Other `local` backends and `talk` start playback immediately
@@ -212,65 +258,17 @@ response, while a smaller value starts sooner but is more sensitive to jitter.
 This setting only controls the packaged Python client's speakers; browser and
 other Realtime clients manage their own playback buffers.
 
-The packaged client can opt in to local Python tools with `talk --tool-module <module>` or `local --tool-module <module>`. The module contract, programmatic API, and a Serper web-search example are documented in [Tool calling design](./src/speech_to_speech/api/openai_realtime/README.md#packaged-python-client-tools).
+The packaged client can opt in to local Python tools with `talk --tool-module <module>` or `local --tool-module <module>`. The module contract, programmatic API, and web-search examples (Serper, or keyless You.com) are documented in [Tool calling design](./src/speech_to_speech/api/openai_realtime/README.md#packaged-python-client-tools).
 
 ### Migrating from `--mode`
 
 `--mode` is deprecated and will stop working soon. During this migration window, `speech-to-speech --mode realtime` runs `speech-to-speech serve`, and `speech-to-speech --mode local` runs `speech-to-speech local`; both print a warning. All other mode values have been removed and exit with guidance to use the new commands.
 
-### Realtime Server
-
-```bash
-export OPENAI_API_KEY=...
-speech-to-speech serve
-```
-
-This is equivalent to:
-
-```bash
-speech-to-speech serve \
-    --thresh 0.6 \
-    --stt parakeet-tdt \
-    --llm_backend responses-api \
-    --tts qwen3 \
-    --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --qwen3_tts_speaker Aiden \
-    --qwen3_tts_language auto \
-    --qwen3_tts_backend ggml \
-    --qwen3_tts_non_streaming_mode True \
-    --qwen3_tts_mlx_quantization 6bit \
-    --model_name gpt-5.6-terra \
-    --chat_size 30 \
-    --responses_api_stream \
-    --enable_live_transcription
-```
-
-The default model is `gpt-5.6-terra` through the OpenAI Responses API with reasoning effort `none`, preserving the previous default model's latency-oriented reasoning behavior. Override the model with `--model_name`, the effort with `--responses_api_reasoning_effort`, and set `--responses_api_base_url` for another OpenAI-compatible provider or server.
-
 ### Local Mac
 
-```bash
-speech-to-speech local --mac-optimal-settings
-```
+On macOS, `local` and `serve` already run all three models through MLX. The optional `--mac-optimal-settings` preset also makes MPS the default device for supported components. It only sets defaults: explicit `--device`, component-device flags such as `--qwen3_tts_device`, and `--stt`, `--llm_backend`, `--model_name`, and `--tts` all win.
 
-Optionally with a specific LLM:
-
-```bash
-speech-to-speech local \
-    --mac-optimal-settings \
-    --model_name mlx-community/Qwen3-4B-Instruct-2507-4bit
-```
-
-This setting:
-
-- Uses MPS defaults for supported model components.
-- Sets Parakeet TDT for STT.
-- Sets MLX LM as the LLM backend.
-- Sets Qwen3-TTS for TTS, using `mlx-audio` with the `6bit` MLX variant by default.
-
-The preset supplies these as defaults only: explicit `--device`, component-device flags such as `--qwen3_tts_device`, and `--stt`, `--llm_backend`, `--model_name`, and `--tts` all win. Use it with `serve` instead of `local` when you want to expose the server without starting the microphone/speaker client.
-
-`--tts pocket`, `--tts kokoro`, and `--tts omnivoice` are also valid on macOS.
+`--tts pocket`, `--tts kokoro`, `--tts omnivoice`, and `--tts kitten` are also valid on macOS.
 
 To compare the MLX quantization variants locally:
 
@@ -292,6 +290,11 @@ docker compose up
 The compose file starts a llama.cpp server with Gemma 4 and the Realtime server, exposing ports `8080` and `8765`.
 
 ## Realtime API
+
+The server logs per-response STT, LLM, first TTS audio, and speech-to-audio
+durations for supported backends, including vLLM-backed STT and TTS. See the
+[response latency guide](./docs/response-latency.md) for the coverage matrix
+and measurement boundaries.
 
 Realtime mode supports the OpenAI Realtime protocol over WebSocket and WebRTC, with live transcription and low-latency turn-taking. WebSocket clients connect at `/v1/realtime`:
 
@@ -352,47 +355,71 @@ Requests are stateless (send the full message list each time) and are proxied to
 
 ## LLM Backends
 
-The LLM is the most compute-intensive and highest-latency component in the pipeline. A single forward pass through a large model can dominate end-to-end response time, so choosing the right backend for your hardware and latency budget matters. The pipeline supports:
+By default the LLM runs inside the speech process. You can swap the model, run it in a separate server, or hand it to a hosted provider:
 
-- **Local inference**: `transformers` on CUDA / CPU and `mlx-lm` on Apple Silicon.
-- **Self-hosted servers**: `responses-api` and `chat-completions` can point at a local [vLLM](https://github.com/vllm-project/vllm) or [llama.cpp](https://github.com/ggerganov/llama.cpp) server.
-- **Provider APIs**: the same backends work with OpenAI, [HF Inference Providers](https://huggingface.co/inference-providers), [OpenRouter](https://openrouter.ai), and other OpenAI-compatible providers.
+| Where the LLM runs | Backend |
+|---|---|
+| In process on Apple Silicon (default) | `mlx-lm` |
+| In process elsewhere (default) | `transformers` |
+| A separate server on your hardware (llama.cpp, vLLM, ...) | `responses-api` or `chat-completions` |
+| A hosted provider | `responses-api` or `chat-completions` |
 
-Two API backends are available, sharing the same `--responses_api_*` connection flags:
+### Changing the local model
 
-- `--llm_backend responses-api` (default) targets `/v1/responses`.
-- `--llm_backend chat-completions` targets `/v1/chat/completions`.
-
-### Direct Audio Input (No STT)
-
-Use `--stt none --llm_backend chat-completions` to send each completed VAD
-audio segment directly to an audio-input model. Direct audio mode is not
-supported with `--llm_backend responses-api`: a model may accept audio through
-`/v1/chat/completions` without supporting `/v1/responses`, including OpenAI's
-[`gpt-audio-1.5`](https://developers.openai.com/api/docs/models/gpt-audio-1.5).
-
-You must explicitly set `--model_name` to a model that accepts audio: the
-default `gpt-5.6-terra` accepts text and image input, but not audio. Check the
-provider's model documentation and endpoint support before enabling this mode.
-For OpenAI, see the
-[GPT-5.6 Terra model card](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
-and [audio-input guide](https://developers.openai.com/api/docs/guides/audio#add-audio-to-your-existing-application).
+Pass `--model_name`, using an MLX conversion on Mac and a Transformers checkpoint elsewhere:
 
 ```bash
-speech-to-speech serve \
-    --stt none \
-    --llm_backend chat-completions \
-    --model_name "YOUR_AUDIO_CAPABLE_MODEL" \
-    --responses_api_base_url "https://provider.example/v1" \
-    --responses_api_api_key "$PROVIDER_API_KEY"
+speech-to-speech local --model_name mlx-community/Qwen3.5-9B-4bit   # Apple Silicon
+speech-to-speech local --model_name Qwen/Qwen3.5-9B                 # Linux / Windows
 ```
 
-OpenAI-compatible servers represent input audio differently. Use
-`--responses_api_audio_content_type input_audio` (the default) for embedded
-WAV base64, or `--responses_api_audio_content_type audio_url` for a base64
-data URL.
+Transformers picks an available accelerator and falls back to CPU. `--llm_device` overrides the LLM's device; `--device` overrides every stage. Generation options such as `--llm_gen_max_new_tokens` are in the [LLM guide](./src/speech_to_speech/LLM/README.md).
 
-The examples below pair Parakeet TDT for local STT and Qwen3-TTS for local TTS with different LLM backends.
+### Combining with llama.cpp
+
+Serve the LLM with llama.cpp and connect speech-to-speech through its local Responses API. This works on **Apple Silicon or Linux/NVIDIA**. Install llama.cpp with `brew install llama.cpp` on macOS or use a [CUDA build](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#cuda) on NVIDIA.
+
+With the default speech models, budget **24 GB of unified memory on Mac** or **16 GB of VRAM on NVIDIA**; about 8 GB of that goes to the speech pipeline.
+
+Terminal 1 — start the LLM and leave it running:
+
+```bash
+llama-server \
+    -hf ggml-org/gemma-4-E4B-it-GGUF:Q4_0 \
+    --alias local-gemma \
+    --host 127.0.0.1 --port 8080 \
+    -ngl all -np 1 -c 8192 -fa on \
+    --no-mmproj \
+    --reasoning off
+```
+
+Terminal 2 — activate your Python environment and connect the speech pipeline to that LLM:
+
+```bash
+speech-to-speech local \
+    --llm_backend responses-api \
+    --model_name local-gemma \
+    --responses_api_base_url http://127.0.0.1:8080/v1 \
+    --responses_api_api_key ""
+```
+
+The [Q4_0 weights](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) are about 4.6 GB. The example uses one 8k context and disables reasoning for faster replies; `--no-mmproj` skips the image/audio projector because STT supplies text. To try another GGUF model, change `-hf` and keep `--alias` and `--model_name` matched.
+
+### Local speech with a hosted LLM
+
+Select an API backend to move only the LLM to a provider. For OpenAI:
+
+```bash
+export OPENAI_API_KEY=...
+speech-to-speech local --llm_backend responses-api
+```
+
+This uses `gpt-5.6-terra` with reasoning effort `none`. Speech recognition and synthesis stay local, so your audio never leaves your computer; transcribed text and conversation history go to the provider.
+
+Two API backends share the same `--responses_api_*` connection flags:
+
+- `--llm_backend responses-api` targets `/v1/responses`.
+- `--llm_backend chat-completions` targets `/v1/chat/completions`.
 
 ### Responses API Backend
 
@@ -409,10 +436,7 @@ Works with any provider or server that implements the OpenAI Responses API. Poin
 ```bash
 # OpenAI
 speech-to-speech local \
-    --stt parakeet-tdt \
     --llm_backend responses-api \
-    --tts qwen3 \
-    --qwen3_tts_mlx_quantization 6bit \
     --model_name "gpt-4o-mini" \
     --responses_api_api_key "$OPENAI_API_KEY" \
     --responses_api_stream \
@@ -422,10 +446,7 @@ speech-to-speech local \
 ```bash
 # HF Inference Providers: Qwen3.5-9B via Together
 speech-to-speech local \
-    --stt parakeet-tdt \
     --llm_backend responses-api \
-    --tts qwen3 \
-    --qwen3_tts_mlx_quantization 6bit \
     --model_name "Qwen/Qwen3.5-9B:together" \
     --responses_api_base_url "https://router.huggingface.co/v1" \
     --responses_api_api_key "$HF_TOKEN" \
@@ -436,10 +457,7 @@ speech-to-speech local \
 ```bash
 # HF Inference Providers: GPT-oss-20B via Groq
 speech-to-speech serve \
-    --stt parakeet-tdt \
     --llm_backend responses-api \
-    --tts qwen3 \
-    --qwen3_tts_mlx_quantization 6bit \
     --model_name "openai/gpt-oss-20b:groq" \
     --responses_api_base_url "https://router.huggingface.co/v1" \
     --responses_api_api_key "$HF_TOKEN" \
@@ -459,10 +477,8 @@ Add `--responses_api_reasoning_effort none` to disable reasoning on providers wh
 ```bash
 # vLLM serving a Qwen model with tool calling
 speech-to-speech serve \
-    --stt parakeet-tdt \
     --llm_backend chat-completions \
-    --tts qwen3 \
-    --model_name "Qwen/Qwen3-4B-Instruct-2507" \
+    --model_name "Qwen/Qwen3.5-4B" \
     --responses_api_base_url "http://localhost:8000/v1" \
     --responses_api_stream
 ```
@@ -470,9 +486,7 @@ speech-to-speech serve \
 ```bash
 # Gemma 4 31B via the HF router on Cerebras, with reasoning disabled for low voice latency
 speech-to-speech serve \
-    --stt parakeet-tdt \
     --llm_backend chat-completions \
-    --tts qwen3 \
     --model_name "google/gemma-4-31B-it:cerebras" \
     --responses_api_base_url "https://router.huggingface.co/v1" \
     --responses_api_api_key "$HF_TOKEN" \
@@ -480,31 +494,37 @@ speech-to-speech serve \
     --responses_api_stream
 ```
 
-### Fully Local
+### Direct Audio Input (No STT)
 
-Run the LLM in a separate llama.cpp process for the lowest-friction fully local setup, as shown in the [Reachy Mini local conversation guide](https://huggingface.co/blog/local-reachy-mini-conversation):
+Use `--stt none --llm_backend chat-completions` to send each completed VAD
+audio segment directly to an audio-input model. Direct audio mode is not
+supported with `--llm_backend responses-api`: a model may accept audio through
+`/v1/chat/completions` without supporting `/v1/responses`, including OpenAI's
+[`gpt-audio-1.5`](https://developers.openai.com/api/docs/models/gpt-audio-1.5).
 
-For a fully local native-audio setup with the browser demo, Realtime turn revisions, and barge-in, see the tested [Gemma 4 12B speech-to-speech example for Apple Silicon](./examples/gemma4-12b-macos/README.md).
+You must explicitly set `--model_name` to a model that accepts audio: the
+API backends' default `gpt-5.6-terra` accepts text and image input, but not audio. Check the
+provider's model documentation and endpoint support before enabling this mode.
+For OpenAI, see the
+[GPT-5.6 Terra model card](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
+and [audio-input guide](https://developers.openai.com/api/docs/guides/audio#add-audio-to-your-existing-application).
 
 ```bash
-# Terminal 1: llama.cpp serving Gemma 4
-llama-server -hf ggml-org/gemma-4-E4B-it-GGUF -np 2 -c 65536 -fa on --swa-full
-```
-
-```bash
-# Terminal 2: speech-to-speech using that local LLM server
 speech-to-speech serve \
-    --stt parakeet-tdt \
-    --llm_backend responses-api \
-    --tts qwen3 \
-    --model_name "ggml-org/gemma-4-E4B-it-GGUF" \
-    --responses_api_base_url "http://127.0.0.1:8080/v1" \
-    --responses_api_api_key "" \
-    --responses_api_stream \
-    --enable_live_transcription
+    --stt none \
+    --llm_backend chat-completions \
+    --model_name "YOUR_AUDIO_CAPABLE_MODEL" \
+    --responses_api_base_url "https://provider.example/v1" \
+    --responses_api_api_key "$PROVIDER_API_KEY"
 ```
 
-Use `speech-to-speech local` when you want to run the same server and talk through the machine hosting it. In-process local backends are available with `--llm_backend mlx-lm` on Apple Silicon or `--llm_backend transformers` on CUDA / CPU.
+OpenAI-compatible servers represent input audio differently. Use
+`--responses_api_audio_content_type input_audio` (the default) for embedded
+WAV base64, or `--responses_api_audio_content_type audio_url` for a base64
+data URL.
+
+For a fully local audio-input model on Apple Silicon, see the
+[Gemma 4 12B example](./examples/gemma4-12b-macos/README.md).
 
 ## Offline Operation
 
@@ -512,20 +532,23 @@ The pipeline can run without internet access after the dependencies and model as
 are installed locally. Before disconnecting, start the exact configuration once while online so it can cache the
 STT, LLM, TTS, Silero VAD, NLTK, and Smart Turn resources it needs.
 
-For the lowest-friction fully local LLM setup, run llama.cpp on the same machine as described in
-[Fully Local](#fully-local). Once llama.cpp and the pipeline assets are available locally, set
-`HF_HUB_OFFLINE=1` when starting speech-to-speech to prevent Hugging Face Hub requests:
+After that first run, set `HF_HUB_OFFLINE=1` to skip Hugging Face Hub requests:
+
+```bash
+HF_HUB_OFFLINE=1 speech-to-speech local
+```
+
+For the [llama.cpp configuration](#combining-with-llamacpp), keep the LLM server running and pass the same LLM flags:
 
 ```bash
 HF_HUB_OFFLINE=1 speech-to-speech serve \
-    --model_name "ggml-org/gemma-4-E4B-it-GGUF" \
+    --llm_backend responses-api \
+    --model_name local-gemma \
     --responses_api_base_url "http://127.0.0.1:8080/v1" \
     --responses_api_api_key ""
 ```
 
-Without the local base URL override, the default `responses-api` LLM backend calls a remote service. Alternatively,
-use an in-process local backend such as `transformers` or `mlx-lm`. Every selected model must already be cached or
-supplied through a local path supported by its backend.
+Hosted LLMs still need a connection.
 
 Smart Turn uses a separate ONNX checkpoint. A cached checkpoint works with `HF_HUB_OFFLINE=1`; for an explicit,
 cache-independent setup, pass `--smart_turn_model_path /path/to/smart-turn-v3.2-cpu.onnx`. If the checkpoint is not
@@ -542,22 +565,28 @@ Language coverage depends on the STT and TTS backends you pick, not on the pipel
 | STT | Paraformer | Depends on the selected FunASR checkpoint; the default is Chinese-oriented |
 | TTS | Qwen3-TTS (default) | Multilingual, with `--qwen3_tts_language auto` by default |
 | TTS | Kokoro | Multiple language/voice mappings, depending on backend availability |
+| TTS | KittenTTS | English |
 | TTS | ChatTTS | English and Chinese |
 | TTS | MMS TTS | Broad multilingual coverage through MMS checkpoints |
+| TTS | OmniVoice | 600+ languages; voice cloning, design, and automatic voice selection |
+| TTS | Supertonic | 32 languages |
+| TTS | Pocket TTS | English, French, German, Portuguese, Italian, Spanish |
+| TTS | OpenAI-compatible `/v1/audio/speech` endpoint | Depends on the connected TTS server/model |
 
-Make sure the STT, LLM, and TTS you pair all cover your target language(s). Two usage patterns:
+Make sure the STT, LLM, and TTS you pair all cover your target language(s). By default, the language code sent to TTS comes from the **user's transcription**. Qwen3-TTS keeps its configured `auto` behavior by default. Add `--detect_llm_output_language` to detect the language of each assistant text chunk instead and send that code to TTS. This helps when the assistant replies in a different language from the user. The Lingua detector is loaded and warmed when the pipeline starts, so detection does not wait for the full reply. Short text (under 20 characters for most languages, or under four CJK characters) and ambiguous text use the last detected assistant language for that response. If there is none yet, TTS receives no language code and uses its own automatic or default behavior; this avoids delaying speech to collect more text. A TTS backend must support the detected language to use it. When a Realtime session selects a language with `session.audio.input.transcription.language`, STT keeps that language, but TTS receives the confidently detected assistant language instead. The first spoken text of each response decides; if it is too short or ambiguous, the whole response uses the session's selected language. If the active TTS backend cannot speak the detected language, that response uses the session's selected language.
 
-- **Single language**: set `--language` to the target language code. The default is `en`.
-- **Language switching**: set `--language auto`. The STT detects the language of each spoken prompt and forwards it to the LLM. Optionally add `--enable_lang_prompt` to append a "Please reply to my message in ..." instruction. It defaults to `False`; large LLMs usually infer the language from context, but the explicit instruction can help smaller models.
+For **Parakeet TDT**, the decoder chooses the transcription language automatically. `--parakeet_tdt_language` remains accepted for compatibility with existing commands, but setting it to a code such as `de` does not constrain decoding. The reported language is inferred with Lingua from the finished transcription when possible. Text shorter than 20 characters is not classified, and inconclusive or failed detection reports an unknown language rather than the configured or previous code. `--language` belongs to the Whisper backends; it does not control Parakeet. For Whisper and Whisper MLX, use `--language auto` to detect each turn, or a code such as `--language zh` to fix the language. Other STT backends have their own language flags; see the [STT component guide](./src/speech_to_speech/STT/README.md#language-support-by-handler).
 
-Automatic language detection:
+To encourage replies in the user's detected language, add `--enable_lang_prompt`. It appends a per-turn instruction such as "Please reply to my message in French." The flag is off by default and works independently of `--detect_llm_output_language`. Qwen3-TTS uses `--qwen3_tts_language auto` by default: it infers language from text unless assistant language detection or a session selection supplies a supported code. Set `--qwen3_tts_language german`, for example, to force synthesis in German.
+
+Automatic detection with Parakeet and a language instruction for the LLM:
 
 ```bash
 speech-to-speech serve \
     --stt parakeet-tdt \
-    --language auto \
-    --llm_backend mlx-lm \
-    --model_name "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+    --enable_lang_prompt \
+    --detect_llm_output_language \
+    --qwen3_tts_language auto
 ```
 
 A single non-English language, Chinese in this example:
@@ -566,16 +595,14 @@ A single non-English language, Chinese in this example:
 speech-to-speech serve \
     --stt whisper-mlx \
     --stt_model_name large-v3 \
-    --language zh \
-    --llm_backend mlx-lm \
-    --model_name mlx-community/Qwen3-4B-Instruct-2507-4bit
+    --language zh
 ```
 
 Both commands also work with `--mac-optimal-settings`; explicit `--stt` flags override the defaults it sets.
 
 ## OmniVoice
 
-OmniVoice provides voice cloning, voice design, and automatic voice selection across 600+ languages. Install its opt-in dependencies and provide a reference clip plus its transcript for voice cloning. This example uses CUDA on Linux or Windows; use `--omnivoice_device mps` on Apple Silicon or `--omnivoice_device xpu` with an Intel XPU-enabled PyTorch installation:
+OmniVoice provides voice cloning, voice design, and automatic voice selection across 600+ languages. Install its opt-in dependencies and provide a reference clip plus its transcript for voice cloning. This example uses CUDA on Linux or Windows; use `--omnivoice_device mps` on Apple Silicon, `--omnivoice_device xpu` with an Intel XPU-enabled PyTorch installation, or `--omnivoice_device npu` with an Ascend `torch_npu` installation:
 
 ```bash
 pip install "speech-to-speech[omnivoice]"
@@ -606,6 +633,67 @@ speech-to-speech serve \
 
 Available voice presets: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. Custom voice files and Hugging Face paths also work.
 
+### Pocket TTS Farsi v2
+
+Select [mehdi-hf/pocket-tts-farsi-v2](https://huggingface.co/mehdi-hf/pocket-tts-farsi-v2)
+with `--pocket_tts_model_name`. The handler normalizes Persian spelling, expands
+numbers, and converts assistant text to phonemes with
+`mehdi-hf/Homo-GE2PE-Persian-HF` before synthesis. Both models download on first use.
+
+The released Pocket TTS package does not support this model's phoneme frontend
+flags yet. Install the author's fork after the `pocket` extra. This command pins
+an inspected commit for reproducibility:
+
+```bash
+pip install "speech-to-speech[pocket]"
+pip install "pocket-tts @ git+https://github.com/mallahyari/pocket-tts@3807c204babb5fe54be8fe18a362a58315e870d6"
+speech-to-speech serve \
+    --tts pocket \
+    --pocket_tts_model_name mehdi-hf/pocket-tts-farsi-v2 \
+    --pocket_tts_voice /voices/persian-reference.wav \
+    --pocket_tts_device cpu
+```
+
+Use a Persian reference recording as a local audio file or Hugging Face audio
+URL. Preset voice states such as `jean` are incompatible with these weights.
+The handler uses the first five seconds of the recording. It splits text at
+sentence boundaries before phoneme conversion, adds a 0.25-second pause between
+sentences, and limits synthesis chunks to 18 tokens. It keeps ezafe-linked words
+together and rejects a linked phrase that exceeds the budget. Oversized G2P inputs
+raise an error rather than lose text.
+Configure the LLM to respond in Persian. This model choice stays fixed for the
+session and does not switch languages based on STT detection.
+
+Farsi synthesis bypasses the fork's orthographic sentence splitter so that `?`
+remains a glottal-stop phoneme. It uses an EOS threshold of -2 and zero extra
+frames after EOS. `--pocket_tts_temperature` overrides the model's default of
+0.3; `--pocket_tts_eos_threshold` overrides -2. Each phoneme chunk is buffered
+before playback. Silent, non-finite, or length-capped output is retried once,
+then reported as an error. This adds one chunk's generation time before the
+first audio block, but avoids playing a failed attempt. PCM conversion clips
+peaks instead of wrapping, and downsampling preserves filter history across
+playback blocks.
+
+To check the handler with actual weights from a source checkout, run:
+
+```bash
+python scripts/check_pocket_tts_farsi.py --output-dir /tmp/pocket-tts-farsi-check
+```
+
+The check downloads the TTS and G2P models and the author's Persian reference
+`samples/prompt_short_sentence.wav`. It uses seed 42 and temperature 0.3.
+It synthesizes a greeting, a sentence with a Persian number, and a
+two-sentence reply. It checks PCM block format, non-silent output, and response
+completion, then saves WAVs and timing measurements. Listen to the WAVs to assess
+pronunciation. Use `--voice /voices/reference.wav` to test your own recording.
+The check saves native 24 kHz audio by default. Pass `--sample-rate 16000` to
+compare with the pipeline's current 16 kHz playback output. The server and local
+playback path still assume 16 kHz, so changing only `--pocket_tts_sample_rate`
+to 24000 does not enable native-rate playback.
+
+The model weights use [CC-BY-NC-4.0](https://huggingface.co/mehdi-hf/pocket-tts-farsi-v2)
+and are for non-commercial use.
+
 ## CLI Reference
 
 References for pipeline CLI arguments live in the [arguments classes](./src/speech_to_speech/arguments_classes) and in `speech-to-speech serve -h`. Client arguments are listed by `speech-to-speech talk -h`.
@@ -620,7 +708,32 @@ See [ModuleArguments](./src/speech_to_speech/arguments_classes/module_arguments.
 - LLM backend (`--llm_backend`: `transformers`, `mlx-lm`, `responses-api`, or `chat-completions`)
 - TTS implementation (`--tts`)
 - logging level
+- transcript logging (`--log_transcripts`)
 - realtime pipeline pool size (`--num_pipelines`)
+- PyTorch CPU thread count (`--torch_num_threads`)
+
+Logs are content-free by default: transcript-bearing records report a character count rather
+than the text, because logs are commonly retained by service managers, containers and hosted
+log aggregators. Pass `--log_transcripts` to include full user and assistant transcripts when
+debugging STT, LLM, TTS or Realtime behaviour; it logs a warning at startup because enabling
+it writes conversation content wherever those logs are collected. The `talk` client takes the
+same flag, as `--log-transcripts` or `--log_transcripts`.
+
+`--torch_num_threads N` sets PyTorch's CPU intra-op thread count (`torch.set_num_threads`) for
+the whole process. It is unset by default, which keeps the current behaviour: Silero VAD sets
+PyTorch to a single thread when it loads, and that single thread also applies to every other
+PyTorch model on the CPU. If your STT runs on the CPU, you can trade some Silero speed for
+faster transcription:
+
+```bash
+speech-to-speech serve --stt parakeet-tdt --device cpu --torch_num_threads 8
+```
+
+The setting is shared: Silero and the CPU STT use the same thread count, and more threads can
+slow Silero down, so measure the complete pipeline when choosing a value. It only affects
+PyTorch; ONNX Runtime, MLX and other non-PyTorch backends keep their own thread settings. In a
+YAML configuration, set it under `runtime` as `torch_num_threads`. See the
+[`torch.set_num_threads` documentation](https://docs.pytorch.org/docs/stable/generated/torch.set_num_threads.html).
 
 ### VAD Parameters
 
@@ -644,6 +757,28 @@ and STT/LLM work may begin speculatively. Complete turns start processing immedi
 gated by `--smart_turn_max_wait_ms` (2 seconds by default). If speech resumes during either delay, the existing turn is
 reopened as a newer revision, the accumulated audio is re-emitted, and work from the previous revision is
 discarded before it reaches the user.
+
+The turn tracker owns the conversation order and the `LISTENING`, `SOFT_ENDED`,
+`ANSWERING`, and `CLOSED` states. VAD supplies speech boundaries and Smart Turn timing;
+the tracker decides whether resumed speech reopens the current turn. The unanswered
+reopen cap uses streamed-audio time, so a push-to-talk pause with no audio does not
+advance it. Processing and output holds use wall-clock deadlines. Starting a newer
+turn drops older work that has not committed; accepted output can finish.
+
+Each response belongs to the input supplied to generation. The server records that
+ownership on conversation items and accepted tool calls. A tool follow-up keeps its
+originating input's turn. If a user message follows the tool call, the follow-up
+answers that message's turn; if a newer turn closed without one, it moves to that
+turn, so a late tool result is still spoken. Client input without a speech-turn
+association stays untagged. A response cannot borrow the identity of speech still
+being recorded.
+These input records do not control turn state, reopening, or deadlines.
+
+The server holds `input_audio_buffer.speech_stopped` and the final transcription while a turn can still
+reopen. Resumed speech keeps the same open item and live transcription deltas
+continue. Once the turn commits, the client receives one stop, an input-buffer commitment, the created
+user item, and one final transcript, so its user-turn history matches the model's.
+If transcription fails, the server sends the stop and failure after the reopen grace ends.
 
 The base package includes the quantized CPU runtime and enables Smart Turn by default:
 
@@ -677,6 +812,17 @@ For example:
 
 Other generation parameters can be set using the handler prefix plus `_gen_`, for example `--stt_gen_max_new_tokens 128` or `--llm_gen_temperature 0.7`. Parameters not yet exposed can be added to the relevant arguments class.
 
+## Big Bench Audio system tests
+
+Run a pinned 40-question audio sample or all 1,000 Big Bench Audio questions
+through VAD, STT, the LLM, and TTS, with
+per-category answer accuracy, audio latency, and protocol failures in JSON reports.
+`src/speech_to_speech/evals/big_bench_audio/Dockerfile.eval` builds an image for
+local GPU runs or Hugging Face Jobs;
+`scripts/prepare_eval_space.py` optionally builds the image in a private HF Space.
+Start with four questions, then compare reports across revisions. See
+[Big Bench Audio system tests](docs/vibe-checks.md).
+
 ## Contributing
 
 Issues and PRs are welcome. Good starting points are the [open issues](https://github.com/huggingface/speech-to-speech/issues). For larger changes, open an issue first to discuss the approach.
@@ -684,9 +830,31 @@ Issues and PRs are welcome. Good starting points are the [open issues](https://g
 For local development:
 
 ```bash
-uv sync
-pytest
-ruff check
+uv sync --group dev
+uv run pytest tests -q
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run mypy src
+```
+
+To check turn ordering, Smart Turn timing, and Realtime routing on CPU:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run pytest -q \
+  tests/test_speculative_turns.py \
+  tests/test_smart_turn.py tests/test_stt_stale_filter.py \
+  tests/test_audio_input_notifier.py tests/test_lm_output_processor.py \
+  tests/openai_realtime/test_response_input_identity.py \
+  tests/openai_realtime/test_realtime_service.py \
+  tests/openai_realtime/test_speculative_turn_protocol.py
+```
+
+The response-input tests include a delayed tool completing during synthetic speech,
+using the packaged client coordinator, service, and VAD handler with mocked model
+output and VAD probabilities. Run that reproduction alone with:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run pytest tests/openai_realtime/test_response_input_identity.py -q -s
 ```
 
 ## Star History
@@ -733,4 +901,4 @@ If you use this pipeline, please also cite the component models you run. The def
 }
 ```
 
-Citations for optional backends such as Kokoro, Pocket TTS, ChatTTS, Whisper variants, Paraformer, and MMS live in the respective [component READMEs](./src/speech_to_speech).
+Citations for optional backends such as Kokoro, KittenTTS, Pocket TTS, ChatTTS, Whisper variants, Paraformer, and MMS live in the respective [component READMEs](./src/speech_to_speech).

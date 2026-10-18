@@ -2,8 +2,8 @@
 /**
  * Demo adapter around the official OpenAI Agents SDK RealtimeSession.
  *
- * Protocol ownership stays with the SDK's stock WebSocket and WebRTC
- * transports. This adapter only preserves demo concerns: the HF queue grant,
+ * Protocol handling uses the SDK transports, with WebSocket interruption
+ * accounting delegated to the browser renderer. Demo concerns include the HF queue grant,
  * browser audio graphs, user-audio replay, visualization, and UI events.
  *
  * @typedef {"websocket" | "webrtc"} TransportKind
@@ -41,17 +41,36 @@
  * @property {ToolDef[]} [tools]
  * @property {NoiseGate} [noiseGate]
  * @property {string} [audioOutputId]
+ * @property {number} [playbackBufferMs] WebSocket startup reserve; applies on the next connection.
  * @property {(call: {name: string, arguments: string, callId: string}) => Promise<{output: string, image?: string}>} [executeTool]
  */
 
+import { readTurnLatency } from "./turn-latency.js";
 import { extractResponseTranscript, trimTrailingSlash } from "./ws/codec.js";
 import { OrbVisualiser, VIS_FFT_SIZE } from "./ws/orb-visualizer.js";
 import { SentAudioRecorder } from "./ws/user-audio-recorder.js";
 
-const AUDIO_SAMPLE_RATE = 24_000;
+export const AUDIO_SAMPLE_RATE = 24_000;
+export const AUDIO_WORKLET_VERSION = "audio-24k-v2";
+export const DEFAULT_PLAYBACK_BUFFER_MS = 0;
 const MIC_CHUNK_MS = 40;
+const CAPTURE_CONFIG_TIMEOUT_MS = 2_000;
 const SPEAKING_OPEN_DB = -50;
 const SPEAKING_HANG_MS = 250;
+
+/** @param {unknown} value */
+export function normalizePlaybackBufferMs(value) {
+  const ms = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  return typeof ms === "number" && Number.isFinite(ms) && ms >= 0
+    ? ms : DEFAULT_PLAYBACK_BUFFER_MS;
+}
+
+/** @param {string} name @param {URL} base */
+export function versionedAudioWorkletUrl(name, base) {
+  const url = new URL(name, base);
+  url.searchParams.set("v", AUDIO_WORKLET_VERSION);
+  return url.href;
+}
 
 /** @param {string} message @param {string} code @param {object} [extra] */
 function codedError(message, code, extra) {
@@ -98,6 +117,11 @@ export class S2sRealtimeClient extends EventTarget {
     this._micSrc = null;
     this._captureNode = null;
     this._playbackNode = null;
+    this._playbackThreshold = Math.ceil(AUDIO_SAMPLE_RATE * normalizePlaybackBufferMs(options.playbackBufferMs) / 1000);
+    this._resetPlaybackBuffer();
+    this._playbackItems = new Map();
+    this._playbackInterruptions = new Map();
+    this._playbackClearId = 0;
     this._micAnalyser = null;
     this._outAnalyser = null;
     this._remoteSrc = null;
@@ -115,6 +139,7 @@ export class S2sRealtimeClient extends EventTarget {
     // Input transcription deltas are append-only and may overlap across turns.
     // Keep each unresolved prefix until its authoritative completion arrives.
     this._userTranscriptByItem = new Map();
+    this._userSnapshotByItem = new Map();
     this._currentUserItemId = "";
     this._userAudioRecorder = new SentAudioRecorder({ sampleRate: AUDIO_SAMPLE_RATE });
     this._debug = (() => {
@@ -163,7 +188,14 @@ export class S2sRealtimeClient extends EventTarget {
     await this._setupAudio();
     const { OpenAIRealtimeWebRTC, OpenAIRealtimeWebSocket, RealtimeSession } = sdk();
     if (this.options.transport === "websocket") {
-      this._transport = new OpenAIRealtimeWebSocket({ useInsecureApiKey: true });
+      // The SDK clock starts at receipt and forgets the item on audio.done.
+      // Our browser queue owns the actual playout position instead.
+      this._transport = new class extends OpenAIRealtimeWebSocket {
+        interrupt(cancelOngoingResponse = true) {
+          if (cancelOngoingResponse) this._cancelResponse();
+          this.emit("audio_interrupted");
+        }
+      }({ useInsecureApiKey: true });
     } else {
       // Keep startup noise from racing the initial config and greeting. The
       // prior demo client held this same gate until its data channel was ready.
@@ -194,13 +226,17 @@ export class S2sRealtimeClient extends EventTarget {
     this._transport.on("connection_change", (state) => {
       if (state === "disconnected" && !this._closing && this._status !== "error") {
         this._setStatus("error");
+        if (this.options.transport === "websocket") this._clearPlayback();
         this.dispatchEvent(new CustomEvent("error", {
           detail: { error: new Error("Realtime transport disconnected") },
         }));
       }
     });
     this._session.on("audio", (event) => this._onAudio(event));
-    this._session.on("audio_interrupted", () => this._clearPlayback());
+    this._session.on("audio_interrupted", () => {
+      if (this.options.transport === "websocket") this._interruptPlayback();
+      else this._clearPlayback();
+    });
 
     await this._session.connect({ apiKey: "s2s-local", url });
     if (this.options.transport === "webrtc") this._attachRtcOutput();
@@ -216,6 +252,9 @@ export class S2sRealtimeClient extends EventTarget {
   _sessionConfig() {
     return {
       outputModalities: ["audio"],
+      providerData: {
+        extensions: ["speech_to_speech.input_audio_transcription.snapshot"],
+      },
       audio: {
         input: {
           format: { type: "audio/pcm", rate: AUDIO_SAMPLE_RATE },
@@ -273,28 +312,60 @@ export class S2sRealtimeClient extends EventTarget {
 
     if (this.options.transport === "websocket") {
       const base = new URL("./worklets/", import.meta.url);
-      await ctx.audioWorklet.addModule(new URL("mic-capture.js", base).href);
-      await ctx.audioWorklet.addModule(new URL("audio-playback.js", base).href);
+      await ctx.audioWorklet.addModule(versionedAudioWorkletUrl("mic-capture.js", base));
+      await ctx.audioWorklet.addModule(versionedAudioWorkletUrl("audio-playback.js", base));
       const capture = new AudioWorkletNode(ctx, "mic-capture", {
         numberOfInputs: 1,
         numberOfOutputs: 0,
-        processorOptions: { chunkMs: MIC_CHUNK_MS },
+        processorOptions: {
+          chunkMs: MIC_CHUNK_MS,
+          targetRate: AUDIO_SAMPLE_RATE,
+          version: AUDIO_WORKLET_VERSION,
+        },
       });
-      capture.port.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) this._onMicChunk(event.data);
-        else if (event.data?.kind === "level") {
-          this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: event.data.rms } }));
-        }
-      };
+      const captureConfigured = new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          reject(new Error(
+            "The microphone audio processor did not report its sample rate. "
+            + "Close every tab for this demo, reopen it, and try again.",
+          ));
+        }, CAPTURE_CONFIG_TIMEOUT_MS);
+        capture.port.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            this._onMicChunk(event.data);
+          } else if (event.data?.kind === "level") {
+            this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: event.data.rms } }));
+          } else if (event.data?.kind === "capture-config") {
+            window.clearTimeout(timeout);
+            const inputRate = Number(event.data.inputRate);
+            const outputRate = Number(event.data.outputRate);
+            const version = String(event.data.version || "unknown");
+            console.info(
+              `[audio] capture worklet ${version}: ${inputRate} Hz -> ${outputRate} Hz`,
+            );
+            if (outputRate !== AUDIO_SAMPLE_RATE || version !== AUDIO_WORKLET_VERSION) {
+              reject(new Error(
+                `Microphone sample-rate mismatch: processor ${version} outputs ${outputRate} Hz; `
+                + `the client expects ${AUDIO_SAMPLE_RATE} Hz.`,
+              ));
+              return;
+            }
+            resolve(undefined);
+          }
+        };
+      });
+      capture.port.postMessage({ kind: "probe" });
       capture.port.postMessage({ kind: "gate", ...this._noiseGate });
       micSrc.connect(capture);
       this._captureNode = capture;
+      await captureConfigured;
 
       const playback = new AudioWorkletNode(ctx, "audio-playback", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
       });
+      playback.port.onmessage = (event) => this._onPlaybackMessage(event.data);
       playback.port.postMessage({ kind: "config", inputRate: AUDIO_SAMPLE_RATE });
       const output = ctx.createAnalyser();
       output.fftSize = VIS_FFT_SIZE;
@@ -359,20 +430,99 @@ export class S2sRealtimeClient extends EventTarget {
 
   /** @param {{data: ArrayBuffer, responseId?: string}} event */
   _onAudio(event) {
-    if (this.options.transport !== "websocket" || !this._playbackNode) return;
+    if (this.options.transport !== "websocket" || !this._playbackNode || this._closed || this._status === "error") return;
+    // The SDK emits response.created before audio. Only that response may
+    // enqueue samples; interruption/completion revoke this permission.
+    if (!this._playbackResponseId || event.responseId !== this._playbackResponseId || !event.data.byteLength) return;
     const view = new DataView(event.data);
     const samples = new Float32Array(event.data.byteLength / 2);
     for (let i = 0; i < samples.length; i += 1) {
       const sample = view.getInt16(i * 2, true);
       samples[i] = sample < 0 ? sample / 0x8000 : sample / 0x7fff;
     }
-    this._playbackNode.port.postMessage({ kind: "audio", samples }, [samples.buffer]);
-    if (event.responseId) this._audibleResponses.add(event.responseId);
+    const key = this._playbackAudioKey;
+    const item = this._playbackItems.get(key);
+    if (item) item.samples += samples.length;
+    this._enqueuePlayback(samples, key);
+  }
+
+  /** @param {Float32Array} samples @param {string} key */
+  _enqueuePlayback(samples, key) {
+    this._pendingPlayback.push({ samples, key });
+    this._pendingPlaybackSamples += samples.length;
+    if (this._playbackStarted || this._pendingPlaybackSamples >= this._playbackThreshold) this._releasePlayback();
+  }
+
+  _releasePlayback() {
+    if (!this._pendingPlayback.length) return;
+    for (const { samples, key } of this._pendingPlayback) {
+      this._playbackNode.port.postMessage({ kind: "audio", samples, key }, [samples.buffer]);
+    }
+    this._pendingPlayback = [];
+    this._pendingPlaybackSamples = 0;
+    this._playbackStarted = true;
+    this._audibleResponses.add(this._playbackResponseId);
     this._aiSpeaking = true;
     this._markAudible();
   }
 
+  /** Reset only the startup gate, leaving already released audio to drain.
+   * @param {string} [responseId] */
+  _resetPlaybackBuffer(responseId = "") {
+    this._playbackResponseId = responseId;
+    this._playbackAudioKey = "";
+    /** @type {{samples: Float32Array, key: string}[]} */
+    this._pendingPlayback = [];
+    this._pendingPlaybackSamples = 0;
+    this._playbackStarted = false;
+  }
+
+  /** @param {string} responseId @param {string} status */
+  _finishPlayback(responseId, status) {
+    if (!responseId || responseId !== this._playbackResponseId) return;
+    if (status === "completed" || status === "incomplete") {
+      this._releasePlayback();
+    }
+    // A terminal status discards only this response's startup reserve.
+    // Released audio may share the worklet queue with an earlier response;
+    // only an actual interruption should clear that queue and truncate items.
+    this._resetPlaybackBuffer();
+  }
+
+  _interruptPlayback() {
+    if (this.options.transport !== "websocket") return;
+    const clearId = ++this._playbackClearId;
+    this._playbackInterruptions.set(clearId, this._playbackItems);
+    this._playbackItems = new Map();
+    this._resetPlaybackBuffer();
+    // The acknowledgement includes samples rendered while the main thread
+    // was busy, and captures the position exactly when the queue is cleared.
+    this._playbackNode?.port.postMessage({ kind: "clear", clearId });
+    this._aiSpeaking = false;
+  }
+
+  _onPlaybackMessage(message) {
+    if (message?.kind !== "cleared") return;
+    const items = this._playbackInterruptions.get(message.clearId);
+    this._playbackInterruptions.delete(message.clearId);
+    if (!items || this._closed || this._status === "error") return;
+    const played = new Map(message.played);
+    for (const [key, item] of items) {
+      const samples = Math.min(item.samples, played.get(key) ?? 0);
+      if (samples >= item.samples) continue;
+      this._transport?.sendEvent({
+        type: "conversation.item.truncate",
+        item_id: item.itemId,
+        content_index: item.contentIndex,
+        audio_end_ms: Math.max(0, Math.floor(samples / AUDIO_SAMPLE_RATE * 1000)),
+      });
+    }
+  }
+
   _clearPlayback() {
+    this._playbackInterruptions.clear();
+    this._playbackItems.clear();
+    this._resetPlaybackBuffer();
     this._playbackNode?.port.postMessage({ kind: "clear" });
     this._aiSpeaking = false;
   }
@@ -386,12 +536,29 @@ export class S2sRealtimeClient extends EventTarget {
 
   /** @param {any} event */
   _onTransportEvent(event) {
+    if (this.options.transport === "websocket" && (this._closed || this._status === "error")) return;
     const type = event?.type;
     if (typeof type !== "string") return;
     if (this._debug) console.debug(`[${this.options.transport}]`, event);
     switch (type) {
+      case "speech_to_speech.output_audio.visemes": {
+        this.dispatchEvent(new CustomEvent("visemes", { detail: event }));
+        break;
+      }
+      case "response.output_audio.delta": {
+        if (this.options.transport !== "websocket" || event.response_id !== this._playbackResponseId) break;
+        const key = JSON.stringify([event.item_id, event.content_index]);
+        this._playbackAudioKey = key;
+        if (!this._playbackItems.has(key)) {
+          this._playbackItems.set(key, {
+            itemId: event.item_id, contentIndex: event.content_index, samples: 0,
+          });
+        }
+        break;
+      }
       case "input_audio_buffer.speech_started": {
-        this._clearPlayback();
+        // WebSocket calls interrupt() after dispatching this raw event.
+        if (this.options.transport !== "websocket") this._clearPlayback();
         const itemId = typeof event.item_id === "string" ? event.item_id : "";
         this._currentUserItemId = itemId;
         if (this.options.transport === "websocket") {
@@ -420,19 +587,33 @@ export class S2sRealtimeClient extends EventTarget {
       case "response.created":
         this._responseRequested = false;
         this._activeResponseId = event.response?.id ?? "";
+        if (this.options.transport === "websocket") this._resetPlaybackBuffer(this._activeResponseId);
         if (this._status === "connected" || this._status === "user-speaking") this._setStatus("processing");
         break;
       case "response.content_part.added":
         if (event.part?.type === "audio" || event.part?.type === "output_audio") this._markAudible();
         break;
+      case "speech_to_speech.input_audio_transcription.snapshot": {
+        const transcript = typeof event.transcript === "string" ? event.transcript : "";
+        if (transcript) {
+          const itemId = typeof event.item_id === "string" ? event.item_id : "";
+          this._userSnapshotByItem.set(itemId, transcript);
+          this.dispatchEvent(new CustomEvent("transcript", { detail: {
+            role: "user", text: transcript, partial: true, itemId,
+          } }));
+        }
+        break;
+      }
       case "conversation.item.input_audio_transcription.delta": {
         const delta = typeof event.delta === "string" ? event.delta : "";
         if (delta) {
           const itemId = typeof event.item_id === "string" ? event.item_id : "";
           const text = (this._userTranscriptByItem.get(itemId) || "") + delta;
           this._userTranscriptByItem.set(itemId, text);
+          const snapshot = this._userSnapshotByItem.get(itemId);
+          const displayText = snapshot || text;
           this.dispatchEvent(new CustomEvent("transcript", { detail: {
-            role: "user", text, partial: true, itemId,
+            role: "user", text: displayText, partial: true, itemId,
           } }));
         }
         break;
@@ -440,8 +621,11 @@ export class S2sRealtimeClient extends EventTarget {
       case "conversation.item.input_audio_transcription.completed": {
         const text = typeof event.transcript === "string" ? event.transcript : "";
         const itemId = typeof event.item_id === "string" ? event.item_id : "";
-        const hadPartial = Boolean(this._userTranscriptByItem.get(itemId));
+        const hadPartial = Boolean(
+          this._userTranscriptByItem.get(itemId) || this._userSnapshotByItem.get(itemId)
+        );
         this._userTranscriptByItem.delete(itemId);
+        this._userSnapshotByItem.delete(itemId);
         const isCurrentUserItem = this._currentUserItemId
           ? Boolean(itemId) && itemId === this._currentUserItemId
           : true;
@@ -466,6 +650,7 @@ export class S2sRealtimeClient extends EventTarget {
           ? Boolean(itemId) && itemId === this._currentUserItemId
           : true;
         this._userTranscriptByItem.delete(itemId);
+        this._userSnapshotByItem.delete(itemId);
         if (itemId && itemId === this._currentUserItemId) this._currentUserItemId = "";
         if (
           isCurrentUserItem
@@ -507,6 +692,9 @@ export class S2sRealtimeClient extends EventTarget {
       }
       case "response.done": {
         const responseId = event.response?.id ?? "";
+        if (this.options.transport === "websocket") {
+          this._finishPlayback(responseId, event.response?.status ?? "completed");
+        }
         this._responseRequested = false;
         this._activeResponseId = "";
         this._aiSpeaking = false;
@@ -516,6 +704,7 @@ export class S2sRealtimeClient extends EventTarget {
           responseId,
           status: event.response?.status ?? "completed",
           audible: this._audibleResponses.has(responseId),
+          latency: readTurnLatency(event.response),
           transcript,
         } }));
         this._audibleResponses.delete(responseId);
@@ -576,11 +765,6 @@ export class S2sRealtimeClient extends EventTarget {
     if (options.image) this._session?.addImage(options.image, { triggerResponse: false });
     this._responseRequested = true;
     this._transport?.requestResponse();
-  }
-
-  /** @param {string} dataUrl */
-  sendUserImage(dataUrl) {
-    this._session?.addImage(dataUrl, { triggerResponse: false });
   }
 
   /** @param {boolean} muted */
@@ -735,8 +919,10 @@ export class S2sRealtimeClient extends EventTarget {
   async close() {
     this._closed = true;
     this._closing = true;
+    if (this.options.transport === "websocket") this._clearPlayback();
     this._userAudioRecorder.reset();
     this._userTranscriptByItem.clear();
+    this._userSnapshotByItem.clear();
     this._currentUserItemId = "";
     if (this._queueWake) {
       clearTimeout(this._queueTimer);
