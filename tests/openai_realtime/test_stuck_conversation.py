@@ -215,3 +215,25 @@ class TestStuckConversationWatchdog:
         st.tool_output_awaiting_response_at -= service_module.STUCK_CONVERSATION_S + 1.0
 
         assert service.check_stuck_conversation(conn_id) is True
+
+
+class TestInBandCreateClearsTheDebt:
+    """The real response.create path must go through ConnState.mark_response_started.
+
+    The watchdog tests above call mark_response_started directly, so they would
+    stay green if the in-band create path set ``in_response`` by hand -- which
+    is what upstream's response.create does, and what SOP-834's merge had to
+    replace. That regression leaves the tool-output debt armed while a response
+    speaks it, and the watchdog then reports a stuck conversation that is not.
+    """
+
+    def test_in_band_response_create_clears_tool_output_debt(self, service, conn_id):
+        _answer_a_tool_call(service, conn_id)
+        st = service._state(conn_id)
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent.model_construct(type="response.create"))
+
+        assert _error_type(result) is None
+        assert st.in_response is True
+        assert st.response_started_at is not None
+        assert st.tool_output_awaiting_response_at is None

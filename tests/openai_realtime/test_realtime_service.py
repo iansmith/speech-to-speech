@@ -5541,6 +5541,34 @@ class TestTranscriptionTurnIdentity:
         [frame] = self._published(service, conn_id, tracker, collected)
         assert frame["chat_action"] == "none"
 
+    def test_superseded_revision_publishes_one_stamped_completed(self, tracked):
+        """Revision 0 is superseded before its turn commits, so only revision 1 reaches the client.
+
+        Pins the contract the SOP-834 merge changed: one completed frame per
+        protocol item (the item speech_started announced), stamped with the
+        latest revision. Revision 0's held frame is discarded unpublished, and
+        the published frame's chat_action still says what the final did to the
+        chat ("replaced"), not what the client has seen.
+        """
+        service, conn_id, tracker = tracked
+        collected = []
+        assert tracker.start_turn() == ("turn_1", 0)
+        self._complete(service, conn_id, collected, "Where does.")
+        started_item_id = next(
+            e.item_id for e in collected[0] if getattr(e, "type", None) == "input_audio_buffer.speech_started"
+        )
+        reopen(tracker, "turn_1")
+        self._complete(service, conn_id, collected, "Where's Jim work?", turn_revision=1)
+
+        frames = self._published(service, conn_id, tracker, collected)
+
+        assert len(frames) == 1
+        [frame] = frames
+        assert frame["item_id"] == started_item_id
+        assert frame["turn_revision"] == 1
+        assert frame["transcript"] == "Where's Jim work?"
+        assert frame["chat_action"] == "replaced"
+
     def test_turnless_pipeline_reports_null_turn(self, service, conn_id):
         service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
         service.dispatch_pipeline_event(conn_id, SpeechStoppedEvent(duration_s=1.0))
