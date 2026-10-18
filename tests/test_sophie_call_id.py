@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -16,9 +18,13 @@ from speech_to_speech.api.openai_realtime.websocket_router import (
     _release_unit_after_drain,
     claim_idle_unit,
 )
+from speech_to_speech.LLM.base_openai_compatible_language_model import (
+    BaseOpenAICompatibleHandler,
+)
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
 )
+from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 
 
 def _handler() -> ChatCompletionsApiModelHandler:
@@ -85,6 +91,74 @@ def test_chat_request_stamps_the_header_and_omits_it_when_clear() -> None:
     handler.on_session_end()
     handler._request([{"role": "user", "content": "hi"}], {})
     assert "extra_headers" not in seen
+
+
+class _Recorder:
+    """Stands in for a client endpoint's ``create``; keeps the last call's kwargs."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> object:
+        self.seen.clear()
+        self.seen.update(kwargs)
+        return object()
+
+
+def _responses_handler(recorder: _Recorder) -> ResponsesApiModelHandler:
+    handler = ResponsesApiModelHandler.__new__(ResponsesApiModelHandler)
+    handler.client = SimpleNamespace(
+        responses=recorder,
+        chat=SimpleNamespace(completions=recorder),
+    )
+    handler.model_name = "m"
+    handler.stream = False
+    handler._extra_body = None
+    handler.request_timeout = 1
+    return handler
+
+
+def _assert_stamped_then_clear(
+    handler: BaseOpenAICompatibleHandler,
+    request: Callable[[Any, dict[str, Any]], Any],
+    recorder: _Recorder,
+) -> None:
+    handler.set_sophie_call_id("call-1")
+    request([{"role": "user", "content": "hi"}], {})
+    headers = recorder.seen.get("extra_headers")
+    assert isinstance(headers, dict)
+    assert headers[CLIENT_SESSION_HEADER] == "call-1"
+
+    handler.on_session_end()
+    request([{"role": "user", "content": "hi"}], {})
+    assert "extra_headers" not in recorder.seen
+
+
+def test_responses_request_stamps_the_header_and_omits_it_when_clear() -> None:
+    # --llm_backend responses-api sends text turns through
+    # ResponsesApiModelHandler._request -> client.responses.create.
+    recorder = _Recorder()
+    handler = _responses_handler(recorder)
+    _assert_stamped_then_clear(handler, handler._request, recorder)
+
+
+def test_responses_audio_request_stamps_the_header_and_omits_it_when_clear() -> None:
+    # Audio-input turns on the Responses backend go out as Chat Completions
+    # (ResponsesApiModelHandler._request_audio), a separate request path.
+    recorder = _Recorder()
+    handler = _responses_handler(recorder)
+    _assert_stamped_then_clear(handler, handler._request_audio, recorder)
+
+
+def test_chat_audio_request_stamps_the_header_and_omits_it_when_clear() -> None:
+    recorder = _Recorder()
+    handler = _handler()
+    handler.client = SimpleNamespace(chat=SimpleNamespace(completions=recorder))
+    handler.model_name = "m"
+    handler.stream = False
+    handler._extra_body = None
+    handler.request_timeout = 1
+    _assert_stamped_then_clear(handler, handler._request_audio, recorder)
 
 
 class _Transport:

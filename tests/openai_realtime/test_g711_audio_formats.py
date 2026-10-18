@@ -165,6 +165,30 @@ class TestOutbound:
         assert len(payload) == FRAME_BYTES
 
 
+class TestOutboundResponseTail:
+    """A whole pcmu response, tail included, is mu-law.
+
+    ResponseHandler.finish_audio_output flushes a held StreamingPcm16Resampler
+    and sends that tail as raw PCM16. The G.711 path must therefore never hold
+    one: a linear-PCM tail inside a mu-law stream is a burst of noise at the end
+    of every response, and no per-chunk test above reaches the flush.
+    """
+
+    def test_pcmu_response_tail_is_ulaw_end_to_end(self, service, conn_id):
+        _use_format(service, conn_id, AudioPCMU.model_construct(type="audio/pcmu"))
+        chunk_bytes = [FRAME_PIPELINE_BYTES, 1000, 2 * FRAME_PIPELINE_BYTES]
+        events = []
+        for size in chunk_bytes:
+            events.extend(service.encode_audio_chunk(conn_id, b"\x00" * size))
+        events.extend(service.response.finish_audio_output(conn_id))
+
+        deltas = [e for e in events if getattr(e, "type", None) == "response.output_audio.delta"]
+        payload = b"".join(base64.b64decode(e.delta) for e in deltas)
+        pipeline_samples = sum(chunk_bytes) // 2
+        assert len(payload) == pipeline_samples // 2, "16 kHz PCM16 -> 8 kHz mu-law, one byte per sample"
+        assert payload == b"\xff" * len(payload), "PCM16 silence encodes to the 0xFF codepoint"
+
+
 class TestPCMUnchanged:
     """The audio/pcm path must be byte-for-byte what it was before."""
 
