@@ -102,6 +102,7 @@ logger = logging.getLogger(__name__)
 # realtime idle guard (90s compiled, 120s on the sophie fleet), which is the
 # thing that used to notice, two minutes late and without saying why.
 STUCK_CONVERSATION_S = 10.0
+
 # Speculative turn work that stops being relevant once its turn is superseded.
 _TURN_INPUT_EVENTS = (
     PartialTranscriptionEvent,
