@@ -584,7 +584,7 @@ def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     assert root.start_time is not None and root.end_time is not None
     # With no terminal to widen it, the bind alone sets the window: it opens
     # where the measured stt stage started and closes at the bind.
-    assert root.start_time == round((stt_end - tracker.stt_s) * 1e9) + offset
+    assert root.start_time == round(stt_end * 1e9) - round(tracker.stt_s * 1e9) + offset
     assert round(stt_end * 1e9) + offset <= root.end_time <= round(bound_by * 1e9) + offset
     # Wall-clock time, read without the registry's offset: the root lies in
     # this test's own window (its stt stage starts 0.12 s before _speak
@@ -619,7 +619,7 @@ def test_root_window_spans_every_bind_of_its_turn(unit: SimpleNamespace) -> None
     (root,) = roots(exporter.get_finished_spans())
     assert root.context.span_id == _int(first_ref.root_span_id)
     assert root.start_time is not None and root.end_time is not None
-    assert root.start_time == round((first_stt_end - first_tracker.stt_s) * 1e9) + offset
+    assert root.start_time == round(first_stt_end * 1e9) - round(first_tracker.stt_s * 1e9) + offset
     # Rev 1's bind widened the open root past rev 1's STT, which ended after rev 0's bind.
     assert root.end_time >= round(second_stt_end * 1e9) + offset
 

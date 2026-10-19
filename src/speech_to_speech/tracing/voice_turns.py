@@ -184,12 +184,26 @@ class StageSpan:
 
 @dataclass(frozen=True)
 class StageInterval:
-    """A tracker measurement: its duration and where on perf_counter it ended."""
+    """A tracker measurement: its duration and where on perf_counter it ended.
+
+    ``start_ns`` and ``end_ns`` place it on perf_counter in integer
+    nanoseconds. They are the one placement rule: the stage spans use them, and
+    so does the root's window, whether it opens at bind or widens at a terminal.
+    """
 
     name: str
     end_perf_s: float
     duration_s: float
     attributes: dict[str, Any]
+
+    @property
+    def end_ns(self) -> int:
+        return _perf_ns(self.end_perf_s)
+
+    @property
+    def start_ns(self) -> int:
+        # Each term rounded first, so the span lasts exactly round(duration_s * 1e9) ns.
+        return self.end_ns - _perf_ns(self.duration_s)
 
 
 class VoiceTracer(Protocol):
@@ -405,6 +419,7 @@ class VoiceTurnTraces:
         now_perf: float,
         *,
         reset_count: int = 0,
+        stages: Sequence[StageInterval] = (),
     ) -> TurnTraceRef | None:
         """The trace ref for a response of *turn_id*, or None when it is not traced.
 
@@ -413,6 +428,9 @@ class VoiceTurnTraces:
         reset counter) moves, so ``turn_1`` after a reset is a new wire id.
         Binding a turn exports any other open root; binding a turn whose root is
         already out (a late follow-up) returns its ref and reopens nothing.
+        The root's window widens to start no later than *est_start_perf* or the
+        earliest start of *stages* (those measured before the bind), and to end
+        no earlier than *now_perf*.
         """
         tracer = current_voice_tracer()
         if turn_id is None or not tracer.enabled:
@@ -445,7 +463,8 @@ class VoiceTurnTraces:
                     return ref
                 closing = self._close_locked(keep=key)
                 entry = self._open.get(key)
-                start_ns, end_ns = _perf_ns(est_start_perf), _perf_ns(now_perf)
+                start_ns = min([_perf_ns(est_start_perf), *(stage.start_ns for stage in stages)])
+                end_ns = _perf_ns(now_perf)
                 if entry is None:
                     self._open[key] = _OpenRoot(ref, start_ns, end_ns)
                 else:
@@ -471,19 +490,15 @@ class VoiceTurnTraces:
             intervals = build_stage_intervals(tracker)
             if not intervals:
                 return
-            spans_perf = [
-                (interval, _perf_ns(interval.end_perf_s) - _perf_ns(interval.duration_s), _perf_ns(interval.end_perf_s))
-                for interval in intervals
-            ]
             with self._lock:
                 entry = self._open.get((ref.call_uuid, ref.wire_turn_id))
                 if entry is not None:
-                    entry.start_ns = min(entry.start_ns, *(start for _, start, _ in spans_perf))
-                    entry.end_ns = max(entry.end_ns, *(end for _, _, end in spans_perf))
+                    entry.start_ns = min(entry.start_ns, *(interval.start_ns for interval in intervals))
+                    entry.end_ns = max(entry.end_ns, *(interval.end_ns for interval in intervals))
                 offset = self._offset_ns
             stages = [
-                StageSpan(interval.name, start + offset, end + offset, interval.attributes)
-                for interval, start, end in spans_perf
+                StageSpan(interval.name, interval.start_ns + offset, interval.end_ns + offset, interval.attributes)
+                for interval in intervals
             ]
             tracer.emit_stages(ref, stages, status)
         except Exception as exc:

@@ -24,6 +24,7 @@ from speech_to_speech.tracing import otel_backend, voice_turns
 from speech_to_speech.tracing.otel_backend import OtelVoiceTracer
 from speech_to_speech.tracing.voice_ids import voice_turn_root_span_id, voice_turn_trace_id
 from speech_to_speech.tracing.voice_turns import (
+    StageInterval,
     TurnTraceRef,
     VoiceTurnTraces,
     current_voice_tracer,
@@ -392,6 +393,26 @@ def test_root_window_covers_its_stages() -> None:
     assert root.start_time == stage.start_time
     assert root.end_time == stage.end_time
     assert stage.end_time - stage.start_time == 2_500_000_000
+
+
+def test_root_bound_with_a_stage_starts_where_that_stage_span_starts() -> None:
+    """One placement rule for the root's bind-time start and the stage span's start."""
+    exporter = install_memory_tracer()
+    registry = VoiceTurnTraces()
+    registry.bind_call(CALL)
+    # perf_counter-sized values for which round(end) - round(duration) and
+    # round(end - duration) differ by 1 ns.
+    end, duration = 500480.73622102157, 1.3484731943662145
+    assert round(end * 1e9) - round(duration * 1e9) != round((end - duration) * 1e9)
+    ref = registry.ref_for(
+        "turn_1", 0, "speech", end + 0.1, end + 0.1, stages=[StageInterval("stt", end, duration, {})]
+    )
+    assert ref is not None
+    registry.finalize_all()  # the root is out before the terminal could widen it
+    registry.record_response(ref, _tracker(stt_s=duration, end=end), "completed")
+    (root,) = roots(exporter.get_finished_spans())
+    (stage,) = children(exporter.get_finished_spans())
+    assert root.start_time == stage.start_time
 
 
 def test_exported_keys_are_capped_oldest_first(monkeypatch: pytest.MonkeyPatch) -> None:

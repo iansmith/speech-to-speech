@@ -572,18 +572,19 @@ class RealtimeService:
                 trace_turn, trace_revision = st.last_voice_turn
             now = time.perf_counter()
             # The root opens at the earliest start of the stages measured so
-            # far (VAD's starts at the caller's speech end), placed by the same
-            # rule as the stage spans, so a root whose response never reaches a
-            # terminal still covers them. With no measured stage it opens now.
-            started = min([now, *(stage.end_perf_s - stage.duration_s for stage in build_stage_intervals(tracker))])
+            # far (VAD's starts at the caller's speech end), placed by the
+            # stage spans' own rule (StageInterval.start_ns), so a root whose
+            # response never reaches a terminal still covers them. With no
+            # measured stage it opens now.
             turns = self.speculative_turns
             ref = self.voice_traces.ref_for(
                 trace_turn,
                 trace_revision,
                 source,
-                started,
+                now,
                 now,
                 reset_count=turns.reset_count if turns is not None else 0,
+                stages=build_stage_intervals(tracker),
             )
             if ref is None:
                 return
