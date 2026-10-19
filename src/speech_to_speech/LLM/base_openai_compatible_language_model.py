@@ -938,7 +938,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         consumed_image_ids: set[str] = set()
         store = getattr(self, "turn_latency_store", None)
         tracker = store.get_response(turn.response_key) if store else None
-        turn_trace = None if is_out_of_band(turn.response) else getattr(tracker, "trace", None)
+        # Out-of-band responses never bind a tracker, so they never carry a turn.
+        turn_trace = getattr(tracker, "trace", None)
 
         try:
             generation_started_at_s = perf_counter()

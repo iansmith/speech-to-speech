@@ -50,10 +50,16 @@ def _env(pk: str | None = PK, sk: str | None = SK, base: str | None = GOOD_BASE)
 
 
 class _MustNotBuild:
-    """Stands in for a constructor that an off configuration must never reach."""
+    """Stands in for a constructor that an off configuration must never reach.
+
+    It records rather than raises: init_tracing contains a failing backend
+    build (and logs it), so a raise here could be swallowed into a pass.
+    """
+
+    calls: list[str] = []
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("tracing built an exporter while it should be off")
+        type(self).calls.append(type(self).__name__)
 
 
 class _RecordingExporter(SpanExporter):
@@ -111,12 +117,14 @@ def test_config_env_matrix(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _MustNotBuild.calls = []
     monkeypatch.setattr(otel_backend, "OtelVoiceTracer", _MustNotBuild)
     monkeypatch.setattr(otel_backend, "OTLPSpanExporter", _MustNotBuild)
     caplog.set_level(logging.DEBUG, logger=TRACING_LOGGER)
 
     tracer = init_tracing(environ)
 
+    assert _MustNotBuild.calls == []
     assert tracer.enabled is False
     assert current_voice_tracer().enabled is False
     assert len(_warnings(caplog)) == expected_warnings
@@ -399,6 +407,27 @@ def test_forced_root_ids_are_thread_isolated() -> None:
     root_ids = {root.context.span_id for root in roots(spans)}
     for child in children(spans):
         assert child.context.span_id not in root_ids
+
+
+def test_forced_id_slot_is_per_thread() -> None:
+    ids = otel_backend._ForcedIdGenerator()
+    forced_elsewhere = threading.Event()
+
+    def other_thread() -> None:
+        ids.force(3, 4)
+        forced_elsewhere.set()
+
+    ids.force(1, 2)
+    worker = threading.Thread(target=other_thread)
+    worker.start()
+    assert forced_elsewhere.wait(5)
+    worker.join(5)
+    # This thread still reads its own ids, once each, then random ones.
+    assert ids.is_trace_id_random() is False
+    assert ids.generate_trace_id() == 1
+    assert ids.generate_span_id() == 2
+    assert ids.is_trace_id_random() is True
+    assert ids.generate_span_id() != 2
 
 
 def test_no_global_provider_propagator_or_instrumentation(recording_exporter: type[_RecordingExporter]) -> None:
