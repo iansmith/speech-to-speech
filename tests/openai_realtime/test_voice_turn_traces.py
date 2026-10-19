@@ -267,7 +267,6 @@ def test_transcription_events_keep_turn_n_format(unit: SimpleNamespace) -> None:
     assert tracker.turn_id == "turn_1"
     line = tracker.format_log_line()
     assert line is not None and line.startswith("Turn turn_1 rev=0 ")
-    assert _ref(unit, request).turn_id == "turn_1"
 
 
 # ── DoD 2/3: which requests carry the turn headers ──────────────────────────

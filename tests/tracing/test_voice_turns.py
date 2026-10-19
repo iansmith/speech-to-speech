@@ -571,7 +571,6 @@ def test_forced_root_ids_are_thread_isolated() -> None:
                 ref = TurnTraceRef(
                     call_uuid=CALL,
                     wire_turn_id=turn,
-                    turn_id=turn,
                     revision=0,
                     source="speech",
                     trace_id=trace_id,

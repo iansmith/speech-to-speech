@@ -165,7 +165,6 @@ class TurnTraceRef:
 
     call_uuid: str
     wire_turn_id: str
-    turn_id: str
     revision: int | None
     source: str
     trace_id: bytes
@@ -435,7 +434,6 @@ class VoiceTurnTraces:
                 ref = TurnTraceRef(
                     call_uuid=call_uuid,
                     wire_turn_id=wire_id,
-                    turn_id=turn_id,
                     revision=revision,
                     source=source,
                     trace_id=trace_id,
