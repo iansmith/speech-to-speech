@@ -66,6 +66,4 @@ def test_wire_turn_id_is_safe() -> None:
 
 def test_traceparent_is_w3c_version_00_sampled() -> None:
     trace_hex, root_hex = GOLDEN["turn_1"]
-    assert (
-        format_traceparent(bytes.fromhex(trace_hex), bytes.fromhex(root_hex)) == f"00-{trace_hex}-{root_hex}-01"
-    )
+    assert format_traceparent(bytes.fromhex(trace_hex), bytes.fromhex(root_hex)) == f"00-{trace_hex}-{root_hex}-01"

@@ -110,6 +110,10 @@ class ResponseHandler(RealtimeBaseHandler):
         line = tracker.format_log_line()
         if line:
             logger.info("%s response_key=%s", line, response_key)
+        if tracker.trace is not None:
+            # SOP-805: the same measurements as stage spans on the turn's trace.
+            # Never raises; at most six spans, each only enqueued.
+            self._service.voice_traces.record_response(tracker.trace, tracker, status)
 
     def _end_response(self, conn_id: str, status: _ResponseStatus = "completed") -> None:
         st = self._state(conn_id)

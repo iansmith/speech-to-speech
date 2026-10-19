@@ -159,7 +159,14 @@ def test_valid_env_builds_langfuse_http_exporter(
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(None, "dev"), ("", "dev"), ("demo", "demo"), ("Demo", "unknown"), ("langfuse-x", "unknown"), ("a" * 41, "unknown")],
+    [
+        (None, "dev"),
+        ("", "dev"),
+        ("demo", "demo"),
+        ("Demo", "unknown"),
+        ("langfuse-x", "unknown"),
+        ("a" * 41, "unknown"),
+    ],
 )
 def test_environment_follows_sophies_rule(
     raw: str | None, expected: str, recording_exporter: type[_RecordingExporter]
@@ -178,7 +185,8 @@ def test_env_set_but_extra_missing_runs_untraced(
     # The [tracing] extra is absent: the SDK and exporter cannot be imported.
     # opentelemetry-api alone may be present (fastapi depends on it).
     monkeypatch.delitem(sys.modules, "speech_to_speech.tracing.otel_backend", raising=False)
-    for name in ("opentelemetry.sdk", "opentelemetry.exporter"):
+    hidden = [m for m in sys.modules if m.startswith(("opentelemetry.sdk", "opentelemetry.exporter"))]
+    for name in {"opentelemetry.sdk", "opentelemetry.exporter", *hidden}:
         monkeypatch.setitem(sys.modules, name, None)
     caplog.set_level(logging.DEBUG, logger=TRACING_LOGGER)
 

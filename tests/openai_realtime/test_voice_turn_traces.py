@@ -559,9 +559,7 @@ def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     unit.service.unregister(unit.conn)  # drops the tracker without a terminal
 
     spans = exporter.get_finished_spans()
-    assert [(s.context.trace_id, s.context.span_id) for s in spans] == [
-        (_int(ref.trace_id), _int(ref.root_span_id))
-    ]
+    assert [(s.context.trace_id, s.context.span_id) for s in spans] == [(_int(ref.trace_id), _int(ref.root_span_id))]
     assert spans[0].parent is None
     unit.service.voice_traces.finalize_all()
     assert len(exporter.get_finished_spans()) == 1
@@ -637,7 +635,13 @@ def test_stage_spans_match_tracker_and_log_line(
         assert stages[name].context.trace_id == _int(ref.trace_id)
     # The same numbers format_log_line() printed for this turn.
     printed = dict(re.findall(r"(\w+)=(\d+\.\d\d)s", line))
-    for name, key in (("stt", "stt"), ("llm", "llm"), ("tts.ttfa", "tts_ttfa"), ("e2e", "e2e"), ("vad", "vad_decision")):
+    for name, key in (
+        ("stt", "stt"),
+        ("llm", "llm"),
+        ("tts.ttfa", "tts_ttfa"),
+        ("e2e", "e2e"),
+        ("vad", "vad_decision"),
+    ):
         assert f"{_duration_ns(stages[name]) / 1e9:.2f}" == printed[key]
     # Placement is measured: each stage ends where the tracker recorded it.
     assert _duration_ns(stages["llm.ttft"]) == round(0.45 * 1e9)

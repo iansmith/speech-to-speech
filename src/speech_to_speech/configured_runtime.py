@@ -13,6 +13,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
 
 from speech_to_speech.config import ConfigurationError, ResolvedConfig
+from speech_to_speech.tracing.voice_turns import init_tracing, shutdown_tracing
 
 if TYPE_CHECKING:
     from speech_to_speech.api.openai_realtime.audio_client import RealtimeAudioClientConfig
@@ -370,6 +371,7 @@ def run_configured_command(command: Literal["serve", "local", "talk"], config: R
             from speech_to_speech.s2s_pipeline import setup_logger
 
             setup_logger(config.runtime.get("log_level", "info"))
+            init_tracing()  # SOP-805: on only when LANGFUSE_* configures it
             result = build_configured_server(config, stop_event, local=command == "local")
             set_log_transcripts(
                 result.client.config.log_transcripts
@@ -382,8 +384,12 @@ def run_configured_command(command: Literal["serve", "local", "talk"], config: R
     finally:
         stop_event.set()
         try:
-            if result is not None:
-                result.stop()
+            try:
+                if result is not None:
+                    result.stop()
+            finally:
+                # Bounded, idempotent, and a no-op when tracing never started.
+                shutdown_tracing()
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)

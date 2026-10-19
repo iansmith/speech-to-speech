@@ -62,11 +62,19 @@ from speech_to_speech.pipeline.messages import (
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+from speech_to_speech.tracing.voice_ids import normalize_call_uuid
+from speech_to_speech.tracing.voice_turns import TurnTraceRef
 from speech_to_speech.utils.utils import audio_to_wav_base64, is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
 
-_REQUEST_TURN_TRACE: ContextVar[Any] = ContextVar("sophie_request_turn_trace", default=None)
+# SOP-805: the voice-trace ref of the request being issued, set by _generate's
+# make_request around request_fn and read by sophie_call_headers(). A context
+# variable rather than handler state because the prefetch worker issues
+# requests on its own thread while the handler thread may be on another turn,
+# and because warm-up and compaction, which never run inside make_request,
+# must not inherit a turn.
+_REQUEST_TURN_TRACE: ContextVar[TurnTraceRef | None] = ContextVar("sophie_request_turn_trace", default=None)
 
 # About 18–24 seconds of default SDK backoff before warmup fails.
 WARMUP_MAX_RETRIES = 6
@@ -265,12 +273,29 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._sophie_call_id = (call_id or "").strip()
 
     def sophie_call_headers(self) -> dict[str, str]:
+        """Headers for Sophie's LLM proxy: the call id, and on a traced spoken turn
+        its X-Sophie-Turn-Id and traceparent (SOP-838's contract).
+
+        The turn headers go out only for a request issued inside make_request
+        for a response bound with a voice-trace ref, and only when that ref
+        belongs to the call this handler is serving now; a pooled unit that has
+        moved to another call never names the previous call's trace.
+        """
         call_id = getattr(self, "_sophie_call_id", "")
         if not call_id:
             return {}
-        from speech_to_speech.api.openai_realtime.sophie_call import CLIENT_SESSION_HEADER
+        from speech_to_speech.api.openai_realtime.sophie_call import (
+            CLIENT_SESSION_HEADER,
+            TRACEPARENT_HEADER,
+            TURN_ID_HEADER,
+        )
 
-        return {CLIENT_SESSION_HEADER: call_id}
+        headers = {CLIENT_SESSION_HEADER: call_id}
+        ref = _REQUEST_TURN_TRACE.get()
+        if ref is not None and ref.call_uuid == normalize_call_uuid(call_id):
+            headers[TURN_ID_HEADER] = ref.wire_turn_id
+            headers[TRACEPARENT_HEADER] = ref.traceparent
+        return headers
 
     def _use_provider_client(self, client: OpenAI) -> None:
         """Adopt *client* and make requests issued on it abortable mid-connect.
@@ -913,6 +938,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         consumed_image_ids: set[str] = set()
         store = getattr(self, "turn_latency_store", None)
         tracker = store.get_response(turn.response_key) if store else None
+        turn_trace = None if is_out_of_band(turn.response) else getattr(tracker, "trace", None)
 
         try:
             generation_started_at_s = perf_counter()
@@ -931,7 +957,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     provider_request_started = True
 
                     def make_request() -> Any:
-                        return (request_fn or self._request)(api_input, optional_kwargs)
+                        # Runs on whichever thread issues the request, the
+                        # prefetch worker included, so the turn travels with it.
+                        token = _REQUEST_TURN_TRACE.set(turn_trace)
+                        try:
+                            return (request_fn or self._request)(api_input, optional_kwargs)
+                        finally:
+                            _REQUEST_TURN_TRACE.reset(token)
 
                     if turn.prefetch_transaction is not None:
                         events = self._iter_prefetch_events_interruptibly(

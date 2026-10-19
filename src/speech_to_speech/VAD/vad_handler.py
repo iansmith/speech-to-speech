@@ -816,7 +816,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     # This excludes upstream queue/network delay, not VAD or Smart Turn work.
                     speech_end_at_s = received_at_s - max(0, self._total_samples - speech_end_sample) / self.sample_rate
                     if tracker is not None:
-                        tracker.vad_decision_s = max(0.0, decision_at_s - speech_end_at_s)
+                        tracker.record_vad_decision(decision_at_s - speech_end_at_s, ended_at_s=decision_at_s)
                 if tracker is not None:
                     tracker.smart_turn_status = self._last_smart_turn_status
                     tracker.smart_turn_analysis_s = self._last_smart_turn_analysis_s
