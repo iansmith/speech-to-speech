@@ -771,7 +771,7 @@ class _ExplodingTracer:
     def emit_stages(self, ref: TurnTraceRef, stages: list[StageSpan], status: str) -> None:
         raise RuntimeError("export exploded")
 
-    def shutdown(self, timeout_s: float) -> None:
+    def shutdown(self) -> None:
         return None
 
 

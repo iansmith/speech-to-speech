@@ -201,7 +201,7 @@ class VoiceTracer(Protocol):
 
     def emit_stages(self, ref: TurnTraceRef, stages: Sequence[StageSpan], status: str) -> None: ...
 
-    def shutdown(self, timeout_s: float) -> None: ...
+    def shutdown(self) -> None: ...
 
 
 class NoopVoiceTracer:
@@ -215,7 +215,7 @@ class NoopVoiceTracer:
     def emit_stages(self, ref: TurnTraceRef, stages: Sequence[StageSpan], status: str) -> None:
         return None
 
-    def shutdown(self, timeout_s: float) -> None:
+    def shutdown(self) -> None:
         return None
 
 
@@ -286,16 +286,14 @@ def shutdown_tracing(timeout_s: float = 3.0) -> None:
         registries = list(_registries)
     for registry in registries:
         registry.finalize_all(tracer)
-    worker = threading.Thread(
-        target=_shutdown_quietly, args=(tracer, timeout_s), name="voice-tracing-shutdown", daemon=True
-    )
+    worker = threading.Thread(target=_shutdown_quietly, args=(tracer,), name="voice-tracing-shutdown", daemon=True)
     worker.start()
     worker.join(timeout_s)
 
 
-def _shutdown_quietly(tracer: VoiceTracer, timeout_s: float) -> None:
+def _shutdown_quietly(tracer: VoiceTracer) -> None:
     try:
-        tracer.shutdown(timeout_s)
+        tracer.shutdown()
     except Exception as exc:
         logger.debug("Voice tracing shutdown failed (%s)", type(exc).__name__)
 

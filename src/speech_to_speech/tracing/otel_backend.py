@@ -199,6 +199,6 @@ class OtelVoiceTracer:
             )
             span.end(end_time=stage.end_ns)
 
-    def shutdown(self, timeout_s: float) -> None:
-        """Flush and stop. The caller bounds how long it waits (shutdown_tracing)."""
+    def shutdown(self) -> None:
+        """Flush and stop. The SDK joins its export thread for up to 30 s; shutdown_tracing bounds the wait."""
         self.provider.shutdown()
