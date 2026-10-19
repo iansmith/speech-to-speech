@@ -6,7 +6,6 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
-from contextvars import ContextVar
 from queue import Empty, Full, Queue
 from threading import BoundedSemaphore, Lock, Thread, current_thread
 from threading import Event as ThreadingEvent
@@ -62,19 +61,11 @@ from speech_to_speech.pipeline.messages import (
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
+from speech_to_speech.pipeline.turn_latency import active_turn_latency_tracker, bind_active_turn_latency_tracker
 from speech_to_speech.tracing.voice_ids import normalize_call_uuid
-from speech_to_speech.tracing.voice_turns import TurnTraceRef
 from speech_to_speech.utils.utils import audio_to_wav_base64, is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
-
-# SOP-805: the voice-trace ref of the request being issued, set by _generate's
-# make_request around request_fn and read by sophie_call_headers(). A context
-# variable rather than handler state because the prefetch worker issues
-# requests on its own thread while the handler thread may be on another turn,
-# and because warm-up and compaction, which never run inside make_request,
-# must not inherit a turn.
-_REQUEST_TURN_TRACE: ContextVar[TurnTraceRef | None] = ContextVar("sophie_request_turn_trace", default=None)
 
 # About 18–24 seconds of default SDK backoff before warmup fails.
 WARMUP_MAX_RETRIES = 6
@@ -277,6 +268,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         its X-Sophie-Turn-Id and traceparent (SOP-838's contract).
 
         The turn headers go out only for a request issued inside make_request
+        (which binds the response's tracker as the active turn-latency tracker)
         for a response bound with a voice-trace ref, and only when that ref
         belongs to the call this handler is serving now; a pooled unit that has
         moved to another call never names the previous call's trace.
@@ -291,7 +283,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         )
 
         headers = {CLIENT_SESSION_HEADER: call_id}
-        ref = _REQUEST_TURN_TRACE.get()
+        tracker = active_turn_latency_tracker()
+        ref = tracker.trace if tracker is not None else None
         if ref is not None and ref.call_uuid == normalize_call_uuid(call_id):
             headers[TURN_ID_HEADER] = ref.wire_turn_id
             headers[TRACEPARENT_HEADER] = ref.traceparent
@@ -938,8 +931,6 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         consumed_image_ids: set[str] = set()
         store = getattr(self, "turn_latency_store", None)
         tracker = store.get_response(turn.response_key) if store else None
-        # Out-of-band responses never bind a tracker, so they never carry a turn.
-        turn_trace = getattr(tracker, "trace", None)
 
         try:
             generation_started_at_s = perf_counter()
@@ -959,12 +950,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
                     def make_request() -> Any:
                         # Runs on whichever thread issues the request, the
-                        # prefetch worker included, so the turn travels with it.
-                        token = _REQUEST_TURN_TRACE.set(turn_trace)
-                        try:
+                        # prefetch worker included, so the response's tracker,
+                        # and with it its turn's trace (SOP-805), travels with
+                        # it. Out-of-band responses never bind a tracker, so
+                        # they never carry a turn.
+                        with bind_active_turn_latency_tracker(tracker):
                             return (request_fn or self._request)(api_input, optional_kwargs)
-                        finally:
-                            _REQUEST_TURN_TRACE.reset(token)
 
                     if turn.prefetch_transaction is not None:
                         events = self._iter_prefetch_events_interruptibly(

@@ -51,6 +51,7 @@ from speech_to_speech.pipeline.messages import (
     ResponsePrefetchTransaction,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.pipeline.turn_latency import TurnLatencyTracker, bind_active_turn_latency_tracker
 from speech_to_speech.tracing import voice_turns
 from speech_to_speech.tracing.voice_ids import TURN_ID_RE, voice_turn_root_span_id, voice_turn_trace_id
 from speech_to_speech.tracing.voice_turns import StageSpan, TurnTraceRef, VoiceTurnTraces
@@ -204,6 +205,11 @@ def _int(raw: bytes) -> int:
     return int.from_bytes(raw, "big")
 
 
+def _traced(ref: TurnTraceRef) -> TurnLatencyTracker:
+    """A response tracker carrying *ref*, as make_request binds one for a traced turn."""
+    return TurnLatencyTracker(turn_id="turn_1", turn_revision=0, source="speech", trace=ref)
+
+
 # ── DoD 4: unique turn ids within a call ────────────────────────────────────
 
 
@@ -314,11 +320,8 @@ def test_every_request_path_carries_turn_headers(path: str) -> None:
     assert ref is not None
     handler.set_sophie_call_id(CALL)
 
-    token = base_mod._REQUEST_TURN_TRACE.set(ref)
-    try:
+    with bind_active_turn_latency_tracker(_traced(ref)):
         request([{"role": "user", "content": "hi"}], {})
-    finally:
-        base_mod._REQUEST_TURN_TRACE.reset(token)
     assert recorder.seen.get("extra_headers") == _expected_turn_headers(ref.wire_turn_id)
 
     request([{"role": "user", "content": "hi"}], {})  # no turn in scope
@@ -504,14 +507,11 @@ def test_non_turn_requests_send_no_turn_headers(unit: SimpleNamespace) -> None:
     assert create_and_send(out_of_band) == {CLIENT_SESSION_HEADER: CALL}
 
     completions = _completions(llm)
-    token = base_mod._REQUEST_TURN_TRACE.set(ref)  # even with a turn in scope
-    try:
+    with bind_active_turn_latency_tracker(_traced(ref)):  # even with a traced turn in scope
         llm.warmup()
         warm = completions.calls[-1]
         llm._build_compaction_generate_fn()("system", "user")
         compaction = completions.calls[-1]
-    finally:
-        base_mod._REQUEST_TURN_TRACE.reset(token)
     assert "extra_headers" not in warm
     assert "extra_headers" not in compaction
 
@@ -853,8 +853,7 @@ def test_tts_requests_get_no_trace_headers(unit: SimpleNamespace, monkeypatch: p
         setup_args=(Event(),),
         setup_kwargs={"sample_rate": 24000, "blocksize": 512},
     )
-    token = base_mod._REQUEST_TURN_TRACE.set(ref)  # a traced model request is in flight
-    try:
+    with bind_active_turn_latency_tracker(_traced(ref)):  # a traced model request is in flight
         audio = list(
             handler.process(
                 TTSInput(
@@ -865,8 +864,6 @@ def test_tts_requests_get_no_trace_headers(unit: SimpleNamespace, monkeypatch: p
                 )
             )
         )
-    finally:
-        base_mod._REQUEST_TURN_TRACE.reset(token)
 
     assert audio
     assert seen
