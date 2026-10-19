@@ -11,6 +11,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
@@ -155,6 +156,8 @@ def test_valid_env_builds_langfuse_http_exporter(
     assert built["endpoint"] == "https://langfuse.invalid/api/public/otel/v1/traces"
     expected_auth = "Basic " + base64.b64encode(f"{PK}:{SK}".encode()).decode()
     assert built["headers"] == {"Authorization": expected_auth, "x-langfuse-ingestion-version": "4"}
+    # The effective export bound: SDK 1.45.1's BatchSpanProcessor ignores export_timeout_millis.
+    assert built["timeout"] == 5.0
     assert isinstance(tracer, OtelVoiceTracer)
     assert isinstance(tracer.processor, BatchSpanProcessor)
     # shutdown_on_exit=False: no atexit hook that could stall a systemd stop.
@@ -204,39 +207,119 @@ def test_env_set_but_extra_missing_runs_untraced(
     assert len(_warnings(caplog)) == 1
 
 
-def test_import_and_init_with_env_unset_load_no_otel_sdk() -> None:
-    script = textwrap.dedent(
-        """
-        import socket, sys
-        attempts = []
-        real_create_connection = socket.create_connection
-        def counting_create_connection(*args, **kwargs):
-            attempts.append(args)
-            return real_create_connection(*args, **kwargs)
-        socket.create_connection = counting_create_connection
+class _BackendBuildFailed(RuntimeError):
+    """What OTLPSpanExporter raises on, e.g., a bad OTEL_* credential-provider variable."""
+
+
+def test_backend_build_failure_runs_untraced(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    def failing_backend(*_args: Any, **_kwargs: Any) -> None:
+        raise _BackendBuildFailed
+
+    monkeypatch.setattr(otel_backend, "OtelVoiceTracer", failing_backend)
+    caplog.set_level(logging.DEBUG, logger=TRACING_LOGGER)
+
+    tracer = init_tracing(_env())  # serve calls this at startup: it must not raise
+
+    assert tracer.enabled is False
+    assert current_voice_tracer().enabled is False
+    assert len(_warnings(caplog)) == 1
+
+
+# Runs in a fresh interpreter. It counts every socket connect (urllib3, under
+# the OTLP exporter's requests session, calls socket.socket.connect), drives one
+# turn through a registry so an exporter, if one were built, has a root to send,
+# and shuts tracing down, which flushes. argv[1] == "entry" also imports the
+# serve entry points first.
+_EXPORT_PROBE = textwrap.dedent(
+    """
+    import socket, sys
+    attempts = []
+    real_connect = socket.socket.connect
+    def counting_connect(self, address):
+        attempts.append(address)
+        return real_connect(self, address)
+    socket.socket.connect = counting_connect
+    if sys.argv[1] == "entry":
         import speech_to_speech.s2s_pipeline
         import speech_to_speech.configured_runtime
         import speech_to_speech.LLM.base_openai_compatible_language_model
         import speech_to_speech.api.openai_realtime.websocket_router
-        from speech_to_speech.tracing import voice_turns
-        tracer = voice_turns.init_tracing()
-        voice_turns.shutdown_tracing()
-        loaded = sorted(
-            m for m in sys.modules
-            if m.startswith(("opentelemetry.sdk", "opentelemetry.exporter", "speech_to_speech.tracing.otel_backend"))
-        )
-        print("ENABLED", tracer.enabled)
-        print("LOADED", loaded)
-        print("CONNECTS", len(attempts))
-        """
+    from speech_to_speech.tracing import voice_turns
+    tracer = voice_turns.init_tracing()
+    registry = voice_turns.VoiceTurnTraces()
+    registry.bind_call("0f8e4c2a-6b1d-4e3f-9a7c-5d2b8e1f4a60")
+    registry.ref_for("turn_1", 0, "speech", 1.0, 2.0)
+    voice_turns.shutdown_tracing()
+    loaded = sorted(
+        m for m in sys.modules
+        if m.startswith(("opentelemetry.sdk", "opentelemetry.exporter", "speech_to_speech.tracing.otel_backend"))
     )
+    print("ENABLED", tracer.enabled)
+    print("LOADED", loaded)
+    print("CONNECTS", len(attempts))
+    """
+)
+
+
+def _run_export_probe(mode: str, extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("LANGFUSE_", "OTEL_"))}
-    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=180)
+    env.update(extra_env or {})
+    result = subprocess.run(
+        [sys.executable, "-c", _EXPORT_PROBE, mode], env=env, capture_output=True, text=True, timeout=180
+    )
     assert result.returncode == 0, result.stderr[-2000:]
-    lines = dict(line.split(" ", 1) for line in result.stdout.strip().splitlines() if " " in line)
+    return dict(line.split(" ", 1) for line in result.stdout.strip().splitlines() if " " in line)
+
+
+def test_import_and_init_with_env_unset_load_no_otel_sdk() -> None:
+    lines = _run_export_probe("entry")
     assert lines["ENABLED"] == "False"
     assert lines["LOADED"] == "[]"
     assert lines["CONNECTS"] == "0"
+
+
+class _OtlpSink(BaseHTTPRequestHandler):
+    """Accepts an OTLP/HTTP export on loopback and answers 200; records the path."""
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.paths.append(self.path)  # type: ignore[attr-defined]
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_args: Any) -> None:
+        return None
+
+
+def test_export_probe_counts_the_exporters_connection() -> None:
+    """The probe's connect counter is not vacuous: a configured exporter trips it.
+
+    Loopback only: the sink is this test's own listener and the keys are stand-ins.
+    """
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), _OtlpSink)
+    sink.paths = []  # type: ignore[attr-defined]
+    serving = threading.Thread(target=sink.serve_forever, daemon=True)
+    serving.start()
+    try:
+        host, port = sink.server_address[:2]
+        lines = _run_export_probe(
+            "bare",
+            {
+                "LANGFUSE_PUBLIC_KEY": "pk-stand-in",
+                "LANGFUSE_SECRET_KEY": "sk-stand-in",
+                "LANGFUSE_BASE_URL": f"http://{host!s}:{port}",
+                # Straight to the sink, whatever proxy the shell configures.
+                "NO_PROXY": "*",
+                "no_proxy": "*",
+            },
+        )
+    finally:
+        sink.shutdown()
+        sink.server_close()
+    assert lines["ENABLED"] == "True"
+    assert int(lines["CONNECTS"]) >= 1
+    assert sink.paths == ["/api/public/otel/v1/traces"]  # type: ignore[attr-defined]
 
 
 def _tracker(*, end: float = 100.0, **fields: float) -> TurnLatencyTracker:
@@ -297,6 +380,26 @@ def test_root_window_covers_its_stages() -> None:
     assert stage.end_time - stage.start_time == 2_000_000_000
 
 
+def test_shutdown_exports_an_open_turn_root_exactly_once() -> None:
+    exporter = install_memory_tracer()
+    registry = VoiceTurnTraces()
+    registry.bind_call(CALL)
+    ref = registry.ref_for("turn_1", 0, "speech", 1.0, 2.0)
+    assert ref is not None
+    assert exporter.get_finished_spans() == ()  # the turn's root is still open
+
+    shutdown_tracing()  # SIGTERM mid-call: nothing finalized the registry first
+
+    spans = exporter.get_finished_spans()
+    assert [(s.context.trace_id, s.context.span_id) for s in spans] == [
+        (int.from_bytes(ref.trace_id, "big"), int.from_bytes(ref.root_span_id, "big"))
+    ]
+    assert spans[0].parent is None
+    shutdown_tracing()
+    registry.finalize_all()
+    assert len(exporter.get_finished_spans()) == 1
+
+
 def test_ref_needs_tracing_a_uuid_call_and_a_turn() -> None:
     registry = VoiceTurnTraces()
     registry.bind_call(CALL)
@@ -327,7 +430,10 @@ class _HungExporter(SpanExporter):
 
 
 def test_hung_exporter_never_blocks_turns(caplog: pytest.LogCaptureFixture) -> None:
-    # The BSP logs one "queue full" warning per dropped span; that is expected here.
+    # Dropping spans here is expected. The BSP warns "Queue full" on the emitting
+    # thread when it drops one, and the SDK's DuplicateFilter suppresses repeats
+    # of that record within a 20 s time bucket, so an outage costs about one
+    # warning per 20 s. CRITICAL keeps it out of the test output.
     caplog.set_level(logging.CRITICAL, logger="opentelemetry")
     exporter = _HungExporter()
     processor = BatchSpanProcessor(exporter, max_queue_size=8, schedule_delay_millis=1, max_export_batch_size=4)
@@ -359,6 +465,11 @@ def test_hung_exporter_never_blocks_turns(caplog: pytest.LogCaptureFixture) -> N
         shutdown_tracing(timeout_s=0.2)
         assert time.perf_counter() - shutdown_started < 1.0
         assert current_voice_tracer().enabled is False
+        # The SDK's shutdown is still joining its stuck export thread (for up
+        # to 30 s). Only the daemon flag keeps interpreter exit from waiting.
+        stuck = [t for t in threading.enumerate() if t.name == "voice-tracing-shutdown"]
+        assert stuck
+        assert all(t.daemon for t in stuck)
     finally:
         exporter.release.set()
 
