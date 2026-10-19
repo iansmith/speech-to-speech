@@ -213,6 +213,8 @@ class _TranscriptionRequest:
     operation: HttpTranscriptionOperation | None = None
     cancelled: bool = False
     elapsed_s: float | None = None
+    # When the request returned, on perf_counter: the stt span's end (SOP-805).
+    completed_at_s: float | None = None
 
 
 class OpenAICompatibleSTTHandler(BaseSTTHandler):
@@ -401,8 +403,10 @@ class OpenAICompatibleSTTHandler(BaseSTTHandler):
                 turn_revision=source.turn_revision,
                 speech_stopped_at_s=source.speech_end_at_s,
             )
-        elapsed = perf_counter() - started_at_s
+        completed_at_s = perf_counter()
+        elapsed = completed_at_s - started_at_s
         request.elapsed_s = elapsed
+        request.completed_at_s = completed_at_s
         if self._publish_output(request, output):
             self._times.append(elapsed)
             logger.info(
@@ -453,7 +457,7 @@ class OpenAICompatibleSTTHandler(BaseSTTHandler):
                 store = getattr(self, "turn_latency_store", None)
                 tracker = store.get_or_create_for_turn(output.turn_id, output.turn_revision) if store else None
                 if tracker is not None:
-                    tracker.record_stt(request.elapsed_s)
+                    tracker.record_stt(request.elapsed_s, ended_at_s=request.completed_at_s)
             self.queue_out.put(self.output_for_queue(output, request.source))
             return True
 
