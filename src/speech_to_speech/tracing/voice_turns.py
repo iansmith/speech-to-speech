@@ -219,7 +219,10 @@ class NoopVoiceTracer:
 
 
 _current: VoiceTracer = NoopVoiceTracer()
-_state_lock = threading.Lock()
+# Reentrant: the serve command's SIGTERM handler calls shutdown_tracing on the
+# main thread, which may already be inside it (its own finally) when the
+# signal lands.
+_state_lock = threading.RLock()
 _registries: weakref.WeakSet[VoiceTurnTraces] = weakref.WeakSet()
 
 

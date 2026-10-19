@@ -98,9 +98,11 @@ class TurnLatencyTracker:
 
     Tool follow-ups use separate trackers.
 
-    Each ``record_*`` also notes, on the same perf_counter clock, when the
-    stage it measured ended (``ended_at_s``), so SOP-805's stage spans can be
-    placed in time without a second timer; their durations are these fields.
+    The ``record_*`` methods for the stage fields (VAD decision and settle,
+    STT, LLM, LLM TTFT, TTS TTFA, e2e) also note, on the same perf_counter
+    clock, when the measured stage ended (``ended_at_s``), so SOP-805's stage
+    spans can be placed in time without a second timer; their durations are
+    the fields themselves.
     ``trace`` is the response's place in its turn's voice trace, set when the
     response is bound and only while voice tracing is on.
     """

@@ -559,11 +559,11 @@ class RealtimeService:
 
         Every request of a spoken turn passes through here before it is queued,
         so the ref set on the tracker is what the LLM handler turns into
-        X-Sophie-Turn-Id and traceparent. Requests with no turn (greetings,
-        typed input, out-of-band, which never bind) get no ref and send neither
-        header. A tool follow-up whose origin turn could not be resolved joins
-        the connection's last traced turn: for the trace only, never for
-        speculative gating, which still sees ``turn_id=None``.
+        X-Sophie-Turn-Id and traceparent. A response with no turn (a greeting,
+        typed input) gets no ref and sends neither header; out-of-band responses
+        never reach here. A tool follow-up whose origin turn could not be
+        resolved joins the connection's last traced turn: for the trace only,
+        never for speculative gating, which still sees ``turn_id=None``.
         """
         try:
             st = self._state(conn_id)

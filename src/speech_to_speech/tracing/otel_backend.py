@@ -67,8 +67,9 @@ class _ForcedIdGenerator(RandomIdGenerator):
     calls ``generate_trace_id`` (a span with no valid parent) and then
     ``generate_span_id`` synchronously on the calling thread, so a
     thread-local slot set just before ``start_span`` is read by exactly that
-    span. Pooled units finalize roots from different threads, which is why
-    the slot is thread-local rather than shared.
+    span. Roots are emitted from the realtime event loop and, at shutdown,
+    from the main thread, which is why the slot is thread-local rather than
+    shared.
     """
 
     def __init__(self) -> None:
