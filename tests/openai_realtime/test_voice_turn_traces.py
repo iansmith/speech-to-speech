@@ -25,6 +25,7 @@ from openai.types.realtime import ConversationItemCreateEvent, ResponseCreateEve
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCall
 from opentelemetry.sdk.trace import ReadableSpan
 
+import speech_to_speech.api.openai_realtime.service as service_module
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
@@ -564,6 +565,7 @@ def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     exporter = install_memory_tracer()
     service: RealtimeService = unit.service
     service.speculative_turns.start_turn()
+    wall_before = time.time_ns()
     request = _speak(unit)
     bound_by = time.perf_counter()
     ref = _ref(unit, request)
@@ -574,6 +576,7 @@ def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     offset = service.voice_traces._offset_ns
 
     service.unregister(unit.conn)  # drops the tracker without a terminal
+    wall_after = time.time_ns()
 
     spans = exporter.get_finished_spans()
     assert [(s.context.trace_id, s.context.span_id) for s in spans] == [(_int(ref.trace_id), _int(ref.root_span_id))]
@@ -584,6 +587,10 @@ def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     # where the measured stt stage started and closes at the bind.
     assert root.start_time == round((stt_end - tracker.stt_s) * 1e9) + offset
     assert round(stt_end * 1e9) + offset <= root.end_time <= round(bound_by * 1e9) + offset
+    # Wall-clock time, read without the registry's offset: the root lies in
+    # this test's own window (its stt stage starts 0.12 s before _speak
+    # records it), not near perf_counter's arbitrary zero.
+    assert wall_before - 5_000_000_000 <= root.start_time <= root.end_time <= wall_after
     service.voice_traces.finalize_all()
     assert len(exporter.get_finished_spans()) == 1
 
@@ -667,6 +674,9 @@ def test_stage_spans_match_tracker_and_log_line(
     tracker.record_tts_ttfa(0.15)  # so does each later sentence's first audio
     clock[0] = 102.10
     assert tracker.record_e2e(2.10)
+    clock[0] = 102.30
+    assert not tracker.record_e2e(2.50)  # and each later sentence's first audio; e2e is the first
+    assert tracker.ended_at_s("e2e_s") == 102.10
     clock[0] = 102.60
     tracker.record_llm(1.65)
     ref = _ref(unit, request)
@@ -742,6 +752,9 @@ def test_every_span_has_session_and_no_content(unit: SimpleNamespace) -> None:
     for span in spans:
         assert span.attributes is not None
         assert span.attributes["langfuse.session.id"] == CALL
+        # Langfuse's routing: the proxy's spans of the same turn carry the same two.
+        assert span.attributes["langfuse.environment"] == "test"
+        assert span.attributes["langfuse.trace.name"] == "voice_turn"
         for text in _strings(span):
             assert re.search(r"\+?\d{10,15}", text) is None
             for sentinel in SENTINELS:
@@ -762,7 +775,12 @@ class _ExplodingTracer:
         return None
 
 
+def _warnings_from(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == logger_name and r.levelno >= logging.WARNING]
+
+
 def test_emit_failure_never_reaches_pipeline(unit: SimpleNamespace, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger=voice_turns.__name__)
     voice_turns.install(_ExplodingTracer())
     service: RealtimeService = unit.service
     service.speculative_turns.start_turn()
@@ -779,6 +797,30 @@ def test_emit_failure_never_reaches_pipeline(unit: SimpleNamespace, caplog: pyte
     second = _speak(unit, turn_id="turn_2")  # closes turn_1: its root export raises
     assert service.turn_latency_store.get_response(second.response_key) is not None
     service.unregister(unit.conn)  # closes turn_2 the same way
+    # Three failed exports on the event loop, one WARNING for the unit.
+    assert len(_warnings_from(caplog, voice_turns.__name__)) == 1
+
+
+def test_bind_failure_logs_once_and_the_request_still_goes(
+    unit: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def failing_stage_intervals(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("stage read exploded")
+
+    install_memory_tracer()
+    monkeypatch.setattr(service_module, "build_stage_intervals", failing_stage_intervals)
+    caplog.set_level(logging.WARNING, logger=service_module.__name__)
+    service: RealtimeService = unit.service
+    requests = []
+    for turn_id in ("turn_1", "turn_2"):
+        service.speculative_turns.start_turn()
+        requests.append(_speak(unit, turn_id=turn_id))  # each bind raises inside _bind_turn_trace
+
+    for request in requests:
+        tracker = service.turn_latency_store.get_response(request.response_key)
+        assert tracker is not None and tracker.trace is None
+        assert _send(unit, request) == {CLIENT_SESSION_HEADER: CALL}
+    assert len(_warnings_from(caplog, service_module.__name__)) == 1
 
 
 def test_tts_requests_get_no_trace_headers(unit: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
