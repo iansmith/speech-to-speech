@@ -109,7 +109,8 @@ def validate_endpoint_base(raw: str) -> str | None:
 
 
 def _environment(raw: str | None) -> str:
-    value = (raw or "").strip()
+    # Untrimmed, as Sophie's ResolveEnvironment: " demo" is invalid there too.
+    value = raw or ""
     if not value:
         return DEFAULT_ENVIRONMENT
     if _ENVIRONMENT_RE.fullmatch(value) and not value.startswith("langfuse"):
