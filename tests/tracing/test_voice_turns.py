@@ -108,6 +108,7 @@ OFF_CASES = [
     pytest.param(_env(base="https://"), 1, id="hostless"),
     pytest.param(_env(base="ftp://langfuse.example.com"), 1, id="wrong-scheme"),
     pytest.param(_env(base="langfuse.example.com"), 1, id="no-scheme"),
+    pytest.param(_env(base="https://langfuse.example.com:notaport"), 1, id="bad-port"),
 ]
 
 
@@ -160,11 +161,19 @@ def test_valid_env_builds_langfuse_http_exporter(
     assert built["timeout"] == 5.0
     assert isinstance(tracer, OtelVoiceTracer)
     assert isinstance(tracer.processor, BatchSpanProcessor)
+    # The production queue's bounds: a stalled Langfuse drops spans past 2048
+    # rather than growing the queue turn after turn.
+    batch = tracer.processor._batch_processor
+    assert batch._queue.maxlen == 2048
+    assert batch._max_export_batch_size == 256
+    assert batch._schedule_delay_millis == 1000
     # shutdown_on_exit=False: no atexit hook that could stall a systemd stop.
     assert tracer.provider._atexit_handler is None
     attributes = dict(tracer.provider.resource.attributes)
     assert attributes["service.name"] == "speech-to-speech"
     assert attributes["deployment.environment"] == "demo"
+    assert attributes["deployment.environment.name"] == "demo"
+    assert attributes["langfuse.environment"] == "demo"
     assert "leaked.attr" not in attributes
 
 
@@ -369,15 +378,36 @@ def test_root_window_covers_its_stages() -> None:
     registry.bind_call(CALL)
     ref = registry.ref_for("turn_1", 0, "speech", 10.0, 10.5)
     assert ref is not None
-    registry.record_response(ref, _tracker(e2e_s=2.0, end=12.0), "completed")
+    # The stage runs 9.5 to 12.0, outside the bind's window on both sides.
+    registry.record_response(ref, _tracker(e2e_s=2.5, end=12.0), "completed")
     registry.finalize_all()
     (root,) = roots(exporter.get_finished_spans())
     (stage,) = children(exporter.get_finished_spans())
     assert root.start_time is not None and root.end_time is not None
     assert stage.start_time is not None and stage.end_time is not None
-    assert root.start_time <= stage.start_time
-    assert root.end_time >= stage.end_time
-    assert stage.end_time - stage.start_time == 2_000_000_000
+    assert root.start_time == stage.start_time
+    assert root.end_time == stage.end_time
+    assert stage.end_time - stage.start_time == 2_500_000_000
+
+
+def test_exported_keys_are_capped_oldest_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    exporter = install_memory_tracer()
+    monkeypatch.setattr(VoiceTurnTraces, "EXPORTED_CAP", 2)
+    registry = VoiceTurnTraces()
+    registry.bind_call(CALL)
+    for n in range(1, 5):
+        assert registry.ref_for(f"turn_{n}", 0, "speech", float(n), float(n) + 0.5) is not None
+    assert len(roots(exporter.get_finished_spans())) == 3  # turn_1..turn_3 out, turn_4 open
+    assert len(registry._exported) == 2
+
+    # A late follow-up of the newest exported turn neither reopens its root nor
+    # closes turn_4's.
+    assert registry.ref_for("turn_3", 0, "tool", 5.0, 6.0) is not None
+    assert len(roots(exporter.get_finished_spans())) == 3
+    registry.finalize_all()
+    exported = roots(exporter.get_finished_spans())
+    assert len(exported) == 4
+    assert len({span.context.span_id for span in exported}) == 4
 
 
 def test_shutdown_exports_an_open_turn_root_exactly_once() -> None:
@@ -398,6 +428,53 @@ def test_shutdown_exports_an_open_turn_root_exactly_once() -> None:
     shutdown_tracing()
     registry.finalize_all()
     assert len(exporter.get_finished_spans()) == 1
+
+
+class _HungOtlpExporter(SpanExporter):
+    """Replaces OTLPSpanExporter inside the production batch processor: every export hangs."""
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def __init__(self, **_kwargs: Any) -> None:
+        return None
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        type(self).entered.set()
+        type(self).release.wait()
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_default_shutdown_bound_with_the_production_processor(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The entry points call shutdown_tracing() with no argument: a hung Langfuse costs 3 s, not the SDK's 30."""
+    caplog.set_level(logging.CRITICAL, logger="opentelemetry")
+    _HungOtlpExporter.entered = threading.Event()
+    _HungOtlpExporter.release = threading.Event()
+    monkeypatch.setattr(otel_backend, "OTLPSpanExporter", _HungOtlpExporter)
+    tracer = init_tracing(_env())
+    assert isinstance(tracer, OtelVoiceTracer)
+    threads_before = set(threading.enumerate())
+    try:
+        registry = VoiceTurnTraces()
+        registry.bind_call(CALL)
+        assert registry.ref_for("turn_1", 0, "speech", 1.0, 2.0) is not None
+
+        started = time.perf_counter()
+        shutdown_tracing()
+        elapsed = time.perf_counter() - started
+
+        assert _HungOtlpExporter.entered.is_set()
+        assert 2.5 <= elapsed < 4.5
+        stuck = [t for t in threading.enumerate() if t.name == "voice-tracing-shutdown" and t not in threads_before]
+        assert stuck
+        assert all(t.is_alive() for t in stuck)
+    finally:
+        _HungOtlpExporter.release.set()
 
 
 def test_ref_needs_tracing_a_uuid_call_and_a_turn() -> None:
