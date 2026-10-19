@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator
 from queue import Queue
 from threading import Event
@@ -422,6 +423,14 @@ def test_tool_followup_and_reopen_share_turn_trace(unit: SimpleNamespace, follow
     assert len(span_ids) == len(set(span_ids))
     assert {span.context.trace_id for span in spans} == {_int(voice_turn_trace_id(CALL, wire_id))}
     assert {span.attributes["s2s.source"] for span in children(spans) if span.attributes} >= {"speech", "tool"}
+    # Each stage carries its response's terminal status: the barged-in rev 0's are cancelled.
+    stage_status = set()
+    for span in children(spans):
+        assert span.attributes is not None
+        stage_status.add(
+            (span.attributes["s2s.turn_revision"], span.attributes["s2s.source"], span.attributes["s2s.status"])
+        )
+    assert stage_status == {(0, "speech", "cancelled"), (1, "speech", "completed"), (1, "tool", "completed")}
 
 
 def test_tool_followup_with_unknown_origin_uses_last_traced_turn(unit: SimpleNamespace) -> None:
@@ -553,16 +562,60 @@ def test_late_finalize_after_call_change_stays_on_original_call(unit: SimpleName
 
 def test_root_exported_for_discarded_response(unit: SimpleNamespace) -> None:
     exporter = install_memory_tracer()
-    unit.service.speculative_turns.start_turn()
-    ref = _ref(unit, _speak(unit))
+    service: RealtimeService = unit.service
+    service.speculative_turns.start_turn()
+    request = _speak(unit)
+    bound_by = time.perf_counter()
+    ref = _ref(unit, request)
+    tracker = service.turn_latency_store.get_response(request.response_key)
+    assert tracker is not None and tracker.stt_s is not None
+    stt_end = tracker.ended_at_s("stt_s")
+    assert stt_end is not None
+    offset = service.voice_traces._offset_ns
 
-    unit.service.unregister(unit.conn)  # drops the tracker without a terminal
+    service.unregister(unit.conn)  # drops the tracker without a terminal
 
     spans = exporter.get_finished_spans()
     assert [(s.context.trace_id, s.context.span_id) for s in spans] == [(_int(ref.trace_id), _int(ref.root_span_id))]
-    assert spans[0].parent is None
-    unit.service.voice_traces.finalize_all()
+    (root,) = spans
+    assert root.parent is None
+    assert root.start_time is not None and root.end_time is not None
+    # With no terminal to widen it, the bind alone sets the window: it opens
+    # where the measured stt stage started and closes at the bind.
+    assert root.start_time == round((stt_end - tracker.stt_s) * 1e9) + offset
+    assert round(stt_end * 1e9) + offset <= root.end_time <= round(bound_by * 1e9) + offset
+    service.voice_traces.finalize_all()
     assert len(exporter.get_finished_spans()) == 1
+
+
+def test_root_window_spans_every_bind_of_its_turn(unit: SimpleNamespace) -> None:
+    exporter = install_memory_tracer()
+    service: RealtimeService = unit.service
+    turns = service.speculative_turns
+    turns.start_turn()
+    first = _speak(unit)
+    first_ref = _ref(unit, first)
+    first_tracker = service.turn_latency_store.get_response(first.response_key)
+    assert first_tracker is not None and first_tracker.stt_s is not None
+    first_stt_end = first_tracker.ended_at_s("stt_s")
+    assert first_stt_end is not None
+    revision = reopen(turns)
+    second = _speak(unit, revision=revision, reopened=True)  # bound after rev 0's bind
+    assert _ref(unit, second).wire_turn_id == first_ref.wire_turn_id
+    second_tracker = service.turn_latency_store.get_response(second.response_key)
+    assert second_tracker is not None
+    second_stt_end = second_tracker.ended_at_s("stt_s")
+    assert second_stt_end is not None
+    offset = service.voice_traces._offset_ns
+
+    service.unregister(unit.conn)  # rev 1 never reaches a terminal
+
+    (root,) = roots(exporter.get_finished_spans())
+    assert root.context.span_id == _int(first_ref.root_span_id)
+    assert root.start_time is not None and root.end_time is not None
+    assert root.start_time == round((first_stt_end - first_tracker.stt_s) * 1e9) + offset
+    # Rev 1's bind widened the open root past rev 1's STT, which ended after rev 0's bind.
+    assert root.end_time >= round(second_stt_end * 1e9) + offset
 
 
 # ── DoD 5/6/7: what is exported ─────────────────────────────────────────────
@@ -606,8 +659,12 @@ def test_stage_spans_match_tracker_and_log_line(
     assert tracker is not None
     clock[0] = 101.40
     tracker.record_llm_ttft(0.45)
+    clock[0] = 101.65
+    tracker.record_llm_ttft(0.70)  # every later text delta reports too; TTFT is the first
     clock[0] = 101.90
     tracker.record_tts_ttfa(0.37)
+    clock[0] = 102.05
+    tracker.record_tts_ttfa(0.15)  # so does each later sentence's first audio
     clock[0] = 102.10
     assert tracker.record_e2e(2.10)
     clock[0] = 102.60
@@ -643,8 +700,12 @@ def test_stage_spans_match_tracker_and_log_line(
         ("vad", "vad_decision"),
     ):
         assert f"{_duration_ns(stages[name]) / 1e9:.2f}" == printed[key]
-    # Placement is measured: each stage ends where the tracker recorded it.
-    assert _duration_ns(stages["llm.ttft"]) == round(0.45 * 1e9)
+    # Placement is measured: each stage ends where the tracker recorded it,
+    # TTFT and TTFA at the first token and the first audio.
+    offset = service.voice_traces._offset_ns
+    ends = {"vad": 100.31, "stt": 100.95, "llm.ttft": 101.40, "tts.ttfa": 101.90, "e2e": 102.10, "llm": 102.60}
+    for name, end_s in ends.items():
+        assert stages[name].end_time == round(end_s * 1e9) + offset
     assert stages["vad"].attributes is not None
     assert stages["vad"].attributes["s2s.vad_settle_s"] == pytest.approx(0.21)
     end_gap = stages["e2e"].end_time - stages["tts.ttfa"].end_time  # type: ignore[operator]

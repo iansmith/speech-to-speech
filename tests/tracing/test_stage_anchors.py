@@ -11,17 +11,22 @@ import json
 import time
 from queue import Queue
 from threading import Event
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
+import speech_to_speech.VAD.vad_handler as vad_module
 from speech_to_speech.pipeline import turn_latency
 from speech_to_speech.pipeline.messages import Transcription, VADAudio
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.turn_latency import TurnLatencyStore
 from speech_to_speech.STT import openai_compatible_handler as stt_module
 from speech_to_speech.STT import streaming_handler
+from speech_to_speech.tracing.voice_turns import build_stage_intervals
+from tests.test_speculative_turns import _audio_bytes, _StaticVADIterator, _vad_handler_for_iterator
 from tests.test_streaming_stt_handler import (
     DIALECT_CASES,
     _ack_session_update,
@@ -120,3 +125,34 @@ def test_streaming_stt_anchor_is_the_provider_final_not_consumption(
     assert tracker is not None
     assert tracker.stt_s == pytest.approx(0.125)
     assert tracker.ended_at_s("stt_s") == pytest.approx(100.125)
+
+
+def test_vad_decision_anchor_is_the_decision_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VADHandler is the only writer of vad_decision_s, and only its anchor makes a vad span.
+
+    Same clock as test_vad_decision_reaches_terminal_response_metadata: the
+    final chunk is received at 10.0 s and the decision taken at 10.04 s, with
+    speech ending one 512-sample chunk (0.032 s) before receipt.
+    """
+    iterator = _StaticVADIterator(
+        triggered=False,
+        vad_output=[torch.zeros(512) for _ in range(31)],
+        last_utterance_active_speech_samples=12 * 512,
+    )
+    iterator.last_speech_end_sample = 0
+    vad = _vad_handler_for_iterator(iterator)
+    store = TurnLatencyStore()
+    vad.turn_latency_store = store
+    clock = iter([10.0, 10.04, 10.04, 10.07])
+    monkeypatch.setattr(vad_module, "time", SimpleNamespace(time=lambda: 100.0, perf_counter=lambda: next(clock)))
+
+    assert len(list(vad.process(_audio_bytes()))) == 1
+
+    tracker = store.pending_for_turn("turn_1", 0)
+    assert tracker is not None
+    assert tracker.vad_decision_s == pytest.approx(0.072)
+    assert tracker.ended_at_s("vad_decision_s") == 10.04
+    (stage,) = build_stage_intervals(tracker)
+    assert stage.name == "vad"
+    assert stage.end_perf_s == 10.04
+    assert stage.duration_s == pytest.approx(0.072)
