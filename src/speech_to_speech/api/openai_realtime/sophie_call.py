@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 CLIENT_SESSION_HEADER = "X-Client-Session-Id"
+TURN_ID_HEADER = "X-Sophie-Turn-Id"
+TRACEPARENT_HEADER = "traceparent"
 
 
 def client_session_id(raw: dict[str, Any]) -> str | None:

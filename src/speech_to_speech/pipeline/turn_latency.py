@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Literal
+from time import perf_counter  # noqa: F401 (RED stub)
+from typing import Any, Literal
 
 TurnLatencyStatus = Literal["completed", "cancelled", "failed", "incomplete"]
 TURN_LATENCY_METADATA_KEY = "speech_to_speech.turn_latency"
@@ -117,6 +118,11 @@ class TurnLatencyTracker:
     mlx_lock_waits: dict[str, MLXLockStat] = field(default_factory=dict)
     mlx_lock_holds: dict[str, MLXLockStat] = field(default_factory=dict)
     status: TurnLatencyStatus = "completed"
+    trace: Any = field(default=None, repr=False, compare=False)
+    _ended_at_s: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
+
+    def record_vad_decision(self, seconds: float, *, ended_at_s: float | None = None) -> None:
+        self.vad_decision_s = max(0.0, seconds)
 
     def record_stt(self, seconds: float) -> None:
         self.stt_s = max(0.0, seconds)

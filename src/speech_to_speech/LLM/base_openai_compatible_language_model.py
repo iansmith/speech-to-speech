@@ -6,6 +6,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
+from contextvars import ContextVar
 from queue import Empty, Full, Queue
 from threading import BoundedSemaphore, Lock, Thread, current_thread
 from threading import Event as ThreadingEvent
@@ -64,6 +65,8 @@ from speech_to_speech.pipeline.transcript_logging import log_exception, transcri
 from speech_to_speech.utils.utils import audio_to_wav_base64, is_out_of_band, response_wants_audio
 
 logger = logging.getLogger(__name__)
+
+_REQUEST_TURN_TRACE: ContextVar[Any] = ContextVar("sophie_request_turn_trace", default=None)
 
 # About 18–24 seconds of default SDK backoff before warmup fails.
 WARMUP_MAX_RETRIES = 6

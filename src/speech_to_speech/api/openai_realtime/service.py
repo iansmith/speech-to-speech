@@ -68,6 +68,7 @@ from speech_to_speech.api.openai_realtime.input_state import (
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.visemes import SpeechToSpeechVisemesEvent
 from speech_to_speech.LLM.chat import Chat, make_user_audio_message, make_user_message
+from speech_to_speech.tracing.voice_turns import VoiceTurnTraces
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -447,6 +448,7 @@ class RealtimeService:
         self.stt_auto_reset_supported: bool = True
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
+        self.voice_traces = VoiceTurnTraces()
 
         self.history = HistoryHandler(self)
         self.audio = AudioHandler(self)
@@ -484,6 +486,9 @@ class RealtimeService:
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
+
+    def set_sophie_call_id(self, call_id: str | None) -> None:
+        return None
 
     def unregister(self, conn_id: str) -> None:
         self.history.close_session(conn_id)
