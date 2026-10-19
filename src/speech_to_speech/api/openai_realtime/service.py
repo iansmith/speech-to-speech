@@ -87,7 +87,8 @@ from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker, TurnGateAction, TurnPhase
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
-from speech_to_speech.pipeline.turn_latency import SpeechLatencyAnchor, TurnLatencyStore
+from speech_to_speech.pipeline.turn_latency import SpeechLatencyAnchor, TurnLatencyStore, TurnLatencyTracker
+from speech_to_speech.tracing.voice_turns import VoiceTurnTraces, build_stage_intervals
 from speech_to_speech.utils.utils import _generate_id, audio_to_wav_base64
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,9 @@ class ConnState(BaseModel):
     input_turn_by_item_id: dict[str, InputTurnReference] = Field(default_factory=dict)
     input_turn_by_call_id: dict[str, InputTurnReference] = Field(default_factory=dict)
     speech_latency_anchors: dict[tuple[str, int | None], SpeechLatencyAnchor] = Field(default_factory=dict)
+    # The last turn bound with a voice-trace ref (SOP-805): where a tool
+    # follow-up of unresolved origin is traced. Never used for gating.
+    last_voice_turn: tuple[str, int | None] | None = None
     response_tool_inputs: dict[str, set[str]] = Field(default_factory=dict)
     # Recent acknowledgements outlive history trimming, with bounded retention.
     answered_tool_call_ids: dict[str, None] = Field(default_factory=dict)
@@ -447,6 +451,9 @@ class RealtimeService:
         self.stt_auto_reset_supported: bool = True
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
+        # Per-turn voice traces for whichever Sophie call claims this unit (SOP-805).
+        self.voice_traces = VoiceTurnTraces()
+        self._turn_trace_failure_logged = False
 
         self.history = HistoryHandler(self)
         self.audio = AudioHandler(self)
@@ -485,6 +492,10 @@ class RealtimeService:
         self.total_usage.connections += 1
         return state.session_id
 
+    def set_sophie_call_id(self, call_id: str | None) -> None:
+        """Follow the unit's Sophie call id for voice traces (SOP-805); empty clears it."""
+        self.voice_traces.bind_call(call_id)
+
     def unregister(self, conn_id: str) -> None:
         self.history.close_session(conn_id)
         st = self._conns.pop(conn_id, None)
@@ -498,6 +509,9 @@ class RealtimeService:
                 st.response_usage.output_tokens += output_tokens
             self.total_usage += st.response_usage
             self.turn_latency_store.clear_session(conn_id)
+            # A turn whose responses were dropped above still exports its root,
+            # so a traceparent Sophie already received names a span that exists.
+            self.voice_traces.finalize_all()
             logger.info(
                 "Session %s unregistered — cumulative: input_tokens=%d, output_tokens=%d, audio=%.2fs",
                 conn_id,
@@ -531,6 +545,56 @@ class RealtimeService:
         tracker.speech_anchor = speech_anchor
         if speech_anchor is not None:
             speech_anchor.requested = True
+        self._bind_turn_trace(conn_id, tracker, turn_id, turn_revision, source)
+
+    def _bind_turn_trace(
+        self,
+        conn_id: str,
+        tracker: TurnLatencyTracker,
+        turn_id: str | None,
+        turn_revision: int | None,
+        source: Literal["speech", "client", "tool"],
+    ) -> None:
+        """Give a response its place in its turn's voice trace (SOP-805), if traced.
+
+        Every request of a spoken turn passes through here before it is queued,
+        so the ref set on the tracker is what the LLM handler turns into
+        X-Sophie-Turn-Id and traceparent. A response with no turn (a greeting,
+        typed input) gets no ref and sends neither header; out-of-band responses
+        never reach here. A tool follow-up whose origin turn could not be
+        resolved joins the connection's last traced turn: for the trace only,
+        never for speculative gating, which still sees ``turn_id=None``.
+        """
+        try:
+            st = self._state(conn_id)
+            trace_turn, trace_revision = turn_id, turn_revision
+            if trace_turn is None and source == "tool" and st.last_voice_turn is not None:
+                trace_turn, trace_revision = st.last_voice_turn
+            now = time.perf_counter()
+            # The root opens at the earliest start of the stages measured so
+            # far (VAD's starts at the caller's speech end), placed by the
+            # stage spans' own rule (StageInterval.start_ns), so a root whose
+            # response never reaches a terminal still covers them. With no
+            # measured stage it opens now.
+            turns = self.speculative_turns
+            ref = self.voice_traces.ref_for(
+                trace_turn,
+                trace_revision,
+                source,
+                now,
+                now,
+                reset_count=turns.reset_count if turns is not None else 0,
+                stages=build_stage_intervals(tracker),
+            )
+            if ref is None:
+                return
+            tracker.trace = ref
+            if turn_id is not None:
+                st.last_voice_turn = (turn_id, turn_revision)
+        except Exception as exc:
+            if not self._turn_trace_failure_logged:
+                self._turn_trace_failure_logged = True
+                logger.warning("Voice tracing: binding a response failed (%s)", type(exc).__name__)
 
     # ── Client event parsing ─────────────────────
 

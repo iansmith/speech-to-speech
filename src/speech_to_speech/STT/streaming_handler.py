@@ -1058,7 +1058,9 @@ class StatefulStreamingSTTHandler(BaseSTTHandler):
             store = getattr(self, "turn_latency_store", None)
             tracker = store.get_or_create_for_turn(vad_audio.turn_id, vad_audio.turn_revision) if store else None
             if tracker is not None:
-                tracker.record_stt(commit.completed_at_s - commit.boundary_queued_at_s)
+                tracker.record_stt(
+                    commit.completed_at_s - commit.boundary_queued_at_s, ended_at_s=commit.completed_at_s
+                )
         yield Transcription(
             text=commit.result or "",
             language_code=commit.language,

@@ -70,6 +70,7 @@ class SpeculativeTurnTracker:
     def __init__(self) -> None:
         self._condition = Condition()
         self._sequence = 0
+        self._reset_count = 0
         self._current: _TurnReference | None = None
         self._committed: set[_TurnReference] = set()
         self._closed_current: _TurnReference | None = None
@@ -474,9 +475,16 @@ class SpeculativeTurnTracker:
         grace = self._reopen_grace
         return grace is not None and grace.turn_id == turn_id and grace.revision == revision
 
+    @property
+    def reset_count(self) -> int:
+        """How many times reset() has restarted turn_N (SOP-805 re-mints its wire epoch)."""
+        with self._condition:
+            return self._reset_count
+
     def reset(self) -> None:
         with self._condition:
             self._sequence = 0
+            self._reset_count += 1
             self._current = None
             self._phase = None
             self._last_final_audio_ms = None

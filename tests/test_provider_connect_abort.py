@@ -44,6 +44,13 @@ def stalling_provider():
 
 
 @pytest.fixture
+def stalling_provider_after_headers():
+    server = StallingProvider(stall_after_headers=True)
+    yield server
+    server.close()
+
+
+@pytest.fixture
 def keepalive_provider():
     server = KeepAliveProvider()
     yield server
@@ -680,3 +687,86 @@ def test_a_finished_operation_releases_its_stream():
     assert outcome.socket_torn_down is False
     with pytest.raises(ProviderRequestAborted):
         stream.read(1)  # the arm is what stops it now
+
+
+def test_cancel_scope_abort_unchanged_with_turn_headers(monkeypatch, stalling_provider_after_headers):
+    """SOP-805 guard: the per-turn headers ride inside SOP-538's abort window.
+
+    The turn headers are computed inside make_request, after the aborter's
+    begin() and before the SDK call. This drives the demo1 backend
+    (Chat Completions, streaming) through the real OpenAI SDK against a real
+    socket that stalls mid-body, with a voice tracer installed and a traced
+    turn bound, and checks both halves: the request on the wire carries the
+    turn headers, and a barge-in still tears the parked read down at once.
+    """
+    from queue import Queue
+    from threading import Event
+
+    import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
+    from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+    from speech_to_speech.api.openai_realtime.service import RealtimeService
+    from speech_to_speech.LLM.chat import make_user_message
+    from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+    from speech_to_speech.pipeline.cancel_scope import CancelScope
+    from speech_to_speech.pipeline.messages import EndOfResponse, GenerateResponseRequest
+    from tests.tracing.memory import install_memory_tracer
+
+    class _WarmupOnly:
+        def __init__(self, *_args, **_kwargs):
+            self.chat = self
+            self.completions = self
+
+        def with_options(self, **_kwargs):
+            return self
+
+        def create(self, **_kwargs):
+            return None
+
+    install_memory_tracer()
+    call = "0f8e4c2a-6b1d-4e3f-9a7c-5d2b8e1f4a60"
+    monkeypatch.setattr(base_mod, "OpenAI", _WarmupOnly)
+    cancel_scope = CancelScope()
+    handler = ChatCompletionsApiModelHandler(
+        Event(),
+        Queue(),
+        Queue(),
+        setup_kwargs=dict(model_name="m", base_url="http://127.0.0.1:9/v1", api_key="k", stream=True),
+    )
+    handler.cancel_scope = cancel_scope
+    sent_headers: list[httpx.Headers] = []
+    http_client = httpx.Client(event_hooks={"request": [lambda request: sent_headers.append(request.headers)]})
+    handler._use_provider_client(
+        OpenAI(
+            api_key="none",
+            base_url=f"http://127.0.0.1:{stalling_provider_after_headers.port}/v1",
+            http_client=http_client,
+        )
+    )
+    service = RealtimeService()
+    handler.turn_latency_store = service.turn_latency_store
+    service.set_sophie_call_id(call)
+    handler.set_sophie_call_id(call)
+    conn = service.register()
+    runtime_config = RuntimeConfig()
+    runtime_config.chat.add_item(make_user_message("Hello"))
+    request = GenerateResponseRequest(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
+    service.bind_response_latency_tracker(conn, request.response_key, turn_id="turn_1", turn_revision=0)
+
+    outputs: list[object] = []
+    worker = threading.Thread(target=lambda: outputs.extend(handler.process(request)), daemon=True)
+    worker.start()
+    assert stalling_provider_after_headers.request_received.wait(5.0)
+    time.sleep(0.3)  # let the read park inside the stalled body
+    started = time.monotonic()
+    cancel_scope.cancel()  # the barge-in
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 2.0
+    ends = [o for o in outputs if isinstance(o, EndOfResponse)]
+    assert ends and all(e.error is None for e in ends)
+    (headers,) = sent_headers
+    assert headers["x-client-session-id"] == call
+    assert headers["x-sophie-turn-id"].startswith("turn_1_")
+    assert headers["traceparent"].startswith("00-")
+    service.unregister(conn)

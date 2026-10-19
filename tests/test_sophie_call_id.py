@@ -9,9 +9,13 @@ from typing import Any
 
 import pytest
 
+from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.sophie_call import (
     CLIENT_SESSION_HEADER,
+    TRACEPARENT_HEADER,
+    TURN_ID_HEADER,
     client_session_id,
+    set_sophie_call_id,
 )
 from speech_to_speech.api.openai_realtime.websocket_router import (
     _dispatch_client_event,
@@ -36,6 +40,14 @@ def test_client_session_header_pins_the_wire_name() -> None:
     # realtime.XClientSessionID, AATK-140). A rename on one side alone drops
     # every voice call's spliced context, so the string is pinned, not derived.
     assert CLIENT_SESSION_HEADER == "X-Client-Session-Id"
+
+
+def test_turn_trace_headers_pin_the_wire_names() -> None:
+    # SOP-838: Sophie's proxy reads tracing.TurnIDHeader and the W3C
+    # traceparent by these exact names (iansmith/sophie#589). A rename here
+    # alone silently drops every voice turn to the per-request fallback.
+    assert TURN_ID_HEADER == "X-Sophie-Turn-Id"
+    assert TRACEPARENT_HEADER == "traceparent"
 
 
 def test_session_update_carries_the_client_id() -> None:
@@ -188,3 +200,35 @@ async def test_dispatch_stores_the_id_from_the_raw_event() -> None:
     }
     await _dispatch_client_event(unit, "srv", raw, _Transport())
     assert handler.sophie_call_headers() == {CLIENT_SESSION_HEADER: "from-wire"}
+
+
+def test_claim_release_clears_the_service_turn_traces() -> None:
+    """SOP-805: the per-call trace binding joins SOP-625's claim/release clear."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from speech_to_speech.tracing import voice_turns
+    from speech_to_speech.tracing.otel_backend import OtelVoiceTracer
+    from tests.tracing.memory import STAND_IN_CONFIG
+
+    exporter = InMemorySpanExporter()
+    voice_turns.install(OtelVoiceTracer(STAND_IN_CONFIG, processor=SimpleSpanProcessor(exporter)))
+    call = "0f8e4c2a-6b1d-4e3f-9a7c-5d2b8e1f4a60"
+    service = RealtimeService()
+    unit = SimpleNamespace(index=0, handlers=[_handler()], service=service, session=None)
+    set_sophie_call_id(unit, call)
+    conn = service.register()
+    service.bind_response_latency_tracker(conn, "r1", turn_id="turn_1", turn_revision=0)
+    assert service.voice_traces.ref_for("turn_1", 0, "speech", 0.0, 0.0) is not None
+
+    session = SimpleNamespace(drained=asyncio.Event(), quarantined_at=None)
+    session.drained.set()
+    asyncio.run(_release_unit_after_drain(unit, session, conn))
+
+    assert service.voice_traces.ref_for("turn_1", 0, "speech", 0.0, 0.0) is None
+    assert len(exporter.get_finished_spans()) == 1  # the open turn root, exactly once
+
+    set_sophie_call_id(unit, call)
+    assert claim_idle_unit([unit], None) is unit
+    assert service.voice_traces.ref_for("turn_1", 0, "speech", 0.0, 0.0) is None
+    assert len(exporter.get_finished_spans()) == 1

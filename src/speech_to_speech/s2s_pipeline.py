@@ -54,6 +54,7 @@ from speech_to_speech.pipeline.transcript_logging import (
 )
 from speech_to_speech.pipeline.turn_latency import TurnLatencyStore
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
+from speech_to_speech.tracing.voice_turns import init_tracing, shutdown_tracing
 from speech_to_speech.utils.thread_manager import ThreadManager
 from speech_to_speech.utils.utils import resolve_device
 from speech_to_speech.VAD.vad_handler import VADHandler
@@ -781,6 +782,8 @@ def run_pipeline_command(command: Literal["serve", "local"], argv: Sequence[str]
     args = parse_arguments(argv, command=command)
 
     setup_logger(args.module_kwargs.log_level)
+    # SOP-805: per-turn voice traces, on only when LANGFUSE_* configures them.
+    init_tracing()
     # Set the transcript gate and warn before any conversation is processed, so an operator
     # sees the notice ahead of the first turn rather than after content is already logged.
     set_log_transcripts(args.module_kwargs.log_transcripts)
@@ -816,6 +819,7 @@ def run_pipeline_command(command: Literal["serve", "local"], argv: Sequence[str]
             shutdown_requested[0] = True
             console.print("\n[yellow]Shutting down gracefully...[/yellow]")
             pipeline_manager.stop()
+            shutdown_tracing()
             console.print("[green]✓ Pipeline stopped successfully[/green]")
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -829,6 +833,9 @@ def run_pipeline_command(command: Literal["serve", "local"], argv: Sequence[str]
             console.print("\n[yellow]Shutting down gracefully...[/yellow]")
             pipeline_manager.stop()
             console.print("[green]✓ Pipeline stopped successfully[/green]")
+    finally:
+        # Bounded and idempotent: exports open turn roots, then flushes.
+        shutdown_tracing()
 
 
 def main() -> None:

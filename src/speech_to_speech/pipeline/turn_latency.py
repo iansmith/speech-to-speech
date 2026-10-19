@@ -6,7 +6,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Literal
+from time import perf_counter
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from speech_to_speech.tracing.voice_turns import TurnTraceRef
 
 TurnLatencyStatus = Literal["completed", "cancelled", "failed", "incomplete"]
 TURN_LATENCY_METADATA_KEY = "speech_to_speech.turn_latency"
@@ -93,6 +97,16 @@ class TurnLatencyTracker:
     truncated: a cancellation landing just after the last chunk is marked too.
 
     Tool follow-ups use separate trackers.
+
+    The ``record_*`` methods for the stage fields (VAD decision, STT, LLM,
+    LLM TTFT, TTS TTFA, e2e) also note, on the same perf_counter clock, when
+    the measured stage ended (``ended_at_s``), so SOP-805's stage spans can be
+    placed in time without a second timer; their durations are the fields
+    themselves. A caller that measured the end apart from the call passes it
+    (VAD's decision; the OpenAI-compatible and streaming STT handlers);
+    otherwise the stamp is the time of the call.
+    ``trace`` is the response's place in its turn's voice trace, set when the
+    response is bound and only while voice tracing is on.
     """
 
     turn_id: str | None = None
@@ -117,12 +131,27 @@ class TurnLatencyTracker:
     mlx_lock_waits: dict[str, MLXLockStat] = field(default_factory=dict)
     mlx_lock_holds: dict[str, MLXLockStat] = field(default_factory=dict)
     status: TurnLatencyStatus = "completed"
+    trace: TurnTraceRef | None = field(default=None, repr=False, compare=False)
+    _ended_at_s: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
 
-    def record_stt(self, seconds: float) -> None:
+    def _stamp(self, field_name: str, ended_at_s: float | None = None) -> None:
+        self._ended_at_s[field_name] = perf_counter() if ended_at_s is None else ended_at_s
+
+    def ended_at_s(self, field_name: str) -> float | None:
+        """When the stage behind *field_name* ended, on perf_counter, if recorded."""
+        return self._ended_at_s.get(field_name)
+
+    def record_vad_decision(self, seconds: float, *, ended_at_s: float | None = None) -> None:
+        self.vad_decision_s = max(0.0, seconds)
+        self._stamp("vad_decision_s", ended_at_s)
+
+    def record_stt(self, seconds: float, *, ended_at_s: float | None = None) -> None:
         self.stt_s = max(0.0, seconds)
+        self._stamp("stt_s", ended_at_s)
 
     def record_llm(self, seconds: float) -> None:
         self.llm_s = max(0.0, seconds)
+        self._stamp("llm_s")
 
     def record_vad_settle(self, seconds: float) -> None:
         self.vad_settle_s = max(0.0, seconds)
@@ -130,10 +159,12 @@ class TurnLatencyTracker:
     def record_llm_ttft(self, seconds: float) -> None:
         if self.llm_ttft_s is None:
             self.llm_ttft_s = max(0.0, seconds)
+            self._stamp("llm_ttft_s")
 
     def record_tts_ttfa(self, seconds: float) -> None:
         if self.tts_ttfa_s is None:
             self.tts_ttfa_s = max(0.0, seconds)
+            self._stamp("tts_ttfa_s")
 
     def record_e2e(self, seconds: float) -> bool:
         if self.e2e_s is not None:
@@ -141,6 +172,7 @@ class TurnLatencyTracker:
         if self.speech_anchor is not None and not self.speech_anchor.consume():
             return False
         self.e2e_s = max(0.0, seconds)
+        self._stamp("e2e_s")
         return True
 
     def record_mlx_lock_wait(self, seconds: float, handler_name: str | None = None) -> None:
@@ -199,6 +231,10 @@ class TurnLatencyTracker:
         }
 
     def absorb_pending(self, pending: TurnLatencyTracker) -> None:
+        for field_name in ("stt_s", "vad_decision_s"):
+            ended_at_s = pending.ended_at_s(field_name)
+            if ended_at_s is not None:
+                self._ended_at_s[field_name] = ended_at_s
         if pending.stt_s is not None:
             self.stt_s = pending.stt_s
         if pending.vad_settle_s is not None:
