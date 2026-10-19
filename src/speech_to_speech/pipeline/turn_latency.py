@@ -102,8 +102,9 @@ class TurnLatencyTracker:
     LLM TTFT, TTS TTFA, e2e) also note, on the same perf_counter clock, when
     the measured stage ended (``ended_at_s``), so SOP-805's stage spans can be
     placed in time without a second timer; their durations are the fields
-    themselves. A caller that measured the end itself passes it (VAD
-    decision, STT); otherwise the stamp is the time of the call.
+    themselves. A caller that measured the end apart from the call passes it
+    (VAD's decision; the OpenAI-compatible and streaming STT handlers);
+    otherwise the stamp is the time of the call.
     ``trace`` is the response's place in its turn's voice trace, set when the
     response is bound and only while voice tracing is on.
     """
