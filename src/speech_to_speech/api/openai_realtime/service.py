@@ -88,7 +88,7 @@ from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker, TurnGateAction, TurnPhase
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
 from speech_to_speech.pipeline.turn_latency import SpeechLatencyAnchor, TurnLatencyStore, TurnLatencyTracker
-from speech_to_speech.tracing.voice_turns import VoiceTurnTraces
+from speech_to_speech.tracing.voice_turns import VoiceTurnTraces, build_stage_intervals
 from speech_to_speech.utils.utils import _generate_id, audio_to_wav_base64
 
 logger = logging.getLogger(__name__)
@@ -571,10 +571,11 @@ class RealtimeService:
             if trace_turn is None and source == "tool" and st.last_voice_turn is not None:
                 trace_turn, trace_revision = st.last_voice_turn
             now = time.perf_counter()
-            # Back to roughly where the caller stopped speaking, for a root
-            # whose response never reaches a terminal to widen it.
-            measured = (tracker.vad_decision_s, tracker.vad_settle_s, tracker.stt_s)
-            started = now - sum(seconds for seconds in measured if seconds is not None)
+            # The root opens at the earliest start of the stages measured so
+            # far (VAD's starts at the caller's speech end), placed by the same
+            # rule as the stage spans, so a root whose response never reaches a
+            # terminal still covers them. With no measured stage it opens now.
+            started = min([now, *(stage.end_perf_s - stage.duration_s for stage in build_stage_intervals(tracker))])
             turns = self.speculative_turns
             ref = self.voice_traces.ref_for(
                 trace_turn,
