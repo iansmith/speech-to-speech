@@ -186,6 +186,10 @@ def test_valid_env_builds_langfuse_http_exporter(
         ("Demo", "unknown"),
         ("langfuse-x", "unknown"),
         ("a" * 41, "unknown"),
+        # Sophie's ResolveEnvironment does not trim: padding is invalid there too.
+        (" demo", "unknown"),
+        ("demo ", "unknown"),
+        ("  ", "unknown"),
     ],
 )
 def test_environment_follows_sophies_rule(
