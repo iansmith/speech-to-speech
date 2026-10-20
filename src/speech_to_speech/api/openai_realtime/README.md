@@ -215,6 +215,36 @@ The key is present only when the response status is `completed` and the history 
 
 `content[].transcript` and `content[].text` are unchanged. Clients that do not know the key ignore it. A client that wants the raw text should fall back to `transcript` / `text` when the key is absent.
 
+### Caller turn on model requests (Sophie extension)
+
+These are HTTP headers on the model requests the server makes, not realtime events. They are sent only by the OpenAI-compatible handlers (Chat Completions and Responses API, on both the text and the audio request path). The local `LanguageModel` backend (transformers / mlx) makes no HTTP request.
+
+- `X-Client-Session-Id`: the Sophie call id from `session.update`'s `client_session_id`. Sent on every model request made for a response while a call id is set; when it is not set, none of the headers below are sent either.
+- `X-Client-Turn-Id`: the caller turn the request answers. Its value is the `turn_id` on that turn's `conversation.item.input_audio_transcription.completed` frame (for example `turn_3`).
+- `X-Client-Turn-Revision`: that turn's `turn_revision`, in decimal. Revision 0 is sent as `0`. An absent revision means unknown.
+
+Which turn a request answers:
+
+| request | headers |
+| -- | -- |
+| response to caller speech (text or audio input path) | that transcription's turn and revision |
+| tool follow-up: the server's own prefetch, or a client `response.create` after `function_call_output` | the turn that owns the originating tool call |
+| claimed prefetch | the turn it was issued under; claiming makes no second request |
+| speculative reopen / same-turn revision | the same turn id with the new revision; the superseded request carried the old revision |
+| response whose turn was overtaken by a newer turn that has closed (for example after an empty or failed transcript) | that newer turn, which may have no stored caller line |
+| startup greeting, typed input, tool output whose call this server never produced | no turn headers |
+| out-of-band (`conversation: "none"`) | no turn headers |
+| warm-up and history compaction | no headers at all |
+| unit moved to another call after the response was bound | the new call's `X-Client-Session-Id` only |
+| unit released (call id cleared) | no headers at all |
+
+Rules a reader should rely on:
+
+- The turn id restarts at `turn_1` whenever the speculative turn tracker resets (on connection register and on a VAD session reset), so it is unique only within one realtime session, not across a whole call.
+- The headers are sent whether or not voice tracing is on. They are separate from SOP-805's `X-Sophie-Turn-Id` / `traceparent`, which carry an epoch-suffixed id and are sent only while tracing is on.
+- The request body is never changed.
+- When the turn headers are absent, or name a turn the reader has no record of, the reader should fall back to whatever it did without them.
+
 ---
 
 ## WebRTC Transport

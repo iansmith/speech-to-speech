@@ -475,7 +475,9 @@ def test_tool_followup_with_unknown_origin_uses_last_traced_turn(unit: SimpleNam
     tracker = service.turn_latency_store.get_response(followup.response_key)
     assert tracker is not None and tracker.source == "tool"
     # The trace borrows the last voice turn; the caller-turn headers do not (SOP-853).
-    trace_only = {k: v for k, v in speech_headers.items() if k not in (CLIENT_TURN_ID_HEADER, CLIENT_TURN_REVISION_HEADER)}
+    trace_only = {
+        k: v for k, v in speech_headers.items() if k not in (CLIENT_TURN_ID_HEADER, CLIENT_TURN_REVISION_HEADER)
+    }
     assert _send(unit, followup) == trace_only
 
 
