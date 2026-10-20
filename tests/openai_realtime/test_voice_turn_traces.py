@@ -1024,14 +1024,25 @@ def test_revision_carries_new_revision_on_same_turn(unit: SimpleNamespace) -> No
     rev1 = _speak(unit, revision=revision, reopened=True)
     assert _send(unit, rev1) == _caller("turn_1", 1)
 
-    # Each request reads its own response's tracker, not shared turn state: a
-    # late rev-0 request issued after rev 1 exists still says rev 0.
-    llm: ChatCompletionsApiModelHandler = unit.llm
-    for rev in (1, 0):
-        with bind_active_turn_latency_tracker(
-            TurnLatencyTracker(turn_id="turn_1", turn_revision=rev, sophie_call_id=CALL)
-        ):
-            assert llm.sophie_call_headers() == _caller("turn_1", rev)
+
+def test_late_superseded_request_keeps_its_own_revision(unit: SimpleNamespace) -> None:
+    """A rev-0 request issued after rev 1 is bound still names rev 0.
+
+    Each request reads its own response's tracker from the store, not shared
+    turn state, so the reopen must not move rev 0's tracker to revision 1.
+    rev 0 is left unfinished (still in flight when the turn reopens), so its
+    tracker is still in the store and the late send goes through process().
+    """
+    turns = unit.service.speculative_turns
+    turns.start_turn()
+    rev0 = _speak(unit)
+    assert _send(unit, rev0) == _caller("turn_1", 0)
+    revision = reopen(turns)
+    rev1 = _speak(unit, revision=revision, reopened=True)
+    assert _send(unit, rev1) == _caller("turn_1", 1)
+
+    assert unit.service.turn_latency_store.get_response(rev0.response_key) is not None
+    assert _send(unit, rev0) == _caller("turn_1", 0)
 
 
 def test_no_caller_turn_sends_session_header_only(unit: SimpleNamespace) -> None:
