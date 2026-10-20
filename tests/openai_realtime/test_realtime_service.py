@@ -2521,6 +2521,43 @@ class TestTextConnectionToolFollowup:
         finally:
             service.unregister(other)
 
+    def test_discarded_prefetch_call_ids_are_not_recorded_after_replacement_finishes(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        """Pin (passes on the base): a discarded prefetch's late tool calls are dropped."""
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, None)
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+        prefetch = text_prompt_queue.get_nowait()
+        assert prefetch.prefetch_transaction is not None
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={"output_modalities": ["text"], "instructions": "", "tools": []},
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        replacement = text_prompt_queue.get_nowait()
+        assert replacement.response_key != prefetch.response_key
+        assert prefetch.response_key in st.closed_response_keys
+        service.finish_response(conn_id, response_key=replacement.response_key)
+        assert st.in_response is False
+
+        late = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseGenerationDoneEvent(response_key=prefetch.response_key, call_ids=["call_prefetched"]),
+        )
+
+        assert late == []
+        assert prefetch.response_key not in st.generation_done_tool_calls
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
+
 
 # ===================================================================
 # Response cancel

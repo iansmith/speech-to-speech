@@ -8,6 +8,7 @@ old tests) so there is no cross-test state.
 
 import asyncio
 import base64
+import json
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
@@ -575,6 +576,70 @@ class TestClientEventDispatch:
                 assert isinstance(replacement, GenerateResponseRequest)
                 assert replacement.response_key != request.response_key
                 assert request.response_key in st.closed_response_keys
+
+    def test_discarded_prefetch_tool_call_never_reaches_client(self, setup):
+        """Pin (passes on the base): a discarded prefetch's held tool call never reaches the wire."""
+        app, service, _, _, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                conn_id = list(service._conns)[0]
+                st = service._state(conn_id)
+                prefetch = GenerateResponseRequest(
+                    runtime_config=st.runtime_config, prefetch_transaction=ResponsePrefetchTransaction()
+                )
+                st.tool_followup_prefetch_request = prefetch
+                st.tool_followup_prefetch_origin_response_key = "response_origin"
+                st.mark_response_pending(prefetch.response_key)
+                text_output_queue.put(
+                    AssistantToolCallReadyEvent(
+                        response_key=prefetch.response_key,
+                        output_sequence=0,
+                        part=AssistantToolCallPart(
+                            tool={
+                                "type": "function_call",
+                                "call_id": "call_prefetched",
+                                "name": "lookup",
+                                "arguments": "{}",
+                            }
+                        ),
+                    )
+                )
+
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "response": {"output_modalities": ["text"], "instructions": "", "tools": []},
+                    }
+                )
+                frames = [ws.receive_json()]
+                assert frames[0]["type"] == "response.created"
+                assert prefetch.response_key in st.closed_response_keys
+                current_key = st.current_response_key
+                assert current_key is not None and current_key != prefetch.response_key
+                text_output_queue.put(
+                    AssistantToolCallReadyEvent(
+                        response_key=current_key,
+                        output_sequence=0,
+                        part=AssistantToolCallPart(
+                            tool={
+                                "type": "function_call",
+                                "call_id": "call_marker",
+                                "name": "lookup",
+                                "arguments": "{}",
+                            }
+                        ),
+                    )
+                )
+                # Read up to the marker: the prefetch's event was queued first,
+                # so by then the send loop has already decided its fate.
+                while True:
+                    frame = ws.receive_json()
+                    frames.append(frame)
+                    if frame["type"] == "response.output_item.done" and frame["item"].get("call_id") == "call_marker":
+                        break
+
+                assert not any("call_prefetched" in json.dumps(frame) for frame in frames)
 
     def test_response_cancel_returns_events(self, setup):
         app, service, *_ = setup
