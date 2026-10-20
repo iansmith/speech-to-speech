@@ -269,7 +269,17 @@ class ResponseHandler(RealtimeBaseHandler):
             st.response_created_pending_key = None
 
     def maybe_start_tool_followup_prefetch(self, conn_id: str) -> bool:
-        """Speculatively generate after every tool output, without opening a response."""
+        """Speculatively generate after a tool output, without opening a response.
+
+        The prefetch is built from session defaults (``response`` is None), so
+        it generates with the voice prompt, and ``_prefetch_matches`` lets only
+        a create whose sole per-response override is metadata claim it. A
+        text-only create can therefore never claim one. No prefetch starts
+        when the origin response (the first key in
+        ``generation_done_tool_calls`` with call ids) is in
+        ``text_only_response_keys``: its in-band response.create asked for
+        output_modalities without audio.
+        """
         st = self._state(conn_id)
         if (
             st.tool_followup_prefetch_request is not None
@@ -284,6 +294,9 @@ class ResponseHandler(RealtimeBaseHandler):
         )
         queue = self._queue(conn_id)
         if origin_response_key is None or queue is None:
+            return False
+        if origin_response_key in st.text_only_response_keys:
+            logger.debug("Skipped tool follow-up prefetch: origin response was text-only")
             return False
 
         reference, source, anchor = self._service.response_latency_context(
@@ -965,6 +978,10 @@ class ResponseHandler(RealtimeBaseHandler):
         st.mark_response_started()
         st.clear_pending_response(request.response_key)
         st.current_response_params = event.response
+        if not out_of_band and not response_wants_audio(event.response):
+            st.text_only_response_keys[request.response_key] = None
+            while len(st.text_only_response_keys) > 128:
+                st.text_only_response_keys.pop(next(iter(st.text_only_response_keys)))
         st.current_response_id = _generate_id("resp")
         st.current_response_key = request.response_key
         st.current_response_turn_id = request.turn_id

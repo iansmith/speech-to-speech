@@ -9,6 +9,7 @@ import hashlib
 import json
 from queue import Queue
 from threading import Event, Thread
+from typing import Any
 
 import numpy as np
 import pytest
@@ -2304,6 +2305,299 @@ class TestHandleResponseCreate:
         assert created.response.audio.output.voice == "voice_session"
         done = next(event for event in service.finish_response(conn_id) if isinstance(event, ResponseDoneEvent))
         assert done.response.audio.output.voice == "voice_session"
+
+
+# ===================================================================
+# Tool follow-up prefetch on a text connection (SOP-850)
+# ===================================================================
+
+
+def _origin_tool_round(service, conn_id, text_prompt_queue, response, call_id="call_lookup"):
+    """Open an in-band origin response through a real response.create and give it one tool call.
+
+    The origin must come from a create (not poked state): the text-only record
+    is written by handle_response_create.
+    """
+    created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create", response=response))
+    assert isinstance(created, ResponseCreatedEvent)
+    origin = text_prompt_queue.get_nowait()
+    assert isinstance(origin, GenerateResponseRequest)
+    st = service._state(conn_id)
+    call = RealtimeConversationItemFunctionCall(
+        type="function_call",
+        id=f"fc_{call_id}",
+        call_id=call_id,
+        name="lookup",
+        arguments="{}",
+    )
+    assert st.runtime_config.chat.add_provisional_generation_items(origin.response_key, [call]) is not None
+    st.pending_function_calls = {0: call}
+    return origin, call
+
+
+def _deliver_tool_output(service, conn_id, call):
+    return service.handle_conversation_item_create(
+        conn_id,
+        ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "call_id": call.call_id, "output": "result"},
+        ),
+    )
+
+
+def _finish_tool_round_in_sophie_order(service, conn_id, origin, call):
+    """Sophie's SMS order: logical done, response.done, then the tool output."""
+    service.dispatch_pipeline_event(
+        conn_id,
+        ResponseGenerationDoneEvent(response_key=origin.response_key, call_ids=[call.call_id]),
+    )
+    service.finish_response(conn_id, response_key=origin.response_key)
+    _deliver_tool_output(service, conn_id, call)
+
+
+TEXT_CREATE = {"output_modalities": ["text"]}
+
+
+class TestTextConnectionToolFollowup:
+    @pytest.mark.parametrize(
+        "output_path",
+        ["item_create_after_response_done", "item_create_during_response", "deferred_then_generation_done"],
+    )
+    def test_text_tool_followup_queues_exactly_one_request_and_no_prefetch(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        output_path,
+        monkeypatch,
+    ):
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE)
+        generation_done = ResponseGenerationDoneEvent(response_key=origin.response_key, call_ids=[call.call_id])
+        # A skipped prefetch must bind no latency tracker: binding one would
+        # create a tracker for a response that never happens and run
+        # _bind_turn_trace for it.
+        bound: list[str] = []
+        real_bind = service.bind_response_latency_tracker
+
+        def spy_bind(conn: str, response_key: str, **kwargs: Any) -> None:
+            bound.append(response_key)
+            real_bind(conn, response_key, **kwargs)
+
+        monkeypatch.setattr(service, "bind_response_latency_tracker", spy_bind)
+
+        if output_path == "item_create_after_response_done":
+            service.dispatch_pipeline_event(conn_id, generation_done)
+            service.finish_response(conn_id, response_key=origin.response_key)
+            _deliver_tool_output(service, conn_id, call)
+        elif output_path == "item_create_during_response":
+            service.dispatch_pipeline_event(conn_id, generation_done)
+            _deliver_tool_output(service, conn_id, call)
+            service.finish_response(conn_id, response_key=origin.response_key)
+        else:
+            _deliver_tool_output(service, conn_id, call)
+            # The output must really be deferred, so generation-done is what
+            # flushes it and reaches maybe_start_tool_followup_prefetch.
+            assert st.deferred_items
+            service.dispatch_pipeline_event(conn_id, generation_done)
+            service.finish_response(conn_id, response_key=origin.response_key)
+
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
+        assert bound == []
+        closed_before = dict(st.closed_response_keys)
+
+        created = service.handle_response_create(
+            conn_id, ResponseCreateEvent(type="response.create", response=TEXT_CREATE)
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert text_prompt_queue.empty()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.response is not None
+        assert request.response.output_modalities == ["text"]
+        assert request.prefetch_transaction is None
+        assert st.current_response_key == request.response_key
+        assert st.closed_response_keys == closed_before
+        assert bound == [request.response_key]
+
+    def test_text_only_record_keeps_the_newest_128_keys(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        keys: list[str] = []
+        for _ in range(129):
+            created = service.handle_response_create(
+                conn_id, ResponseCreateEvent(type="response.create", response=TEXT_CREATE)
+            )
+            assert isinstance(created, ResponseCreatedEvent)
+            request = text_prompt_queue.get_nowait()
+            keys.append(request.response_key)
+            service.finish_response(conn_id, response_key=request.response_key)
+
+        assert len(st.text_only_response_keys) == 128
+        assert keys[0] not in st.text_only_response_keys
+        assert list(st.text_only_response_keys) == keys[1:]
+
+        # The 130th text create is the origin of a tool round: its key must
+        # survive its own insertion, so the round still skips the prefetch.
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE)
+        assert origin.response_key in st.text_only_response_keys
+        assert len(st.text_only_response_keys) == 128
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
+
+    def test_text_connection_session_update_does_not_restart_prefetch(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE)
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+        assert text_prompt_queue.empty()
+
+        error = service.handle_session_update(
+            conn_id,
+            SessionUpdateEvent(type="session.update", session={"type": "realtime", "instructions": "Be concise"}),
+        )
+
+        assert error is None
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
+
+    def test_rejected_text_create_does_not_suppress_prefetch(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, None)
+
+        rejected = service.handle_response_create(
+            conn_id, ResponseCreateEvent(type="response.create", response=TEXT_CREATE)
+        )
+        assert isinstance(rejected, RealtimeErrorEvent)
+        assert rejected.error.type == "conversation_already_has_active_response"
+        assert text_prompt_queue.empty()
+
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        prefetch = text_prompt_queue.get_nowait()
+        assert isinstance(prefetch, GenerateResponseRequest)
+        assert prefetch.prefetch_transaction is not None
+        assert st.tool_followup_prefetch_request is prefetch
+
+    @pytest.mark.parametrize(
+        "origin_response",
+        [None, {"output_modalities": ["audio"]}, {"output_modalities": []}, {"output_modalities": ["text", "audio"]}],
+        ids=["bare", "audio", "empty", "text_and_audio"],
+    )
+    def test_audio_or_default_origin_still_prefetches_and_bare_create_claims(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        origin_response,
+    ):
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, origin_response)
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        prefetch = text_prompt_queue.get_nowait()
+        assert isinstance(prefetch, GenerateResponseRequest)
+        assert prefetch.prefetch_transaction is not None
+        assert prefetch.response is None
+        assert st.tool_followup_prefetch_request is prefetch
+
+        claimed = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(claimed, ResponseCreatedEvent)
+        assert st.current_response_key == prefetch.response_key
+        assert st.tool_followup_prefetch_request is None
+        assert text_prompt_queue.empty()
+
+    def test_text_round_does_not_suppress_a_later_bare_round(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE, call_id="call_text")
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+        assert text_prompt_queue.empty()
+        followup = service.handle_response_create(
+            conn_id, ResponseCreateEvent(type="response.create", response=TEXT_CREATE)
+        )
+        assert isinstance(followup, ResponseCreatedEvent)
+        followup_request = text_prompt_queue.get_nowait()
+        service.finish_response(conn_id, response_key=followup_request.response_key)
+
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, None, call_id="call_voice")
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        prefetch = text_prompt_queue.get_nowait()
+        assert prefetch.prefetch_transaction is not None
+        assert st.tool_followup_prefetch_request is prefetch
+
+    def test_out_of_band_text_create_does_not_suppress_prefetch(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        oob = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create", response={"conversation": "none", "output_modalities": ["text"]}
+            ),
+        )
+        assert isinstance(oob, ResponseCreatedEvent)
+        oob_request = text_prompt_queue.get_nowait()
+        service.finish_response(conn_id, response_key=oob_request.response_key)
+
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, None)
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        prefetch = text_prompt_queue.get_nowait()
+        assert prefetch.prefetch_transaction is not None
+        assert st.tool_followup_prefetch_request is prefetch
+
+    def test_text_create_on_one_connection_does_not_suppress_another(self, service, conn_id, text_prompt_queue):
+        _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE, call_id="call_text")
+        other = service.register()
+        try:
+            other_st = service._state(other)
+            origin, call = _origin_tool_round(service, other, text_prompt_queue, None, call_id="call_voice")
+            _finish_tool_round_in_sophie_order(service, other, origin, call)
+
+            prefetch = text_prompt_queue.get_nowait()
+            assert prefetch.prefetch_transaction is not None
+            assert other_st.tool_followup_prefetch_request is prefetch
+        finally:
+            service.unregister(other)
+
+    def test_discarded_prefetch_call_ids_are_not_recorded_after_replacement_finishes(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        """Pin (passes on the base): a discarded prefetch's late tool calls are dropped."""
+        st = service._state(conn_id)
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, None)
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+        prefetch = text_prompt_queue.get_nowait()
+        assert prefetch.prefetch_transaction is not None
+
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(
+                type="response.create",
+                response={"output_modalities": ["text"], "instructions": "", "tools": []},
+            ),
+        )
+        assert isinstance(created, ResponseCreatedEvent)
+        replacement = text_prompt_queue.get_nowait()
+        assert replacement.response_key != prefetch.response_key
+        assert prefetch.response_key in st.closed_response_keys
+        service.finish_response(conn_id, response_key=replacement.response_key)
+        assert st.in_response is False
+
+        late = service.dispatch_pipeline_event(
+            conn_id,
+            ResponseGenerationDoneEvent(response_key=prefetch.response_key, call_ids=["call_prefetched"]),
+        )
+
+        assert late == []
+        assert prefetch.response_key not in st.generation_done_tool_calls
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
 
 
 # ===================================================================
