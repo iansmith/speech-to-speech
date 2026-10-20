@@ -201,7 +201,10 @@ Clients that previously consumed each chunk-level `done` event must switch their
 
 A completed `response.done` may carry the key `s2s_raw_text` (a string) on each `message` item of `response.output`. It is never set on content parts and never on `response.output_item.done`, which can be sent before the response's final status is known.
 
-The value is the model's output text exactly as the server's conversation history holds it for that item: the provider's text deltas concatenated, with the newlines, markdown and characters that the spoken transcript drops or rewrites still in place. If a provider retained several messages in one wire item, they are concatenated with no separator. A Responses API refusal is included, although it is not spoken.
+The value is the model's output text exactly as the server's conversation history holds it for that item. What that history holds depends on the LLM backend:
+
+- **OpenAI-compatible backends** (Chat Completions and Responses API): the provider's text deltas concatenated, with the newlines, markdown and characters that the spoken transcript drops or rewrites still in place. If a provider retained several messages in one wire item, they are concatenated with no separator. A Responses API refusal is included, although it is not spoken.
+- **Local `LanguageModel` backend** (transformers / mlx): the history holds the text as it was chunked for output. For an audio response that is the spoken form, with markdown removed and sentences joined by single spaces, so `s2s_raw_text` is not raw provider text there. The key gives no signal of which backend produced it.
 
 The key is present only when the response status is `completed` and the history still holds that item's text. It is absent on:
 

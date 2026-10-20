@@ -668,8 +668,11 @@ class Chat:
         """Map each wire assistant message id to the raw text this chat holds for it.
 
         Read-only. The text is the provisional assistant history written for
-        ``response_key`` (what the provider produced, before any spoken-form
-        normalisation), grouped onto wire messages as ``bind_assistant_item_ids``
+        ``response_key``. On the OpenAI-compatible backends that is what the
+        provider produced, before any spoken-form normalisation; the local
+        ``LanguageModel`` backend writes its output chunks instead, which for
+        an audio response are already markdown-stripped and space-joined.
+        It is grouped onto wire messages as ``bind_assistant_item_ids``
         groups them, with several provider messages joined by ``""``. A wire
         message is left out when any of its history messages has been evicted
         or its joined text is empty, and the map is empty once the response's
