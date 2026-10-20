@@ -107,6 +107,9 @@ class TurnLatencyTracker:
     otherwise the stamp is the time of the call.
     ``trace`` is the response's place in its turn's voice trace, set when the
     response is bound and only while voice tracing is on.
+    ``sophie_call_id`` is the Sophie call the response was bound under
+    (SOP-853). The LLM handler compares it with its current call id, so a
+    pooled unit moved to another call never names this response's turn.
     """
 
     turn_id: str | None = None
@@ -132,6 +135,7 @@ class TurnLatencyTracker:
     mlx_lock_holds: dict[str, MLXLockStat] = field(default_factory=dict)
     status: TurnLatencyStatus = "completed"
     trace: TurnTraceRef | None = field(default=None, repr=False, compare=False)
+    sophie_call_id: str = field(default="", repr=False, compare=False)
     _ended_at_s: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
 
     def _stamp(self, field_name: str, ended_at_s: float | None = None) -> None:

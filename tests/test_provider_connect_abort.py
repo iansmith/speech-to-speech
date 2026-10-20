@@ -769,4 +769,7 @@ def test_cancel_scope_abort_unchanged_with_turn_headers(monkeypatch, stalling_pr
     assert headers["x-client-session-id"] == call
     assert headers["x-sophie-turn-id"].startswith("turn_1_")
     assert headers["traceparent"].startswith("00-")
+    # SOP-853: the caller turn reaches the socket too, inside the same window.
+    assert headers["x-client-turn-id"] == "turn_1"
+    assert headers["x-client-turn-revision"] == "0"
     service.unregister(conn)

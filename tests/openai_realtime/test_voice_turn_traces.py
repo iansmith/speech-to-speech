@@ -5,6 +5,10 @@ stage spans.
 The LLM handler here is the production ChatCompletionsApiModelHandler (the
 backend demo1 runs) with only its OpenAI client replaced by a recorder, so the
 headers asserted are the kwargs the real request path hands the SDK.
+
+SOP-853 adds the caller turn (X-Client-Turn-Id + X-Client-Turn-Revision) beside
+the call id on every request that answers a caller turn, with or without
+tracing; its tests are the last section.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.sophie_call import (
     CLIENT_SESSION_HEADER,
+    CLIENT_TURN_ID_HEADER,
+    CLIENT_TURN_REVISION_HEADER,
     TRACEPARENT_HEADER,
     TURN_ID_HEADER,
     clear_sophie_call_id,
@@ -191,11 +197,13 @@ def _ref(unit: SimpleNamespace, request: GenerateResponseRequest) -> TurnTraceRe
     return tracker.trace
 
 
-def _expected_turn_headers(wire_turn_id: str) -> dict[str, str]:
+def _expected_turn_headers(wire_turn_id: str, turn_id: str = "turn_1", revision: int = 0) -> dict[str, str]:
     trace_hex = voice_turn_trace_id(CALL, wire_turn_id).hex()
     root_hex = voice_turn_root_span_id(CALL, wire_turn_id).hex()
     return {
         CLIENT_SESSION_HEADER: CALL,
+        CLIENT_TURN_ID_HEADER: turn_id,
+        CLIENT_TURN_REVISION_HEADER: str(revision),
         TURN_ID_HEADER: wire_turn_id,
         TRACEPARENT_HEADER: f"00-{trace_hex}-{root_hex}-01",
     }
@@ -207,7 +215,7 @@ def _int(raw: bytes) -> int:
 
 def _traced(ref: TurnTraceRef) -> TurnLatencyTracker:
     """A response tracker carrying *ref*, as make_request binds one for a traced turn."""
-    return TurnLatencyTracker(turn_id="turn_1", turn_revision=0, source="speech", trace=ref)
+    return TurnLatencyTracker(turn_id="turn_1", turn_revision=0, source="speech", trace=ref, sophie_call_id=CALL)
 
 
 # ── DoD 4: unique turn ids within a call ────────────────────────────────────
@@ -243,6 +251,8 @@ def test_turn_ids_unique_across_reset_within_one_call(unit: SimpleNamespace) -> 
     sent = [first, after_reset, after_rebind]
     wire_ids = [headers[TURN_ID_HEADER] for headers in sent]
     assert len(set(wire_ids)) == 3
+    # SOP-853: the raw caller turn id repeats across the reset; only the wire id is unique.
+    assert [headers[CLIENT_TURN_ID_HEADER] for headers in sent] == ["turn_1"] * 3
     for wire_id in wire_ids:
         assert wire_id.startswith("turn_1_")
         assert TURN_ID_RE.fullmatch(wire_id)
@@ -414,10 +424,11 @@ def test_tool_followup_and_reopen_share_turn_trace(unit: SimpleNamespace, follow
     followup_headers = _send(unit, followup_request)
     _finish(unit, followup_request)
 
-    sent = [first_headers, second_headers, followup_headers]
     wire_id = first_headers[TURN_ID_HEADER]
-    for headers in sent:
-        assert headers == _expected_turn_headers(wire_id)
+    # One trace for the whole turn; the caller-turn revision follows each request's own revision.
+    assert first_headers == _expected_turn_headers(wire_id, revision=0)
+    assert second_headers == _expected_turn_headers(wire_id, revision=1)
+    assert followup_headers == _expected_turn_headers(wire_id, revision=1)
 
     unit.service.voice_traces.finalize_all()
     spans = exporter.get_finished_spans()
@@ -463,7 +474,11 @@ def test_tool_followup_with_unknown_origin_uses_last_traced_turn(unit: SimpleNam
     assert followup.turn_id is None  # speculative gating is untouched
     tracker = service.turn_latency_store.get_response(followup.response_key)
     assert tracker is not None and tracker.source == "tool"
-    assert _send(unit, followup) == speech_headers
+    # The trace borrows the last voice turn; the caller-turn headers do not (SOP-853).
+    trace_only = {
+        k: v for k, v in speech_headers.items() if k not in (CLIENT_TURN_ID_HEADER, CLIENT_TURN_REVISION_HEADER)
+    }
+    assert _send(unit, followup) == trace_only
 
 
 def test_non_turn_requests_send_no_turn_headers(unit: SimpleNamespace) -> None:
@@ -516,24 +531,32 @@ def test_non_turn_requests_send_no_turn_headers(unit: SimpleNamespace) -> None:
     assert "extra_headers" not in compaction
 
 
-def test_tracing_off_requests_are_unchanged(unit: SimpleNamespace) -> None:
+def test_tracing_off_sends_caller_turn_but_no_trace_headers(unit: SimpleNamespace) -> None:
     unit.service.speculative_turns.start_turn()
     request = _speak(unit)
     tracker = unit.service.turn_latency_store.get_response(request.response_key)
     assert tracker is not None and tracker.trace is None
-    assert _send(unit, request) == {CLIENT_SESSION_HEADER: CALL}
+    assert _send(unit, request) == {
+        CLIENT_SESSION_HEADER: CALL,
+        CLIENT_TURN_ID_HEADER: "turn_1",
+        CLIENT_TURN_REVISION_HEADER: "0",
+    }
 
     clear_sophie_call_id(unit)
     list(unit.llm.process(request))
     assert "extra_headers" not in _completions(unit.llm).calls[-1]
 
 
-def test_non_uuid_call_id_sends_only_the_session_header(unit: SimpleNamespace) -> None:
+def test_non_uuid_call_id_sends_caller_turn_but_no_trace_headers(unit: SimpleNamespace) -> None:
     exporter = install_memory_tracer()
     set_sophie_call_id(unit, "call-1")
     unit.service.speculative_turns.start_turn()
     request = _speak(unit)
-    assert _send(unit, request) == {CLIENT_SESSION_HEADER: "call-1"}
+    assert _send(unit, request) == {
+        CLIENT_SESSION_HEADER: "call-1",
+        CLIENT_TURN_ID_HEADER: "turn_1",
+        CLIENT_TURN_REVISION_HEADER: "0",
+    }
     _finish(unit, request)
     unit.service.voice_traces.finalize_all()
     assert exporter.get_finished_spans() == ()
@@ -818,7 +841,12 @@ def test_bind_failure_logs_once_and_the_request_still_goes(
     for request in requests:
         tracker = service.turn_latency_store.get_response(request.response_key)
         assert tracker is not None and tracker.trace is None
-        assert _send(unit, request) == {CLIENT_SESSION_HEADER: CALL}
+        # A failed trace bind drops the trace headers, never the caller turn.
+        assert _send(unit, request) == {
+            CLIENT_SESSION_HEADER: CALL,
+            CLIENT_TURN_ID_HEADER: request.turn_id,
+            CLIENT_TURN_REVISION_HEADER: "0",
+        }
     assert len(_warnings_from(caplog, service_module.__name__)) == 1
 
 
@@ -868,5 +896,227 @@ def test_tts_requests_get_no_trace_headers(unit: SimpleNamespace, monkeypatch: p
     assert audio
     assert seen
     for headers in seen:
-        for name in ("traceparent", "tracestate", "baggage", TURN_ID_HEADER, CLIENT_SESSION_HEADER):
+        for name in (
+            "traceparent",
+            "tracestate",
+            "baggage",
+            TURN_ID_HEADER,
+            CLIENT_SESSION_HEADER,
+            CLIENT_TURN_ID_HEADER,
+            CLIENT_TURN_REVISION_HEADER,
+        ):
             assert name not in headers
+
+
+# ── SOP-853: caller turn headers (tracing off unless stated) ────────────────
+
+
+def _caller(turn_id: str, revision: int | None, call: str = CALL) -> dict[str, str]:
+    headers = {CLIENT_SESSION_HEADER: call, CLIENT_TURN_ID_HEADER: turn_id}
+    if revision is not None:
+        headers[CLIENT_TURN_REVISION_HEADER] = str(revision)
+    return headers
+
+
+@pytest.mark.parametrize("kind", ["text", "audio"])
+def test_spoken_turn_caller_headers_match_transcription_frame(
+    unit: SimpleNamespace, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audio = unit.service.audio
+    original = audio.hold_input_terminal
+    frames: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> None:
+        terminal = kwargs.get("terminal")
+        if terminal is not None:
+            frames.append(terminal.model_dump())
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(audio, "hold_input_terminal", capture)
+    unit.service.speculative_turns.start_turn()
+    request = _speak(unit)
+    if kind == "audio":
+        request = request.model_copy(update={"audio": np.zeros(1600, dtype=np.float32), "audio_sample_rate": 16000})
+
+    headers = _send(unit, request)
+
+    (frame,) = frames
+    assert frame["type"] == "conversation.item.input_audio_transcription.completed"
+    # The expectation comes from the frame Sophie stores the caller line by.
+    assert headers == {
+        CLIENT_SESSION_HEADER: CALL,
+        CLIENT_TURN_ID_HEADER: frame["turn_id"],
+        CLIENT_TURN_REVISION_HEADER: str(frame["turn_revision"]),
+    }
+
+
+@pytest.mark.parametrize("path", ["chat-text", "chat-audio", "responses-text", "responses-audio"])
+def test_caller_turn_headers_leave_the_body_untouched(path: str) -> None:
+    recorder = _Recorder()
+    handler: Any
+    if path.startswith("chat"):
+        handler = _handler()
+        handler.client = SimpleNamespace(chat=SimpleNamespace(completions=recorder))
+        handler.model_name = "m"
+        handler.stream = False
+        handler._extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        handler.request_timeout = 1
+    else:
+        handler = _responses_handler(recorder)
+        handler._extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+    request: Callable[[Any, dict[str, Any]], Any] = (
+        handler._request_audio if path.endswith("audio") else handler._request
+    )
+    handler.set_sophie_call_id(CALL)
+    api_input = [{"role": "user", "content": "hi"}]
+    optional_kwargs: dict[str, Any] = {"tool_choice": "auto"}
+
+    with bind_active_turn_latency_tracker(TurnLatencyTracker(turn_id="turn_1", turn_revision=2, sophie_call_id=CALL)):
+        request(api_input, optional_kwargs)
+    with_turn = dict(recorder.seen)
+    request(api_input, optional_kwargs)
+    without_turn = dict(recorder.seen)
+    with bind_active_turn_latency_tracker(
+        TurnLatencyTracker(turn_id="turn_1", turn_revision=None, sophie_call_id=CALL)
+    ):
+        request(api_input, optional_kwargs)
+    no_revision = dict(recorder.seen)
+
+    assert with_turn.pop("extra_headers") == _caller("turn_1", 2)
+    assert without_turn.pop("extra_headers") == {CLIENT_SESSION_HEADER: CALL}
+    assert no_revision.pop("extra_headers") == _caller("turn_1", None)
+    assert with_turn == without_turn == no_revision
+    assert api_input == [{"role": "user", "content": "hi"}]
+    assert optional_kwargs == {"tool_choice": "auto"}
+
+
+def test_client_create_tool_followup_carries_origin_turn(unit: SimpleNamespace) -> None:
+    unit.service.speculative_turns.start_turn()
+    speech = _speak(unit)
+    assert _send(unit, speech) == _caller("turn_1", 0)
+    followup = _tool_round_trip(unit, speech, "client_response_create")
+    assert followup.prefetch_transaction is None
+    assert speech.turn_id is not None
+    assert _send(unit, followup) == _caller(speech.turn_id, speech.turn_revision)
+
+
+def test_claimed_voice_prefetch_carries_origin_turn_and_issues_once(unit: SimpleNamespace) -> None:
+    unit.service.speculative_turns.start_turn()
+    speech = _speak(unit)
+    assert _send(unit, speech) == _caller("turn_1", 0)
+    prefetched = _tool_round_trip(unit, speech, "prefetch")
+    queue = unit.service.text_prompt_queue
+    assert queue is not None and queue.empty()  # the claiming response.create queued nothing new
+
+    headers = _send(unit, prefetched)  # _send asserts exactly one provider request
+
+    assert _completions(unit.llm).threads[-1] == "realtime-tool-prefetch"
+    assert headers == _caller("turn_1", 0)
+
+
+def test_revision_carries_new_revision_on_same_turn(unit: SimpleNamespace) -> None:
+    turns = unit.service.speculative_turns
+    turns.start_turn()
+    rev0 = _speak(unit)
+    assert _send(unit, rev0) == _caller("turn_1", 0)
+    _finish(unit, rev0, "cancelled")
+    revision = reopen(turns)
+    rev1 = _speak(unit, revision=revision, reopened=True)
+    assert _send(unit, rev1) == _caller("turn_1", 1)
+
+
+def test_late_superseded_request_keeps_its_own_revision(unit: SimpleNamespace) -> None:
+    """A rev-0 request issued after rev 1 is bound still names rev 0.
+
+    Each request reads its own response's tracker from the store, not shared
+    turn state, so the reopen must not move rev 0's tracker to revision 1.
+    rev 0 is left unfinished (still in flight when the turn reopens), so its
+    tracker is still in the store and the late send goes through process().
+    """
+    turns = unit.service.speculative_turns
+    turns.start_turn()
+    rev0 = _speak(unit)
+    assert _send(unit, rev0) == _caller("turn_1", 0)
+    revision = reopen(turns)
+    rev1 = _speak(unit, revision=revision, reopened=True)
+    assert _send(unit, rev1) == _caller("turn_1", 1)
+
+    assert unit.service.turn_latency_store.get_response(rev0.response_key) is not None
+    assert _send(unit, rev0) == _caller("turn_1", 0)
+
+
+def test_no_caller_turn_sends_session_header_only(unit: SimpleNamespace) -> None:
+    service: RealtimeService = unit.service
+    llm: ChatCompletionsApiModelHandler = unit.llm
+    queue = service.text_prompt_queue
+    assert queue is not None
+
+    def create_and_send(event: ResponseCreateEvent) -> dict[str, str]:
+        created = service.handle_response_create(unit.conn, event)
+        assert created is not None and created.type == "response.created"
+        request = queue.get_nowait()
+        headers = _send(unit, request)
+        _finish(unit, request)
+        return headers
+
+    # The greeting: a client response.create with no caller turn yet.
+    assert create_and_send(ResponseCreateEvent(type="response.create")) == {CLIENT_SESSION_HEADER: CALL}
+
+    # A spoken turn, so a later request could only inherit it by mistake.
+    service.speculative_turns.start_turn()
+    speech = _speak(unit)
+    assert _send(unit, speech) == _caller("turn_1", 0)
+    _finish(unit, speech)
+
+    # A tool follow-up whose origin this server never produced: no guessed turn.
+    for item in (
+        {"type": "function_call", "call_id": "call_unknown", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_unknown", "output": "result"},
+    ):
+        service.handle_conversation_item_create(
+            unit.conn, ConversationItemCreateEvent(type="conversation.item.create", item=item)
+        )
+    assert create_and_send(ResponseCreateEvent(type="response.create")) == {CLIENT_SESSION_HEADER: CALL}
+
+    # Typed text is client input with no caller turn.
+    service.handle_conversation_item_create(
+        unit.conn,
+        ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "message", "role": "user", "content": [{"type": "input_text", "text": "typed"}]},
+        ),
+    )
+    assert create_and_send(ResponseCreateEvent(type="response.create")) == {CLIENT_SESSION_HEADER: CALL}
+
+    out_of_band = ResponseCreateEvent.model_validate(
+        {"type": "response.create", "response": {"conversation": "none", "instructions": "Summarize."}}
+    )
+    assert create_and_send(out_of_band) == {CLIENT_SESSION_HEADER: CALL}
+
+    completions = _completions(llm)
+    with bind_active_turn_latency_tracker(TurnLatencyTracker(turn_id="turn_1", turn_revision=0, sophie_call_id=CALL)):
+        llm.warmup()
+        warm = completions.calls[-1]
+        llm._build_compaction_generate_fn()("system", "user")
+        compaction = completions.calls[-1]
+    assert "extra_headers" not in warm
+    assert "extra_headers" not in compaction
+
+
+def test_call_change_or_clear_drops_caller_turn(unit: SimpleNamespace) -> None:
+    turns = unit.service.speculative_turns
+    turns.start_turn()
+    request = _speak(unit)  # bound under CALL
+
+    set_sophie_call_id(unit, OTHER_CALL)
+    assert _send(unit, request) == {CLIENT_SESSION_HEADER: OTHER_CALL}  # A's turn, B's call
+
+    clear_sophie_call_id(unit)
+    list(unit.llm.process(request))
+    assert "extra_headers" not in _completions(unit.llm).calls[-1]
+
+    # A turn bound while no call id is set never carries a turn, even once one is.
+    turns.start_turn()
+    unbound = _speak(unit, turn_id="turn_2")
+    set_sophie_call_id(unit, OTHER_CALL)
+    assert _send(unit, unbound) == {CLIENT_SESSION_HEADER: OTHER_CALL}

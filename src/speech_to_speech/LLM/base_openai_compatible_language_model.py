@@ -264,26 +264,39 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._sophie_call_id = (call_id or "").strip()
 
     def sophie_call_headers(self) -> dict[str, str]:
-        """Headers for Sophie's LLM proxy: the call id, and on a traced spoken turn
-        its X-Sophie-Turn-Id and traceparent (SOP-838's contract).
+        """Headers for Sophie's LLM proxy: the call id, plus two optional families.
 
-        The turn headers go out only for a request issued inside make_request
-        (which binds the response's tracker as the active turn-latency tracker)
-        for a response bound with a voice-trace ref, and only when that ref
-        belongs to the call this handler is serving now; a pooled unit that has
-        moved to another call never names the previous call's trace.
+        Nothing at all goes out without a call id. With one, X-Client-Session-Id
+        always goes, and the rest come from the response tracker make_request
+        binds as the active turn-latency tracker:
+
+        * The caller turn (SOP-853): X-Client-Turn-Id and, when the tracker has
+          one, X-Client-Turn-Revision -- the tracker's raw turn_id/turn_revision
+          -- when the tracker has a turn and was bound under the call this
+          handler serves now. Independent of voice tracing.
+        * The trace (SOP-838's contract): X-Sophie-Turn-Id and traceparent, when
+          the tracker carries a voice-trace ref of the current call.
+
+        Either way, a pooled unit that has moved to another call never names
+        the previous call's turn or trace.
         """
         call_id = getattr(self, "_sophie_call_id", "")
         if not call_id:
             return {}
         from speech_to_speech.api.openai_realtime.sophie_call import (
             CLIENT_SESSION_HEADER,
+            CLIENT_TURN_ID_HEADER,
+            CLIENT_TURN_REVISION_HEADER,
             TRACEPARENT_HEADER,
             TURN_ID_HEADER,
         )
 
         headers = {CLIENT_SESSION_HEADER: call_id}
         tracker = active_turn_latency_tracker()
+        if tracker is not None and tracker.turn_id is not None and tracker.sophie_call_id == call_id:
+            headers[CLIENT_TURN_ID_HEADER] = tracker.turn_id
+            if tracker.turn_revision is not None:
+                headers[CLIENT_TURN_REVISION_HEADER] = str(tracker.turn_revision)
         ref = tracker.trace if tracker is not None else None
         if ref is not None and ref.call_uuid == normalize_call_uuid(call_id):
             headers[TURN_ID_HEADER] = ref.wire_turn_id
@@ -951,9 +964,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     def make_request() -> Any:
                         # Runs on whichever thread issues the request, the
                         # prefetch worker included, so the response's tracker,
-                        # and with it its turn's trace (SOP-805), travels with
-                        # it. Out-of-band responses never bind a tracker, so
-                        # they never carry a turn.
+                        # and with it its caller turn (SOP-853) and its turn's
+                        # trace (SOP-805), travels with it. Out-of-band
+                        # responses never bind a tracker, so they never carry
+                        # a turn.
                         with bind_active_turn_latency_tracker(tracker):
                             return (request_fn or self._request)(api_input, optional_kwargs)
 

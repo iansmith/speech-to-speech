@@ -462,6 +462,9 @@ class RealtimeService:
         # Per-turn voice traces for whichever Sophie call claims this unit (SOP-805).
         self.voice_traces = VoiceTurnTraces()
         self._turn_trace_failure_logged = False
+        # The unit's Sophie call id, stamped on each response tracker at bind so
+        # the LLM handler sends a caller turn only to the call it belongs to (SOP-853).
+        self._sophie_call_id = ""
 
         self.history = HistoryHandler(self)
         self.audio = AudioHandler(self)
@@ -501,7 +504,13 @@ class RealtimeService:
         return state.session_id
 
     def set_sophie_call_id(self, call_id: str | None) -> None:
-        """Follow the unit's Sophie call id for voice traces (SOP-805); empty clears it."""
+        """Follow the unit's Sophie call id; empty clears it.
+
+        Voice traces bind to it (SOP-805), and each response tracker bound from
+        now on records it, so the caller-turn headers (SOP-853) go out only
+        while the unit still serves the call the response was bound under.
+        """
+        self._sophie_call_id = (call_id or "").strip()
         self.voice_traces.bind_call(call_id)
 
     def unregister(self, conn_id: str) -> None:
@@ -547,6 +556,9 @@ class RealtimeService:
             turn_revision=turn_revision,
             session_id=conn_id,
         )
+        # Unconditional and apart from the trace bind: the caller-turn headers
+        # (SOP-853) do not depend on voice tracing.
+        tracker.sophie_call_id = self._sophie_call_id
         tracker.source = source
         if source == "speech" and speech_anchor is None and turn_id is not None:
             speech_anchor = self._state(conn_id).speech_latency_anchors.get((turn_id, turn_revision))
