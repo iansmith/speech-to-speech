@@ -338,9 +338,10 @@ class ConnState(BaseModel):
     # In-band response keys whose accepted response.create asked for a
     # non-empty output_modalities without "audio" (response_wants_audio False).
     # Read only by ResponseHandler.maybe_start_tool_followup_prefetch, which
-    # never prefetches a follow-up to such a response. Kept past response end
-    # (the tool output usually arrives after response.done); ordered set
-    # bounded at 128 entries.
+    # never prefetches a follow-up to such a response. Kept past response end,
+    # because a tool output can arrive after response.done, by which point
+    # _end_response has cleared current_response_params. Ordered set bounded
+    # at 128 entries.
     text_only_response_keys: dict[str, None] = Field(default_factory=dict)
     tool_followup_prefetch_request: GenerateResponseRequest | None = None
     tool_followup_prefetch_origin_response_key: str | None = None
