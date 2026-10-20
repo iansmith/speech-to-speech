@@ -469,6 +469,51 @@ def test_one_wire_message_deletes_all_retained_provider_fragments():
     assert chat.delete_item("wire_after") is after
 
 
+def test_assistant_text_by_item_id_groups_by_preceding_call():
+    chat = Chat(10)
+    chat.add_provisional_generation_items(
+        "response", [make_assistant_message("before\n"), _call(), make_assistant_message("after\n\nX.")]
+    )
+    ids_before = [item.id for item in chat.buffer]
+    wire = [_wire_message("wire_first"), _call(), _wire_message("wire_last")]
+    assert chat.assistant_text_by_item_id("response", wire) == {"wire_first": "before\n", "wire_last": "after\n\nX."}
+    assert [item.id for item in chat.buffer] == ids_before
+
+
+def test_assistant_text_by_item_id_joins_fragments_and_omits_evicted_or_unknown():
+    chat = Chat(10)
+    second = make_assistant_message("second")
+    chat.add_provisional_generation_items(
+        "response", [make_assistant_message("first"), second, _call(), make_assistant_message("after call")]
+    )
+    wire = [_wire_message("wire_before"), _call(), _wire_message("wire_after")]
+    assert chat.assistant_text_by_item_id("response", wire) == {
+        "wire_before": "firstsecond",
+        "wire_after": "after call",
+    }
+    assert chat.assistant_text_by_item_id("other", wire) == {}
+    chat.buffer = [item for item in chat.buffer if item is not second]
+    assert chat.assistant_text_by_item_id("response", wire) == {"wire_after": "after call"}
+    chat.finalize_provisional_generation("response")
+    assert chat.assistant_text_by_item_id("response", wire) == {}
+
+
+def test_assistant_text_by_item_id_is_scoped_to_its_response():
+    chat = Chat(10)
+    chat.add_provisional_generation_items("rev1", [make_assistant_message("Old.")])
+    chat.rollback_provisional_generation("rev1")
+    chat.add_provisional_generation_items("rev2", [make_assistant_message("New.\nLine.")])
+    assert chat.assistant_text_by_item_id("rev2", [_wire_message("wire")]) == {"wire": "New.\nLine."}
+    assert chat.assistant_text_by_item_id("rev1", [_wire_message("wire")]) == {}
+
+
+def test_assistant_text_by_item_id_omits_empty_text():
+    chat = Chat(10)
+    empty = make_assistant_message("").model_copy(update={"id": "empty_native"})
+    chat.add_provisional_generation_items("response", [empty, _call()])
+    assert chat.assistant_text_by_item_id("response", [_wire_message("wire")]) == {}
+
+
 @pytest.mark.parametrize("cancel_active", [False, True])
 def test_delete_waits_for_overlapping_queued_response(service, conn_id, cancel_active):
     st = service._state(conn_id)
