@@ -12,6 +12,8 @@ import pytest
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.sophie_call import (
     CLIENT_SESSION_HEADER,
+    CLIENT_TURN_ID_HEADER,
+    CLIENT_TURN_REVISION_HEADER,
     TRACEPARENT_HEADER,
     TURN_ID_HEADER,
     client_session_id,
@@ -48,6 +50,15 @@ def test_turn_trace_headers_pin_the_wire_names() -> None:
     # alone silently drops every voice turn to the per-request fallback.
     assert TURN_ID_HEADER == "X-Sophie-Turn-Id"
     assert TRACEPARENT_HEADER == "traceparent"
+
+
+def test_client_turn_headers_pin_the_wire_names() -> None:
+    # SOP-853: Sophie's proxy reads the caller turn by these exact names and
+    # strips both before forwarding upstream. A rename here alone drops every
+    # voice request back to the proxy's anchor heuristic and leaks the new
+    # name to the provider.
+    assert CLIENT_TURN_ID_HEADER == "X-Client-Turn-Id"
+    assert CLIENT_TURN_REVISION_HEADER == "X-Client-Turn-Revision"
 
 
 def test_session_update_carries_the_client_id() -> None:

@@ -16,6 +16,13 @@ CLIENT_SESSION_HEADER = "X-Client-Session-Id"
 # proxy reads both by these names (SOP-838) and strips all three upstream.
 TURN_ID_HEADER = "X-Sophie-Turn-Id"
 TRACEPARENT_HEADER = "traceparent"
+# SOP-853: the caller turn a model request answers, as the raw SOP-691
+# turn_id / turn_revision on that turn's transcription.completed frame (not
+# SOP-805's epoch-suffixed wire id). Sent whenever a call id is set and the
+# response has a caller turn, whether or not voice tracing is on. Sophie's
+# proxy reads both by these names and must strip both upstream.
+CLIENT_TURN_ID_HEADER = "X-Client-Turn-Id"
+CLIENT_TURN_REVISION_HEADER = "X-Client-Turn-Revision"
 
 
 def client_session_id(raw: dict[str, Any]) -> str | None:
