@@ -615,28 +615,8 @@ class Chat:
             messages_by_id = {
                 item.id: item for item in self.buffer if isinstance(item, RealtimeConversationItemAssistantMessage)
             }
-            groups: dict[str | None, list[str]] = {}
-            preceding_call_id: str | None = None
-            # Tool boundaries survive text filtering and history eviction, so a
-            # hidden or evicted interval cannot take a later wire message's ID.
-            for native_id, kind, call_id in self._provisional_output_items.get(response_key or "", []):
-                if kind == "message":
-                    groups.setdefault(preceding_call_id, []).append(native_id)
-                else:
-                    preceding_call_id = call_id
-            preceding_call_id = None
-            for output_item in output_items:
-                if isinstance(output_item, RealtimeConversationItemFunctionCall):
-                    preceding_call_id = output_item.call_id
-                    continue
-                if not isinstance(output_item, RealtimeConversationItemAssistantMessage) or output_item.id is None:
-                    continue
-                item_id = output_item.id
-                messages = [
-                    messages_by_id[native_id]
-                    for native_id in groups.get(preceding_call_id, [])
-                    if native_id in messages_by_id
-                ]
+            for item_id, native_ids in self._wire_message_groups_locked(response_key, output_items):
+                messages = [messages_by_id[native_id] for native_id in native_ids if native_id in messages_by_id]
                 if not messages:
                     continue
                 if len(messages) > 1:
@@ -653,6 +633,67 @@ class Chat:
                     if old_id in context:
                         context.remove(old_id)
                         context.add(item_id)
+
+    def _wire_message_groups_locked(
+        self, response_key: str | None, output_items: Sequence[ConversationItem]
+    ) -> list[tuple[str, list[str]]]:
+        """Pair each wire assistant message with its provisional history message ids.
+
+        Caller holds ``_lock``. Returns ``(wire_id, native_ids)`` in output
+        order; ``native_ids`` may name messages no longer in the buffer.
+        """
+        groups: dict[str | None, list[str]] = {}
+        preceding_call_id: str | None = None
+        # Tool boundaries survive text filtering and history eviction, so a
+        # hidden or evicted interval cannot take a later wire message's ID.
+        for native_id, kind, call_id in self._provisional_output_items.get(response_key or "", []):
+            if kind == "message":
+                groups.setdefault(preceding_call_id, []).append(native_id)
+            else:
+                preceding_call_id = call_id
+        pairs: list[tuple[str, list[str]]] = []
+        preceding_call_id = None
+        for output_item in output_items:
+            if isinstance(output_item, RealtimeConversationItemFunctionCall):
+                preceding_call_id = output_item.call_id
+                continue
+            if not isinstance(output_item, RealtimeConversationItemAssistantMessage) or output_item.id is None:
+                continue
+            pairs.append((output_item.id, groups.get(preceding_call_id, [])))
+        return pairs
+
+    def assistant_text_by_item_id(
+        self, response_key: str | None, output_items: Sequence[ConversationItem]
+    ) -> dict[str, str]:
+        """Map each wire assistant message id to the raw text this chat holds for it.
+
+        Read-only. The text is the provisional assistant history written for
+        ``response_key`` (what the provider produced, before any spoken-form
+        normalisation), grouped onto wire messages as ``bind_assistant_item_ids``
+        groups them, with several provider messages joined by ``""``. A wire
+        message is left out when any of its history messages has been evicted
+        or its joined text is empty, and the map is empty once the response's
+        history is finalized, rolled back, or was never tracked.
+        """
+        with self._lock:
+            if (response_key or "") not in self._provisional_generations:
+                return {}
+            messages_by_id = {
+                item.id: item for item in self.buffer if isinstance(item, RealtimeConversationItemAssistantMessage)
+            }
+            texts: dict[str, str] = {}
+            for item_id, native_ids in self._wire_message_groups_locked(response_key, output_items):
+                if not native_ids or any(native_id not in messages_by_id for native_id in native_ids):
+                    continue
+                text = "".join(
+                    part.text
+                    for native_id in native_ids
+                    for part in messages_by_id[native_id].content or []
+                    if isinstance(part.text, str)
+                )
+                if text:
+                    texts[item_id] = text
+            return texts
 
     def remove_user_message(self, item_id: str) -> bool:
         """Remove an existing user message from the bounded chat buffer."""
