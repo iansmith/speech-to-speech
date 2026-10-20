@@ -4,7 +4,7 @@ import base64
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from openai.types.realtime import (
     ConversationItem,
@@ -71,6 +71,10 @@ if TYPE_CHECKING:
     from speech_to_speech.api.openai_realtime.service import ConnState, ServerEvent, _ResponseStatus, _StatusReason
 
 logger = logging.getLogger(__name__)
+
+# Sophie extension: the model's raw output text on each assistant message item
+# of a completed response.done; documented in README "Raw model text on response.done".
+RAW_TEXT_ITEM_KEY: Final = "s2s_raw_text"
 
 
 class ResponseHandler(RealtimeBaseHandler):
@@ -624,6 +628,25 @@ class ResponseHandler(RealtimeBaseHandler):
         voice_id = getattr(voice, "id", None)
         return voice_id if isinstance(voice_id, str) else None
 
+    def _with_raw_text(self, conn_id: str, response: RealtimeResponse) -> RealtimeResponse:
+        """Stamp each assistant message with the raw text the chat holds for it.
+
+        The value is an extra key (the SDK models allow extras and serialise
+        them); content parts and their spoken transcript are left untouched.
+        Messages the chat has no complete text for are left without the key.
+        """
+        st = self._state(conn_id)
+        raw = st.runtime_config.chat.assistant_text_by_item_id(st.current_response_key, response.output or [])
+        if not raw:
+            return response
+        output: list[ConversationItem] = [
+            item.model_copy(update={RAW_TEXT_ITEM_KEY: raw[item.id]})
+            if isinstance(item, RealtimeConversationItemAssistantMessage) and item.id in raw
+            else item
+            for item in response.output or []
+        ]
+        return response.model_copy(update={"output": output})
+
     # Annotated with ConversationItem (the SDK's own 9-type item union) rather
     # than the two types actually produced: list is invariant, so a narrower
     # element type is rejected where RealtimeResponse.output is assigned.
@@ -1062,6 +1085,10 @@ class ResponseHandler(RealtimeBaseHandler):
             for pending in st.pending_text_outputs:
                 events.extend(self._finish_message_output(conn_id, pending, item_status, wants_audio, response_key))
             terminal_response = self._build_response(conn_id, status, reason)
+            if status == "completed":
+                # Read before bind renames the history and before
+                # _end_response rolls back anything not finalized.
+                terminal_response = self._with_raw_text(conn_id, terminal_response)
             function_outputs = {
                 getattr(item, "call_id", None): item
                 for item in (terminal_response.output or [])

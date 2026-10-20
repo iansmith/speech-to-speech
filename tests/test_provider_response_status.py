@@ -119,11 +119,13 @@ def _client(payload, stream):
     )
 
 
-def _run(backend, stream, signal, modality, payload=None):
+def _run(backend, stream, signal, modality, payload=None, *, conversation=None, tts_texts=None):
     handler = (_chat_handler if backend == "chat" else _responses_handler)(stream=stream)
     request = _make_request()
     request.runtime_config.session = RealtimeSessionCreateRequest(type="realtime", output_modalities=[modality])
     request.response = RealtimeResponseCreateParams(output_modalities=[modality])
+    if conversation is not None:
+        request.response = RealtimeResponseCreateParams(output_modalities=[modality], conversation=conversation)
     side_channel = Queue()
     processor = LMOutputProcessor.__new__(LMOutputProcessor)
     processor.setup(text_output_queue=side_channel)
@@ -143,6 +145,8 @@ def _run(backend, stream, signal, modality, payload=None):
                 if isinstance(processed, PipelineEvent):
                     events.extend(service.dispatch_pipeline_event(conn, processed))
                 elif isinstance(processed, TTSInput):
+                    if tts_texts is not None:
+                        tts_texts.append(processed.text)
                     # Stand in for TTS with real PCM so the status tests also
                     # cover the audio resampler and its terminal ordering.
                     events.extend(service.encode_audio_chunk(conn, b"\x00" * 512, processed.response_key))
