@@ -9,6 +9,7 @@ import hashlib
 import json
 from queue import Queue
 from threading import Event, Thread
+from typing import Any
 
 import numpy as np
 import pytest
@@ -2368,10 +2369,22 @@ class TestTextConnectionToolFollowup:
         conn_id,
         text_prompt_queue,
         output_path,
+        monkeypatch,
     ):
         st = service._state(conn_id)
         origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE)
         generation_done = ResponseGenerationDoneEvent(response_key=origin.response_key, call_ids=[call.call_id])
+        # A skipped prefetch must bind no latency tracker: binding one would
+        # create a tracker for a response that never happens and run
+        # _bind_turn_trace for it.
+        bound: list[str] = []
+        real_bind = service.bind_response_latency_tracker
+
+        def spy_bind(conn: str, response_key: str, **kwargs: Any) -> None:
+            bound.append(response_key)
+            real_bind(conn, response_key, **kwargs)
+
+        monkeypatch.setattr(service, "bind_response_latency_tracker", spy_bind)
 
         if output_path == "item_create_after_response_done":
             service.dispatch_pipeline_event(conn_id, generation_done)
@@ -2391,6 +2404,7 @@ class TestTextConnectionToolFollowup:
 
         assert text_prompt_queue.empty()
         assert st.tool_followup_prefetch_request is None
+        assert bound == []
         closed_before = dict(st.closed_response_keys)
 
         created = service.handle_response_create(
@@ -2406,6 +2420,33 @@ class TestTextConnectionToolFollowup:
         assert request.prefetch_transaction is None
         assert st.current_response_key == request.response_key
         assert st.closed_response_keys == closed_before
+        assert bound == [request.response_key]
+
+    def test_text_only_record_keeps_the_newest_128_keys(self, service, conn_id, text_prompt_queue):
+        st = service._state(conn_id)
+        keys: list[str] = []
+        for _ in range(129):
+            created = service.handle_response_create(
+                conn_id, ResponseCreateEvent(type="response.create", response=TEXT_CREATE)
+            )
+            assert isinstance(created, ResponseCreatedEvent)
+            request = text_prompt_queue.get_nowait()
+            keys.append(request.response_key)
+            service.finish_response(conn_id, response_key=request.response_key)
+
+        assert len(st.text_only_response_keys) == 128
+        assert keys[0] not in st.text_only_response_keys
+        assert list(st.text_only_response_keys) == keys[1:]
+
+        # The 130th text create is the origin of a tool round: its key must
+        # survive its own insertion, so the round still skips the prefetch.
+        origin, call = _origin_tool_round(service, conn_id, text_prompt_queue, TEXT_CREATE)
+        assert origin.response_key in st.text_only_response_keys
+        assert len(st.text_only_response_keys) == 128
+        _finish_tool_round_in_sophie_order(service, conn_id, origin, call)
+
+        assert text_prompt_queue.empty()
+        assert st.tool_followup_prefetch_request is None
 
     def test_text_connection_session_update_does_not_restart_prefetch(self, service, conn_id, text_prompt_queue):
         st = service._state(conn_id)
