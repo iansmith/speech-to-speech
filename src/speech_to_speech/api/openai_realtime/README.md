@@ -236,6 +236,7 @@ Which turn a request answers:
 | out-of-band (`conversation: "none"`) | no turn headers |
 | warm-up and history compaction | no headers at all |
 | unit moved to another call after the response was bound | the new call's `X-Client-Session-Id` only |
+| response bound while no call id was set, sent after `session.update` set one | `X-Client-Session-Id` only |
 | unit released (call id cleared) | no headers at all |
 
 Rules a reader should rely on:

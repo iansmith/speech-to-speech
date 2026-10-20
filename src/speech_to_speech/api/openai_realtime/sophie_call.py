@@ -20,7 +20,8 @@ TRACEPARENT_HEADER = "traceparent"
 # turn_id / turn_revision on that turn's transcription.completed frame (not
 # SOP-805's epoch-suffixed wire id). Sent whenever a call id is set and the
 # response has a caller turn, whether or not voice tracing is on. Sophie's
-# proxy reads both by these names and must strip both upstream.
+# proxy is to read both by these names and strip both upstream (the SOP-853
+# Sophie half); until it does, they are forwarded to the provider.
 CLIENT_TURN_ID_HEADER = "X-Client-Turn-Id"
 CLIENT_TURN_REVISION_HEADER = "X-Client-Turn-Revision"
 
