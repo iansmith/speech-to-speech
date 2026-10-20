@@ -104,7 +104,7 @@ flowchart LR
 | `response.output_audio_transcript.delta` | Incremental assistant transcript suffix for the current audio output item. |
 | `response.output_audio_transcript.done` | Full assistant transcript, emitted once when the output item closes. On cancellation, it contains the accumulated partial transcript. |
 | `response.function_call_arguments.done` | Tool call with `call_id`, `name`, and JSON `arguments`. |
-| `response.done` | Response finished: `completed`, `cancelled`, `incomplete`, or `failed`. See terminal status details below. |
+| `response.done` | Response finished: `completed`, `cancelled`, `incomplete`, or `failed`. See terminal status details below. Completed responses may carry the `s2s_raw_text` extension on assistant message items (see below). |
 
 ### Optional viseme output
 
@@ -196,6 +196,21 @@ When opted in:
 Assistant transcript chunks are emitted as `response.output_audio_transcript.delta`; concatenating their `delta` values reproduces the terminal `response.output_audio_transcript.done.transcript`. A response that produced transcript text emits exactly one transcript `done` after `response.output_audio.done` and before `response.done`, including when cancellation closes an incomplete assistant item.
 
 Clients that previously consumed each chunk-level `done` event must switch their live rendering to `delta` and treat `done` only as finalization. The packaged audio client also accepts a legacy done-only stream, but it does not re-render the full terminal transcript after displaying its deltas.
+
+### Raw model text on response.done (Sophie extension)
+
+A completed `response.done` may carry the key `s2s_raw_text` (a string) on each `message` item of `response.output`. It is never set on content parts and never on `response.output_item.done`, which can be sent before the response's final status is known.
+
+The value is the model's output text exactly as the server's conversation history holds it for that item: the provider's text deltas concatenated, with the newlines, markdown and characters that the spoken transcript drops or rewrites still in place. If a provider retained several messages in one wire item, they are concatenated with no separator. A Responses API refusal is included, although it is not spoken.
+
+The key is present only when the response status is `completed` and the history still holds that item's text. It is absent on:
+
+- cancelled, incomplete and failed responses (their history is rolled back);
+- out-of-band (`conversation: "none"`) responses, which write no history;
+- `function_call` items;
+- items whose history was evicted before the response finished, or whose text is empty.
+
+`content[].transcript` and `content[].text` are unchanged. Clients that do not know the key ignore it. A client that wants the raw text should fall back to `transcript` / `text` when the key is absent.
 
 ---
 
