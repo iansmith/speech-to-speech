@@ -66,6 +66,63 @@ SUPPORTED_LANGUAGES = [
 ]
 
 
+def _nano_hf_download(model_name: str) -> str:
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=model_name, filename=f"{model_name.split('/')[-1]}.nemo")
+
+
+def _nano_tokenizer(proto: bytes) -> Any:
+    import sentencepiece as spm
+
+    sp = spm.SentencePieceProcessor()
+    sp.LoadFromSerializedProto(proto)
+    return sp
+
+
+def _load_nano_parakeet(model_name: str, device: str) -> Any:
+    """nano_parakeet.from_pretrained, with the bf16 cast moved before the GPU move.
+
+    from_pretrained (0.2.1) moves the fp32 model to the device and casts the
+    encoder, decoder and joint to bf16 afterwards, so the GPU briefly holds the
+    fp32 weights (~2.1 GiB for parakeet-tdt-0.6b-v3). On a g6f.xlarge's 3 GiB
+    L4 slice that peak is an OOM, although the bf16 model it ends with uses
+    ~1.3 GiB. This does the same steps with the cast first.
+
+    Same cache and key as from_pretrained, so the pipelines still share one
+    model. Where from_pretrained would not cast (CPU, or a GPU without bf16,
+    such as the T4), it is called as before.
+    """
+    import nano_parakeet
+    import torch
+
+    if not (device.startswith("cuda") and torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
+        return nano_parakeet.from_pretrained(model_name=model_name, device=device)
+
+    from nano_parakeet._loader import get_bundled_tokenizer_proto, load_nemo_state_dict, remap_state_dict
+
+    dtype = torch.bfloat16
+    cache_key = (model_name, device, dtype)
+    if cache_key in nano_parakeet._MODEL_CACHE:
+        return nano_parakeet._MODEL_CACHE[cache_key]
+
+    model = nano_parakeet.ParakeetTDT()
+    sd = remap_state_dict(load_nemo_state_dict(_nano_hf_download(model_name), map_location="cpu"))
+    missing, _ = model.load_state_dict(sd, strict=False)
+    if missing:
+        raise RuntimeError(f"Missing keys in state_dict: {missing[:10]}")
+    # The preprocessor stays float32 (its STFT requires it), as in from_pretrained.
+    model.encoder.to(dtype)
+    model.decoder.to(dtype)
+    model.joint.to(dtype)
+    model = model.to(device).eval()
+    model.sp = _nano_tokenizer(get_bundled_tokenizer_proto())
+    model.warmup()
+
+    nano_parakeet._MODEL_CACHE[cache_key] = model
+    return model
+
+
 class ParakeetTDTSTTHandler(BaseSTTHandler):
     """
     Handles Speech-to-Text using NVIDIA Parakeet TDT model.
@@ -166,8 +223,8 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
     def _setup_nano_parakeet(self, model_name: str) -> None:
         """Setup for CUDA/CPU using nano-parakeet."""
         try:
+            import nano_parakeet  # noqa: F401 -- a missing package raises the ImportError below
             import torch
-            from nano_parakeet import from_pretrained
 
             self.backend = "nano_parakeet"
 
@@ -175,7 +232,7 @@ class ParakeetTDTSTTHandler(BaseSTTHandler):
                 logger.warning("CUDA requested but not available. Falling back to CPU for nano-parakeet.")
                 self.device = "cpu"
 
-            self.model = from_pretrained(model_name=model_name, device=self.device)
+            self.model = _load_nano_parakeet(model_name, self.device)
 
             logger.info(f"nano-parakeet model loaded successfully on {self.device}")
         except ImportError as e:
