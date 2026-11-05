@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import numpy as np
 import pytest
+from openai import OpenAI
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.sophie_call import (
     CLIENT_SESSION_HEADER,
@@ -24,13 +30,17 @@ from speech_to_speech.api.openai_realtime.websocket_router import (
     _release_unit_after_drain,
     claim_idle_unit,
 )
+from speech_to_speech.LLM import base_openai_compatible_language_model as llm_module
 from speech_to_speech.LLM.base_openai_compatible_language_model import (
     BaseOpenAICompatibleHandler,
 )
+from speech_to_speech.LLM.chat import make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
 )
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
+from speech_to_speech.pipeline.messages import GenerateResponseRequest
+from speech_to_speech.utils.request_tracing import REQUEST_ID_HEADER
 
 
 def _handler() -> ChatCompletionsApiModelHandler:
@@ -243,3 +253,66 @@ def test_claim_release_clears_the_service_turn_traces() -> None:
     assert claim_idle_unit([unit], None) is unit
     assert service.voice_traces.ref_for("turn_1", 0, "speech", 0.0, 0.0) is None
     assert len(exporter.get_finished_spans()) == 1
+
+
+_CHAT_REPLY = {
+    "id": "provider-response",
+    "object": "chat.completion",
+    "created": 0,
+    "model": "synthetic",
+    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Synthetic."}}],
+}
+_RESPONSES_REPLY = {
+    "id": "provider-response",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "synthetic",
+    "output": [
+        {
+            "id": "message-one",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Synthetic.", "annotations": []}],
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize("backend", ["chat", "responses", "responses-audio"])
+def test_request_id_and_sophie_headers_reach_one_request(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    # SOP-1113: upstream's request_options puts X-Speech-Request-Id into
+    # extra_headers before the backend's _request runs, and the backend adds
+    # the Sophie headers. Both must reach the provider on the same request;
+    # replacing the dict instead of merging it drops the request id.
+    sent: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=_RESPONSES_REPLY if request.url.path.endswith("/responses") else _CHAT_REPLY)
+
+    client = OpenAI(
+        api_key="provider-secret-sentinel",
+        base_url="https://provider.test/v1",
+        # A mount, so ProviderConnectAborter still finds a real default pool.
+        http_client=httpx.Client(mounts={"all://": httpx.MockTransport(respond)}),
+    )
+    monkeypatch.setattr(llm_module, "OpenAI", lambda **kwargs: client)
+    handler_class = ChatCompletionsApiModelHandler if backend == "chat" else ResponsesApiModelHandler
+    monkeypatch.setattr(handler_class, "warmup", lambda self: None)
+    handler = handler_class(Event(), Queue(), Queue(), setup_kwargs={"model_name": "synthetic", "stream": False})
+    try:
+        handler.set_sophie_call_id("call-1113")
+        config = RuntimeConfig()
+        config.chat.add_item(make_user_message("synthetic input"))
+        request = GenerateResponseRequest(runtime_config=config, turn_id="turn_1", turn_revision=0)
+        if backend == "responses-audio":
+            request.audio = np.zeros(160, dtype=np.float32)
+            request.audio_sample_rate = 16_000
+        list(handler.process(request))
+        assert len(sent) == 1
+        assert sent[0].headers.get(REQUEST_ID_HEADER)
+        assert sent[0].headers.get(CLIENT_SESSION_HEADER) == "call-1113"
+    finally:
+        handler.cleanup()

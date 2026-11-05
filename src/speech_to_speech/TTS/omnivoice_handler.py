@@ -8,22 +8,21 @@ from typing import Any, Iterator
 
 import numpy as np
 import scipy.signal
-from rich.console import Console
 
-from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.console import console
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.TTS.base_tts_handler import BaseTTSHandler
 from speech_to_speech.utils.utils import TORCH_DEVICES, resolve_device
 
 logger = logging.getLogger(__name__)
-console = Console()
 
 PIPELINE_SAMPLE_RATE = 16000
 
 
-class OmniVoiceTTSHandler(BaseHandler[TTSIn, TTSOut]):
+class OmniVoiceTTSHandler(BaseTTSHandler):
     def setup(
         self,
         should_listen: Event,
@@ -119,9 +118,6 @@ class OmniVoiceTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     return self.language_voice_clone_prompts[key]
         return self.voice_clone_prompt
 
-    def _is_cancelled(self, generation: int | None) -> bool:
-        return generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation)
-
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
@@ -165,17 +161,25 @@ class OmniVoiceTTSHandler(BaseHandler[TTSIn, TTSOut]):
             generation_kwargs["instruct"] = self.instruct
 
         console.print(f"[green]ASSISTANT: {text}")
+        # Synthesis start: after speculative gate / prompt selection, before provider work.
+        timer = self._latency_timer(tts_input, cancel_generation)
         audios = self.model.generate(**generation_kwargs)
 
         # OmniVoice generation is blocking. If the user interrupted while it ran,
         # discard the completed buffer before it reaches the output client.
-        if self._is_cancelled(cancel_generation):
+        if self._is_stale(cancel_generation):
             logger.info("OmniVoice TTS output cancelled (interruption)")
             return
         if not audios:
             return
 
         audio = np.asarray(audios[0], dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return
+
+        # Full waveform is available before resample / block assembly.
+        timer.first_provider_audio()
+
         source_sample_rate = int(getattr(self.model, "sampling_rate", 24000))
         if source_sample_rate != PIPELINE_SAMPLE_RATE:
             divisor = gcd(source_sample_rate, PIPELINE_SAMPLE_RATE)
@@ -186,16 +190,21 @@ class OmniVoiceTTSHandler(BaseHandler[TTSIn, TTSOut]):
             )
 
         audio_int16 = np.clip(audio * 32768, -32768, 32767).astype(np.int16)
+
+        def emit(block: np.ndarray) -> Iterator[TTSOut]:
+            timer.first_yield()
+            yield block
+
         full_block_samples = (len(audio_int16) // self.blocksize) * self.blocksize
         for offset in range(0, full_block_samples, self.blocksize):
-            if self._is_cancelled(cancel_generation):
+            if self._is_stale(cancel_generation):
                 logger.info("OmniVoice TTS output cancelled (interruption)")
                 return
-            yield audio_int16[offset : offset + self.blocksize]
+            yield from emit(audio_int16[offset : offset + self.blocksize])
 
         if full_block_samples < len(audio_int16):
-            if self._is_cancelled(cancel_generation):
+            if self._is_stale(cancel_generation):
                 logger.info("OmniVoice TTS output cancelled (interruption)")
                 return
             tail = audio_int16[full_block_samples:]
-            yield np.pad(tail, (0, self.blocksize - len(tail)))
+            yield from emit(np.pad(tail, (0, self.blocksize - len(tail))))
