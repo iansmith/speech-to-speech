@@ -795,12 +795,25 @@ def test_vad_discards_streamed_audio_after_a_phantom_trigger(speech_started):
 
     assert sink.discard_count == 1
     if speech_started:
+        stops = _queued_speech_stops(handler)
+        assert len(stops) == 1
+        # A phantom trigger is not a turn end.
+        assert getattr(stops[0], "turn_end_candidate", None) is False
         assert tracker.phase == TurnPhase.SOFT_ENDED
         assert not tracker.can_reopen(1000)
         assert tracker.speech_started(1000) == ("turn_2", 0, False)
     else:
         assert tracker.current_turn() == (None, None)
         assert tracker.phase is None
+
+
+def _queued_speech_stops(handler: VADHandler) -> list[SpeechStoppedEvent]:
+    stops = []
+    while not handler.text_output_queue.empty():
+        event = handler.text_output_queue.get_nowait()
+        if isinstance(event, SpeechStoppedEvent):
+            stops.append(event)
+    return stops
 
 
 def _drive_final_segment(handler: VADHandler, active_chunks: int = 12, segment_chunks: int = 31) -> list:
@@ -822,6 +835,9 @@ def test_vad_complete_smart_turn_selects_shorter_speculative_grace():
 
     assert len(outputs) == 1
     assert outputs[0].processing_delay_s == 0.0
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    assert getattr(stops[0], "turn_end_candidate", None) is True
     grace = handler.speculative_turns._reopen_grace
     assert grace is not None
     assert grace.revision == 0
@@ -837,6 +853,10 @@ def test_vad_incomplete_smart_turn_selects_longer_speculative_grace():
 
     assert len(outputs) == 1
     assert outputs[0].processing_delay_s == 0.6
+    # An incomplete Smart Turn verdict is still a turn-end candidate.
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    assert getattr(stops[0], "turn_end_candidate", None) is True
     grace = handler.speculative_turns._reopen_grace
     assert grace is not None
     assert grace.revision == 0
@@ -923,6 +943,20 @@ def test_vad_max_speech_is_enforced_before_smart_turn():
 
     assert _drive_final_segment(handler, segment_chunks=63) == []
     assert analyzer.calls == []
+
+
+def test_vad_rejected_segment_after_speech_started_is_not_a_turn_end():
+    handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
+    handler.max_speech_ms = 1500
+    assert handler.speculative_turns.speech_started(0) == ("turn_1", 0, False)
+    handler._speech_started_emitted = True
+
+    assert _drive_final_segment(handler, segment_chunks=63) == []
+
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    # A segment the VAD rejects is not a turn end: no turn.ended for it.
+    assert getattr(stops[0], "turn_end_candidate", None) is False
 
 
 def _handler_after_soft_ended_turn() -> VADHandler:

@@ -25,6 +25,33 @@ class SpeechToSpeechInputAudioTranscriptionSnapshotEvent(BaseModel):
     transcript: str
 
 
+class TurnEndedEvent(BaseModel):
+    """Fork extension: the VAD judged a stop candidate for this item's turn.
+
+    Sent once per VAD soft end, at the stop decision, ahead of the
+    ``input_audio_buffer.speech_stopped`` that is held until the turn commits.
+    It is not held and never repeated when the held terminals are released.
+    Not part of the OpenAI Realtime API; generic clients ignore it.
+    """
+
+    type: Literal["turn.ended"] = "turn.ended"
+    event_id: str
+    item_id: str
+    audio_end_ms: int
+
+
+class TurnResumedEvent(BaseModel):
+    """Fork extension: speech resumed in a reopened turn that keeps its item.
+
+    Sent in place of the ``input_audio_buffer.speech_started`` that a reopen
+    reusing the open item does not send. Not part of the OpenAI Realtime API.
+    """
+
+    type: Literal["turn.resumed"] = "turn.resumed"
+    event_id: str
+    item_id: str
+
+
 class InputItemState(BaseModel):
     """Active state for one client-visible input transcription item."""
 

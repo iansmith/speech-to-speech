@@ -234,12 +234,13 @@ async def test_final_transcription_reopen_is_one_item_until_response(monkeypatch
         assert tracker.confirm_reopen_candidate(turn_id, revision, candidate)
         # Reopening a finalized STT hypothesis keeps the externally open input
         # item; it does not emit another speech onset or publish the old text.
-        assert (
-            service.dispatch_pipeline_event(
+        # The fork's turn.resumed is the only event (SOP-1110).
+        assert [
+            event.type
+            for event in service.dispatch_pipeline_event(
                 sid, SpeechStartedEvent(turn_id=turn_id, turn_revision=candidate, reopened=True)
             )
-            == []
-        )
+        ] == ["turn.resumed"]
         events += service.dispatch_pipeline_event(sid, SpeechStoppedEvent(turn_id=turn_id, turn_revision=candidate))
         assert (
             service.dispatch_pipeline_event(

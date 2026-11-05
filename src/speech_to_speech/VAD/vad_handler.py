@@ -836,6 +836,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             audio_end_ms=end_ms,
                             turn_id=turn_id,
                             turn_revision=turn_revision,
+                            turn_end_candidate=True,
                         )
                     )
                 self._speculative_audio_prefix = output_array

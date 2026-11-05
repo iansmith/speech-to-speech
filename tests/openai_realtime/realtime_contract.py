@@ -20,6 +20,10 @@ from pydantic import TypeAdapter
 
 _SERVER_EVENT = TypeAdapter(RealtimeServerEvent)
 
+# The fork's non-OpenAI server events. A generic client ignores them, so the
+# schema helpers skip exactly these and validate everything else strictly.
+FORK_EXTENSION_EVENT_TYPES: frozenset[str] = frozenset({"turn.ended", "turn.resumed"})
+
 # Events that carry a per-item payload keyed by output_index.
 _ITEM_SCOPED = {
     "response.output_item.added",
@@ -57,9 +61,14 @@ _EVENT_PART_TYPE = {
 
 
 def assert_openai_schema(events: list[Any]) -> None:
-    """Every emitted event must parse as an official OpenAI server event."""
+    """Every emitted event must parse as an official OpenAI server event.
+
+    The fork's extension events (``FORK_EXTENSION_EVENT_TYPES``) are skipped.
+    """
     for index, event in enumerate(events):
         payload = event.model_dump(mode="json", exclude_none=True)
+        if payload.get("type") in FORK_EXTENSION_EVENT_TYPES:
+            continue
         try:
             _SERVER_EVENT.validate_python(payload)
         except Exception as exc:  # pragma: no cover - failure path
@@ -72,10 +81,13 @@ def parse_wire_events(messages: list[dict[str, Any]]) -> list[Any]:
     """Parse raw wire JSON with the OpenAI SDK's own models.
 
     Used by the transport tests so the lifecycle is asserted on the objects an
-    official client would build, not on the server's internal types.
+    official client would build, not on the server's internal types. The
+    fork's extension events are dropped, as a generic client would ignore them.
     """
     parsed: list[Any] = []
     for index, message in enumerate(messages):
+        if message.get("type") in FORK_EXTENSION_EVENT_TYPES:
+            continue
         try:
             parsed.append(_SERVER_EVENT.validate_python(message))
         except Exception as exc:  # pragma: no cover - failure path

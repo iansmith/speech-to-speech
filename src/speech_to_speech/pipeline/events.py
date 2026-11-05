@@ -51,6 +51,10 @@ class SpeechStoppedEvent(PipelineEvent):
     audio_end_ms: int = 0
     turn_id: str | None = None
     turn_revision: int | None = None
+    # Set only on the VAD's soft end, after Smart Turn has run: the stop is a
+    # candidate end of the user's turn. Phantom triggers and discarded
+    # segments also stop speech but leave it False. Internal; never serialized.
+    turn_end_candidate: bool = Field(default=False, exclude=True)
 
 
 # ── Transcription events (TranscriptionNotifier) ─────────────────────

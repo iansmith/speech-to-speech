@@ -64,6 +64,8 @@ from speech_to_speech.api.openai_realtime.input_state import (
     InputItemState,
     PendingInputTerminal,
     SpeechToSpeechInputAudioTranscriptionSnapshotEvent,
+    TurnEndedEvent,
+    TurnResumedEvent,
 )
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.visemes import SpeechToSpeechVisemesEvent
@@ -167,6 +169,8 @@ ServerEvent = Union[
     ConversationItemInputAudioTranscriptionCompletedEvent,
     ConversationItemInputAudioTranscriptionFailedEvent,
     SpeechToSpeechInputAudioTranscriptionSnapshotEvent,
+    TurnEndedEvent,
+    TurnResumedEvent,
     ResponseCreatedEvent,
     ResponseDoneEvent,
     ResponseAudioDeltaEvent,

@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
+from pydantic import BaseModel
 
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
@@ -33,6 +34,7 @@ from speech_to_speech.pipeline.messages import (
 from .realtime_contract import (
     assert_openai_schema,
     assert_response_lifecycle_contract,
+    parse_wire_events,
 )
 
 
@@ -316,3 +318,31 @@ def test_contract_checker_catches_a_content_part_closed_twice(service, conn_id):
     duplicated = [*events[: part_done_index + 1], events[part_done_index], *events[part_done_index + 1 :]]
     with pytest.raises(AssertionError, match="content part closed twice"):
         assert_response_lifecycle_contract(duplicated, wants_audio=False)
+
+
+# ── Fork extension events (SOP-1110) ──────────────────────────────────
+
+
+class _WireEvent(BaseModel):
+    type: str
+    event_id: str = "event_1"
+    item_id: str = "item_1"
+
+
+def test_schema_helpers_accept_listed_fork_turn_events():
+    events = [
+        _WireEvent(type="turn.ended"),
+        _WireEvent(type="turn.resumed"),
+    ]
+
+    assert_openai_schema(events)
+    assert parse_wire_events([event.model_dump() for event in events]) == []
+
+
+def test_schema_helpers_reject_unlisted_non_openai_events():
+    bogus = _WireEvent(type="turn.bogus")
+
+    with pytest.raises(AssertionError):
+        assert_openai_schema([bogus])
+    with pytest.raises(AssertionError):
+        parse_wire_events([bogus.model_dump()])
