@@ -63,14 +63,24 @@ def _streaming_endpoint(initial):
     sent = Event()
     closed = Event()
     release = Event()
+    errors: list[BaseException] = []
 
-    def serve():
+    def serve() -> None:
+        try:
+            _serve()
+        except BaseException as exc:  # surfaced at fixture exit, not lost with the thread
+            errors.append(exc)
+
+    def _serve() -> None:
         connection, _ = listener.accept()
         with connection:
-            connection.settimeout(0.05)
+            connection.settimeout(2)
             request = b""
             while b"\r\n\r\n" not in request:
-                request += connection.recv(4096)
+                data = connection.recv(4096)
+                if not data:
+                    return
+                request += data
             headers, body = request.split(b"\r\n\r\n", 1)
             content_length = int(
                 next(
@@ -80,13 +90,17 @@ def _streaming_endpoint(initial):
                 )
             )
             while len(body) < content_length:
-                body += connection.recv(4096)
+                data = connection.recv(4096)
+                if not data:
+                    return
+                body += data
             connection.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
             )
             if initial:
                 connection.sendall(f"{len(initial):x}\r\n".encode() + initial + b"\r\n")
             sent.set()
+            connection.settimeout(0.05)
             while not release.is_set():
                 try:
                     if not connection.recv(4096):
@@ -94,6 +108,11 @@ def _streaming_endpoint(initial):
                         return
                 except socket.timeout:
                     continue
+                except (ConnectionResetError, ConnectionAbortedError):
+                    # A client closed with the response headers still unread in
+                    # its receive buffer sends RST, not FIN: that is a close too.
+                    closed.set()
+                    return
             final = _event(status=2)
             try:
                 connection.sendall(f"{len(final):x}\r\n".encode() + final + b"\r\n0\r\n\r\n")
@@ -108,6 +127,8 @@ def _streaming_endpoint(initial):
         release.set()
         server.join(2)
         listener.close()
+        if errors:
+            raise errors[0]
         assert not server.is_alive()
 
 
