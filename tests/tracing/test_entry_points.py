@@ -62,7 +62,8 @@ def test_configured_serve_inits_before_build_and_always_shuts_down(
         return server
 
     monkeypatch.setattr(configured_runtime, "build_configured_server", build)
-    config: Any = SimpleNamespace(runtime={})
+    # run_configured_command reads config.client since upstream's conversation-output mode.
+    config: Any = SimpleNamespace(runtime={}, client=None)
 
     if failing is None:
         configured_runtime.run_configured_command("serve", config)

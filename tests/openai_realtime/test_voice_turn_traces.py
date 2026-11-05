@@ -183,6 +183,16 @@ def _send(unit: SimpleNamespace, request: GenerateResponseRequest) -> dict[str, 
     return dict(headers) if headers else {}
 
 
+_SOPHIE_HEADERS = frozenset(
+    {CLIENT_SESSION_HEADER, CLIENT_TURN_ID_HEADER, CLIENT_TURN_REVISION_HEADER, TURN_ID_HEADER, TRACEPARENT_HEADER}
+)
+
+
+def _sophie_headers(call: dict[str, Any]) -> set[str]:
+    """The Sophie header names on one recorded request (SOP-625/853/805)."""
+    return _SOPHIE_HEADERS & set(call.get("extra_headers") or {})
+
+
 def _finish(unit: SimpleNamespace, request: GenerateResponseRequest, status: str = "completed") -> list[Any]:
     """Open *request*'s response (as its first output would) and end it."""
     service: RealtimeService = unit.service
@@ -544,7 +554,9 @@ def test_tracing_off_sends_caller_turn_but_no_trace_headers(unit: SimpleNamespac
 
     clear_sophie_call_id(unit)
     list(unit.llm.process(request))
-    assert "extra_headers" not in _completions(unit.llm).calls[-1]
+    # Upstream's X-Speech-Request-Id (request_options) rides every request,
+    # so assert on the Sophie headers rather than on extra_headers' absence.
+    assert not _sophie_headers(_completions(unit.llm).calls[-1])
 
 
 def test_non_uuid_call_id_sends_caller_turn_but_no_trace_headers(unit: SimpleNamespace) -> None:
@@ -1113,7 +1125,9 @@ def test_call_change_or_clear_drops_caller_turn(unit: SimpleNamespace) -> None:
 
     clear_sophie_call_id(unit)
     list(unit.llm.process(request))
-    assert "extra_headers" not in _completions(unit.llm).calls[-1]
+    # Upstream's X-Speech-Request-Id (request_options) rides every request,
+    # so assert on the Sophie headers rather than on extra_headers' absence.
+    assert not _sophie_headers(_completions(unit.llm).calls[-1])
 
     # A turn bound while no call id is set never carries a turn, even once one is.
     turns.start_turn()

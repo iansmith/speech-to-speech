@@ -70,6 +70,7 @@ from speech_to_speech.api.openai_realtime.input_state import (
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.visemes import SpeechToSpeechVisemesEvent
 from speech_to_speech.LLM.chat import Chat, make_user_audio_message, make_user_message
+from speech_to_speech.LLM.utils import WHISPER_LANGUAGE_TO_LLM_LANGUAGE
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
@@ -90,7 +91,9 @@ from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker, TurnGateAction, TurnPhase
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
 from speech_to_speech.pipeline.turn_latency import SpeechLatencyAnchor, TurnLatencyStore, TurnLatencyTracker
+from speech_to_speech.speech_languages import SpeechLanguageCapabilities
 from speech_to_speech.tracing.voice_turns import VoiceTurnTraces, build_stage_intervals
+from speech_to_speech.utils.request_tracing import log_response_binding
 from speech_to_speech.utils.utils import _generate_id, audio_to_wav_base64
 
 logger = logging.getLogger(__name__)
@@ -460,6 +463,8 @@ class RealtimeService:
         # None means the active backend does not declare a complete language set.
         self.stt_supported_languages: set[str] | None = None
         self.tts_supported_languages: set[str] | None = None
+        self.stt_language_capabilities = SpeechLanguageCapabilities()
+        self.tts_language_capabilities = SpeechLanguageCapabilities()
         self.stt_auto_reset_supported: bool = True
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
@@ -488,6 +493,47 @@ class RealtimeService:
             ResponseFailedEvent: self._on_response_failed,
         }
 
+    def get_language_capabilities(self) -> dict[str, Any]:
+        """Describe coverage separately from valid named session selections."""
+
+        def languages(codes: frozenset[str] | set[str] | None) -> list[dict[str, str | None]] | None:
+            if codes is None:
+                return None
+            return [{"code": code, "name": WHISPER_LANGUAGE_TO_LLM_LANGUAGE.get(code)} for code in sorted(codes)]
+
+        def describe(capabilities: SpeechLanguageCapabilities) -> dict[str, Any]:
+            return {
+                "languages": languages(capabilities.languages),
+                "supports_language_selection": capabilities.supports_language_selection,
+                "supports_auto": capabilities.supports_auto,
+            }
+
+        stt, tts = self.stt_language_capabilities, self.tts_language_capabilities
+        shared = None if stt.languages is None or tts.languages is None else stt.languages & tts.languages
+        selectable: set[str] | None = None
+        for capabilities, allowed in (
+            (stt, self.stt_supported_languages),
+            (tts, self.tts_supported_languages),
+        ):
+            if not capabilities.supports_language_selection:
+                selectable = set()
+                break
+            for known in (capabilities.languages, allowed):
+                if known is not None:
+                    selectable = set(known) if selectable is None else selectable.intersection(known)
+        # A partial known set cannot establish complete coverage for a selector.
+        if selectable and shared is None:
+            selectable = None
+        return {
+            "stt": describe(stt),
+            "tts": describe(tts),
+            "conversation": {
+                "languages": languages(shared),
+                "selectable_languages": languages(selectable),
+                "session_auto_supported": self.stt_auto_reset_supported,
+            },
+        }
+
     # ── Connection lifecycle ─────────────────────
 
     def register(self) -> str:
@@ -503,6 +549,7 @@ class RealtimeService:
                 ),
             )
         )
+        state.runtime_config.bind_trace_session(state.session_id)
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
@@ -551,19 +598,32 @@ class RealtimeService:
         *,
         turn_id: str | None = None,
         turn_revision: int | None = None,
+        parent_response_key: str | None = None,
+        parent_call_id: str | None = None,
         source: Literal["speech", "client", "tool"] = "speech",
         speech_anchor: SpeechLatencyAnchor | None = None,
     ) -> None:
+        existing = self.turn_latency_store.get_response(response_key)
         tracker = self.turn_latency_store.get_or_create_response(
             response_key,
             turn_id=turn_id,
             turn_revision=turn_revision,
             session_id=conn_id,
+            parent_response_key=parent_response_key,
+            parent_call_id=parent_call_id,
         )
         # Unconditional and apart from the trace bind: the caller-turn headers
         # (SOP-853) do not depend on voice tracing.
         tracker.sophie_call_id = self._sophie_call_id
         tracker.source = source
+        if existing is None:
+            log_response_binding(
+                session_id=self._state(conn_id).session_id,
+                response_key=response_key,
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                source=source,
+            )
         if source == "speech" and speech_anchor is None and turn_id is not None:
             speech_anchor = self._state(conn_id).speech_latency_anchors.get((turn_id, turn_revision))
         tracker.speech_anchor = speech_anchor
