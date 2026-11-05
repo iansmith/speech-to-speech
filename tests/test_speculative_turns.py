@@ -795,12 +795,25 @@ def test_vad_discards_streamed_audio_after_a_phantom_trigger(speech_started):
 
     assert sink.discard_count == 1
     if speech_started:
+        stops = _queued_speech_stops(handler)
+        assert len(stops) == 1
+        # A phantom trigger is not a turn end.
+        assert getattr(stops[0], "turn_end_candidate", None) is False
         assert tracker.phase == TurnPhase.SOFT_ENDED
         assert not tracker.can_reopen(1000)
         assert tracker.speech_started(1000) == ("turn_2", 0, False)
     else:
         assert tracker.current_turn() == (None, None)
         assert tracker.phase is None
+
+
+def _queued_speech_stops(handler: VADHandler) -> list[SpeechStoppedEvent]:
+    stops = []
+    while not handler.text_output_queue.empty():
+        event = handler.text_output_queue.get_nowait()
+        if isinstance(event, SpeechStoppedEvent):
+            stops.append(event)
+    return stops
 
 
 def _drive_final_segment(handler: VADHandler, active_chunks: int = 12, segment_chunks: int = 31) -> list:
@@ -822,6 +835,9 @@ def test_vad_complete_smart_turn_selects_shorter_speculative_grace():
 
     assert len(outputs) == 1
     assert outputs[0].processing_delay_s == 0.0
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    assert getattr(stops[0], "turn_end_candidate", None) is True
     grace = handler.speculative_turns._reopen_grace
     assert grace is not None
     assert grace.revision == 0
@@ -837,6 +853,10 @@ def test_vad_incomplete_smart_turn_selects_longer_speculative_grace():
 
     assert len(outputs) == 1
     assert outputs[0].processing_delay_s == 0.6
+    # An incomplete Smart Turn verdict is still a turn-end candidate.
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    assert getattr(stops[0], "turn_end_candidate", None) is True
     grace = handler.speculative_turns._reopen_grace
     assert grace is not None
     assert grace.revision == 0

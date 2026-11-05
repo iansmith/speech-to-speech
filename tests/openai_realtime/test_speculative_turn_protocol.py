@@ -91,13 +91,23 @@ class _Session:
             )
         )
 
-    def stop_speech(self, turn_id: str, revision: int, *, duration_s: float, audio_end_ms: int) -> list[Any]:
+    def stop_speech(
+        self,
+        turn_id: str,
+        revision: int,
+        *,
+        duration_s: float,
+        audio_end_ms: int,
+        turn_end_candidate: bool = True,
+    ) -> list[Any]:
+        """Stop speech the way the VAD's soft end does (a turn-end candidate)."""
         return self.dispatch(
             SpeechStoppedEvent(
                 turn_id=turn_id,
                 turn_revision=revision,
                 duration_s=duration_s,
                 audio_end_ms=audio_end_ms,
+                turn_end_candidate=turn_end_candidate,
             )
         )
 
@@ -152,15 +162,15 @@ def test_paused_utterance_is_one_committed_item(session):
     """
     session.start_turn("turn_1")
     session.hypothesis("turn_1", 0, "The quick brown fox")
-    assert session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000) == []
+    assert [e.type for e in session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)] == ["turn.ended"]
 
     session.resume_turn("turn_1", 0, audio_start_ms=1200)
     session.hypothesis("turn_1", 1, "The quick brown fox jumps over")
-    assert session.stop_speech("turn_1", 1, duration_s=2.0, audio_end_ms=2000) == []
+    assert [e.type for e in session.stop_speech("turn_1", 1, duration_s=2.0, audio_end_ms=2000)] == ["turn.ended"]
 
     session.resume_turn("turn_1", 1, audio_start_ms=2200)
     session.hypothesis("turn_1", 2, "The quick brown fox jumps over the lazy dog")
-    assert session.stop_speech("turn_1", 2, duration_s=3.0, audio_end_ms=3000) == []
+    assert [e.type for e in session.stop_speech("turn_1", 2, duration_s=3.0, audio_end_ms=3000)] == ["turn.ended"]
 
     # The final transcript feeds the LLM, but the user item stays private
     # until the server commits to answering it.
@@ -505,3 +515,150 @@ def test_direct_audio_commits_a_user_item_without_transcription(session):
     assert session.service._state(session.conn_id).input_items == {}
     assert_input_lifecycle_contract(session.events)
     assert_openai_schema(session.events)
+
+
+# ── Fork extension: turn.ended / turn.resumed (SOP-1110) ──────────────
+#
+# ``speech_stopped`` is held until the turn commits (above), so a relay that
+# times a hold sound from it starts the timer as the reply starts. The fork
+# sends ``turn.ended`` at the stop decision instead, and ``turn.resumed`` when
+# a reopened turn keeps its item and so gets no second ``speech_started``.
+
+
+def _types(events: list[Any]) -> list[str]:
+    return [event.type for event in events]
+
+
+def test_turn_ended_precedes_held_speech_stopped(session):
+    started = session.start_turn("turn_1")
+    item_id = started[0].item_id
+    session.hypothesis("turn_1", 0, "Book a table")
+
+    ended = session.stop_speech("turn_1", 0, duration_s=1.2, audio_end_ms=1234)
+
+    assert _types(ended) == ["turn.ended"]
+    assert ended[0].item_id == item_id
+    assert ended[0].audio_end_ms == 1234
+
+    session.final("turn_1", 0, "Book a table")
+    session.answer("turn_1", 0)
+
+    types = _types(session.events)
+    assert types.count("turn.ended") == 1
+    assert types.index("turn.ended") < types.index("input_audio_buffer.speech_stopped")
+    assert types.index("turn.ended") < types.index("conversation.item.input_audio_transcription.completed")
+    assert_openai_schema(session.events)
+    assert_input_lifecycle_contract(session.events)
+
+
+def test_turn_ended_once_per_stop_candidate_never_on_release(session):
+    started = session.start_turn("turn_1")
+    item_id = started[0].item_id
+    session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)
+    session.resume_turn("turn_1", 0, audio_start_ms=1200)
+    session.stop_speech("turn_1", 1, duration_s=2.0, audio_end_ms=2000)
+    session.resume_turn("turn_1", 1, audio_start_ms=2200)
+    session.stop_speech("turn_1", 2, duration_s=3.0, audio_end_ms=3000)
+
+    final = session.final("turn_1", 2, "One long sentence")
+    committed = session.answer("turn_1", 2)
+
+    ended = [event for event in session.events if event.type == "turn.ended"]
+    assert [event.audio_end_ms for event in ended] == [1000, 2000, 3000]
+    assert {event.item_id for event in ended} == {item_id}
+    # Releasing the held terminals at commit does not repeat it.
+    assert "turn.ended" not in _types(final)
+    assert "turn.ended" not in _types(committed)
+    assert _types(committed).count("input_audio_buffer.speech_stopped") == 1
+
+
+def test_turn_ended_not_repeated_when_next_turn_releases_terminals(session):
+    session.start_turn("turn_1")
+    session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)
+    session.final("turn_1", 0, "Hold on")
+
+    released = session.start_turn("turn_2", audio_start_ms=9000)
+
+    assert "input_audio_buffer.speech_stopped" in _types(released)
+    assert "turn.ended" not in _types(released)
+    assert _types(session.events).count("turn.ended") == 1
+
+
+def test_turn_ended_not_repeated_on_grace_expiry_release(session, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr("speech_to_speech.pipeline.speculative_turns.time", SimpleNamespace(monotonic=lambda: now))
+    session.start_turn("turn_1")
+    session.stop_speech("turn_1", 0, duration_s=0.3, audio_end_ms=300)
+    session.tracker.start_reopen_grace("turn_1", 0, grace_s=0.8)
+    session.final("turn_1", 0, "")
+    now += 0.9
+
+    released = session.service.audio.resolve_input_terminals(session.conn_id)
+
+    assert "input_audio_buffer.speech_stopped" in _types(released)
+    assert "turn.ended" not in _types(released)
+
+
+def test_non_candidate_stop_sends_no_turn_ended(session):
+    """A VAD phantom or discarded segment is not a turn end."""
+    session.start_turn("turn_1")
+
+    assert session.stop_speech("turn_1", 0, duration_s=0.0, audio_end_ms=500, turn_end_candidate=False) == []
+
+    # The held stop is still published exactly as before.
+    session.final("turn_1", 0, "Hm")
+    committed = session.answer("turn_1", 0)
+    assert _types(committed).count("input_audio_buffer.speech_stopped") == 1
+    assert "turn.ended" not in _types(session.events)
+
+
+def test_reopen_reusing_item_sends_turn_resumed_not_speech_started(session):
+    started = session.start_turn("turn_1")
+    item_id = started[0].item_id
+    session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)
+
+    resumed = session.resume_turn("turn_1", 0, audio_start_ms=1200)
+
+    assert _types(resumed) == ["turn.resumed"]
+    assert resumed[0].item_id == item_id
+
+    session.stop_speech("turn_1", 1, duration_s=2.0, audio_end_ms=2000)
+    second = session.resume_turn("turn_1", 1, audio_start_ms=2200)
+    assert _types(second) == ["turn.resumed"]
+    assert second[0].item_id == item_id
+    assert _types(session.events).count("input_audio_buffer.speech_started") == 1
+
+
+def test_new_turn_gets_speech_started_not_turn_resumed(session):
+    started = session.start_turn("turn_1")
+
+    assert _types(started) == ["input_audio_buffer.speech_started"]
+
+
+def test_pause_then_resume_sends_turn_ended_then_turn_resumed(session):
+    """Every soft end is a candidate, whatever Smart Turn judged.
+
+    An incomplete verdict still reaches the stop, so the relay may arm its hold
+    sound; the resume then stops it on the same item.
+    """
+    started = session.start_turn("turn_1")
+    session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)
+    session.resume_turn("turn_1", 0, audio_start_ms=1500)
+
+    fork_events = [event for event in session.events if event.type in {"turn.ended", "turn.resumed"}]
+    assert _types(fork_events) == ["turn.ended", "turn.resumed"]
+    assert {event.item_id for event in fork_events} == {started[0].item_id}
+
+
+def test_fork_turn_events_exact_wire_keys(session):
+    session.start_turn("turn_1")
+    ended = session.stop_speech("turn_1", 0, duration_s=1.0, audio_end_ms=1000)
+    resumed = session.resume_turn("turn_1", 0, audio_start_ms=1200)
+
+    assert ended[0].model_dump().keys() == {"type", "event_id", "item_id", "audio_end_ms"}
+    assert ended[0].model_dump()["type"] == "turn.ended"
+    assert resumed[0].model_dump().keys() == {"type", "event_id", "item_id"}
+    assert resumed[0].model_dump()["type"] == "turn.resumed"
+    stop = SpeechStoppedEvent(turn_id="turn_1", turn_revision=0, turn_end_candidate=True)
+    assert "turn_end_candidate" not in stop.model_dump()
+    assert getattr(stop, "turn_end_candidate", None) is True

@@ -1631,3 +1631,32 @@ def test_talk_client_uses_signal_driven_shutdown(monkeypatch):
         (signal.SIGINT, "previous-SIGINT"),
         (signal.SIGTERM, "previous-SIGTERM"),
     ]
+
+
+@pytest.mark.parametrize("event_type", ["turn.ended", "turn.resumed"])
+def test_audio_client_ignores_fork_turn_events(capsys, event_type):
+    playback = PlaybackBuffer(16000)
+    renderer = _FriendlyEventRenderer()
+    handle_server_event(
+        SimpleNamespace(
+            type="speech_to_speech.input_audio_transcription.snapshot",
+            item_id="item_1",
+            transcript="hello there",
+        ),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+    capsys.readouterr()
+    live_width = renderer.live_user_width
+
+    handle_server_event(
+        SimpleNamespace(type=event_type, event_id="event_1", item_id="item_1", audio_end_ms=1000),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+
+    assert live_width > 0
+    assert renderer.live_user_width == live_width
+    assert capsys.readouterr().out == ""

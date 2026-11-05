@@ -4872,6 +4872,44 @@ class TestDispatchPipelineEvent:
         assert continued[0].delta == "hello"
         assert continued[0].content_index == 0
 
+    def test_reopen_without_live_item_sends_speech_started_only(self, service, conn_id):
+        """A reopen whose item is already gone opens a new item the ordinary way."""
+        first_started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent(turn_id="turn_1", turn_revision=0))
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="hello", turn_id="turn_1", turn_revision=0),
+        )
+
+        reopened = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="turn_1", turn_revision=1, reopened=True),
+        )
+
+        assert [event.type for event in reopened] == ["input_audio_buffer.speech_started"]
+        assert reopened[0].item_id != first_started[0].item_id
+
+    def test_turn_ended_first_without_tracker(self, service, conn_id):
+        """With no tracker, speech_stopped publishes in the same call, after turn.ended."""
+        started = service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(audio_end_ms=700, turn_end_candidate=True),
+        )
+
+        assert events[0].type == "turn.ended"
+        assert isinstance(events[1], InputAudioBufferSpeechStoppedEvent)
+        assert events[0].item_id == events[1].item_id == started[0].item_id
+        assert events[0].audio_end_ms == 700
+        assert [event.type for event in events].count("turn.ended") == 1
+
+    def test_speech_stopped_for_unknown_turn_sends_nothing(self, service, conn_id):
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(turn_id="turn_404", turn_revision=0, turn_end_candidate=True),
+        )
+
+        assert events == []
+
     def test_completed_input_item_does_not_emit_later_deltas(self, service, conn_id):
         service.dispatch_pipeline_event(conn_id, SpeechStartedEvent(turn_id="turn_1"))
         service.dispatch_pipeline_event(
@@ -5321,7 +5359,8 @@ class TestDispatchPipelineEvent:
         )
 
         item_id = first_started[0].item_id
-        assert second_started == []
+        assert [event.type for event in second_started] == ["turn.resumed"]
+        assert second_started[0].item_id == first_started[0].item_id
         assert first_reopened_partial == []
         assert second_partial[0].item_id == item_id
         assert second_partial[0].delta == "hello"
