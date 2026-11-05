@@ -190,7 +190,9 @@ def _request_chat_completions(
     if stream:
         create_kwargs["stream_options"] = {"include_usage": True}
     if extra_headers:
-        create_kwargs["extra_headers"] = extra_headers
+        # Merge, never replace: request_options already put the
+        # X-Speech-Request-Id diagnostic header here (SOP-1113).
+        create_kwargs["extra_headers"] = {**(create_kwargs.get("extra_headers") or {}), **extra_headers}
     return client.chat.completions.create(
         model=model_name,
         messages=messages,

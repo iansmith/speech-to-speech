@@ -61,6 +61,7 @@ from speech_to_speech.pipeline.turn_latency import TurnLatencyTracker, bind_acti
 from speech_to_speech.tracing import voice_turns
 from speech_to_speech.tracing.voice_ids import TURN_ID_RE, voice_turn_root_span_id, voice_turn_trace_id
 from speech_to_speech.tracing.voice_turns import StageSpan, TurnTraceRef, VoiceTurnTraces
+from speech_to_speech.utils.request_tracing import REQUEST_ID_HEADER
 from tests.test_sophie_call_id import _handler, _Recorder, _responses_handler
 from tests.tracing.memory import children, install_memory_tracer, roots
 from tests.turns import reopen
@@ -179,8 +180,11 @@ def _send(unit: SimpleNamespace, request: GenerateResponseRequest) -> dict[str, 
     before = len(completions.calls)
     list(unit.llm.process(request))
     assert len(completions.calls) == before + 1
-    headers = completions.calls[-1].get("extra_headers")
-    return dict(headers) if headers else {}
+    headers = dict(completions.calls[-1].get("extra_headers") or {})
+    # Upstream's diagnostic request id rides beside the Sophie headers
+    # (SOP-1113); drop it so the asserts below still pin the Sophie set exactly.
+    assert headers.pop(REQUEST_ID_HEADER)
+    return headers
 
 
 _SOPHIE_HEADERS = frozenset(
