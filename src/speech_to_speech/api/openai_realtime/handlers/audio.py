@@ -22,6 +22,8 @@ from speech_to_speech.api.openai_realtime.input_state import (
     InputItemState,
     InputTranscriptionTerminal,
     PendingInputTerminal,
+    TurnEndedEvent,
+    TurnResumedEvent,
 )
 from speech_to_speech.api.openai_realtime.utils import (
     StreamingPcm16Resampler,
@@ -367,7 +369,11 @@ class AudioHandler(RealtimeBaseHandler):
 
     def on_speech_started(self, conn_id: str, event: SpeechStartedEvent) -> list[ServerEvent]:
         """Handle VAD speech_started: publish the settled turn, cancel an active
-        response if interrupts are enabled, and start or reopen an input item."""
+        response if interrupts are enabled, and start or reopen an input item.
+
+        A reopen that keeps the still-open item sends ``turn.resumed`` instead
+        of a second ``speech_started``.
+        """
         response = self._service.response
         st = self._state(conn_id)
         # A turn other than the one now starting can no longer be revised, so
@@ -414,7 +420,10 @@ class AudioHandler(RealtimeBaseHandler):
         # A reopened revision is still the same externally open speech item.
         # Keep cancellation and revision bookkeeping above, but do not reset
         # a generic client's audio onset with another speech_started event.
+        # The fork's turn.resumed tells a client that saw turn.ended for this
+        # item that the user is speaking again.
         if previous_input_item is not None:
+            events.append(TurnResumedEvent(event_id=self._next_event_id(), item_id=input_item_id))
             return events
         events.append(
             InputAudioBufferSpeechStartedEvent(
@@ -433,6 +442,10 @@ class AudioHandler(RealtimeBaseHandler):
         resume and keep the same item open. The protocol event therefore waits
         until the turn commits, so the client sees exactly one stop per item
         and it is the one that precedes the item's transcription.
+
+        A turn-end candidate (the VAD soft end) also sends the fork's
+        ``turn.ended`` at once, ahead of any terminals this call releases. It
+        is never held, so releasing the terminals cannot repeat it.
         """
         st = self._state(conn_id)
         item_id = self._input_item_id(conn_id, event.turn_id, event.turn_revision)
@@ -448,6 +461,17 @@ class AudioHandler(RealtimeBaseHandler):
             input_item = st.input_items.get(item_id)
             if input_item is not None:
                 input_item.audio_duration_s = event.duration_s
+        ended: list[ServerEvent] = (
+            [
+                TurnEndedEvent(
+                    event_id=self._next_event_id(),
+                    item_id=item_id,
+                    audio_end_ms=event.audio_end_ms,
+                )
+            ]
+            if event.turn_end_candidate
+            else []
+        )
         pending = self._pending_terminal(conn_id, item_id, event.turn_id, event.turn_revision)
         pending.speech_stopped = InputAudioBufferSpeechStoppedEvent(
             type="input_audio_buffer.speech_stopped",
@@ -455,7 +479,7 @@ class AudioHandler(RealtimeBaseHandler):
             audio_end_ms=event.audio_end_ms,
             item_id=item_id,
         )
-        return self.resolve_input_terminals(conn_id)
+        return ended + self.resolve_input_terminals(conn_id)
 
     # ── Outbound audio encoding ──────────────────
 

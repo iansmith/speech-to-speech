@@ -93,7 +93,9 @@ flowchart LR
 | `session.updated` | Confirms a successful `session.update` with the effective session config. |
 | `error` | Protocol errors (`session_limit_reached`, `unknown_or_invalid_event`, `invalid_session_type`, `conversation_already_has_active_response`, etc.) |
 | `input_audio_buffer.speech_started` | VAD detected user speech. |
-| `input_audio_buffer.speech_stopped` | End of user speech segment. |
+| `input_audio_buffer.speech_stopped` | End of the user turn's speech. Held while the turn can still be revised (a speculative pause the user may resume from) and sent once per input item, immediately before that item's `input_audio_buffer.committed`, `conversation.item.created` and transcription terminal, when the turn becomes final (for example: an accepted reply commits it, the next turn starts, or an unanswered or failed turn passes its reopen grace). A held stop for a revision the user resumed from is dropped, not sent. For an early stop signal, see `turn.ended`. |
+| `turn.ended` | Fork extension, always sent. The VAD ended a speech segment (after Smart Turn has run, whatever its verdict): sent at once, carrying `item_id` and `audio_end_ms`, before the held `speech_stopped`. Once per segment end, so a turn with resumed pauses gets one per pause. Not sent for a VAD phantom trigger, a segment the VAD rejects as too short or too long, or a stop that maps to no input item. See below. |
+| `turn.resumed` | Fork extension, always sent. Speech resumed in a reopened turn that keeps its `item_id`; sent in place of the `speech_started` such a reopen does not send. See below. |
 | `conversation.item.created` | Acknowledges injected `input_text` from `conversation.item.create`. |
 | `conversation.item.input_audio_transcription.delta` | Incremental transcript text for the active input-audio content part (when live transcription is enabled). |
 | `conversation.item.input_audio_transcription.completed` | Final transcript for the user turn (with duration usage). |
@@ -167,6 +169,20 @@ protocol layer. No custom SDK transport is used.
 ### Input transcription semantics
 
 Internal partial transcriptions are cumulative hypotheses. Before emitting `conversation.item.input_audio_transcription.delta`, the Realtime server compares consecutive hypotheses at normalized word boundaries and holds back the newest matching word. Only confirmed growth beyond the per-item committed prefix reaches the append-only wire stream; unstable casing and edge punctuation are left to the final transcript. If a later hypothesis revises a word that was already emitted, that partial is withheld because the protocol has no transcript-retraction event, but subsequent hypotheses can resume the stream when they extend the committed prefix. Clients should treat `conversation.item.input_audio_transcription.completed` as authoritative and replace any rendered partial for the same `item_id` with its final `transcript`. Turn metadata routes out-of-order completions to their originating item, and bundled clients retain each unresolved item's transcript until completion so later deltas and empty authoritative completions remain correct.
+
+### Early turn signals: `turn.ended` and `turn.resumed` (Sophie fork extension)
+
+Because `input_audio_buffer.speech_stopped` is held until the turn commits, it arrives with the reply, too late for a relay to time a "still there?" hold sound from it. The fork sends two extra server events for that. They are not part of the OpenAI Realtime API, need no opt-in, and are sent over both the WebSocket and the WebRTC data channel. Clients that do not know them ignore them; the OpenAI SDK parses unknown types without raising, and the bundled `audio_client.py` ignores both.
+
+```json
+{"type": "turn.ended", "event_id": "event_…", "item_id": "item_…", "audio_end_ms": 4210}
+{"type": "turn.resumed", "event_id": "event_…", "item_id": "item_…"}
+```
+
+- `turn.ended` is sent when the VAD ends a speech segment, after Smart Turn has run, whatever its verdict (an incomplete one included) or with Smart Turn off. It goes out at that moment, ahead of the held `speech_stopped` and of any terminals released in the same step, and is never held or repeated when the terminals are released. A VAD phantom trigger, a segment the VAD rejects as too short or too long (including one held to merge with the next), and a stop for an unknown turn send none.
+- `turn.resumed` is sent when the user starts speaking again in a reopened turn that keeps its open `item_id`. Such a reopen sends no second `input_audio_buffer.speech_started`, so this is the only sign of resumed speech. A reopen whose item was already published instead opens a new item with an ordinary `speech_started`, and sends no `turn.resumed`.
+
+So each speech onset gets exactly one of `speech_started` or `turn.resumed`, and a turn with N pauses gets N `turn.ended` events on the same `item_id`.
 
 ### Speculative input transcription snapshots
 

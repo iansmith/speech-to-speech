@@ -19,8 +19,8 @@ of those.
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
+from pydantic import BaseModel
 
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,

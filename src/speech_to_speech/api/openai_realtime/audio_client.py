@@ -389,6 +389,9 @@ def handle_server_event(
         renderer.saw_user_speech = True
     elif event.type == "input_audio_buffer.speech_stopped":
         return
+    elif event.type in {"turn.ended", "turn.resumed"}:
+        # Fork turn signals for relays (hold sound); nothing to render.
+        return
     elif event.type == "speech_to_speech.input_audio_transcription.snapshot":
         renderer.finish_live_assistant_text()
         item_id = getattr(event, "item_id", None)
