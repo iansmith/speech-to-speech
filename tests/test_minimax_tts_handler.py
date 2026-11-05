@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 from contextlib import contextmanager
 from queue import Queue
 from threading import Event, Thread
@@ -62,14 +63,24 @@ def _streaming_endpoint(initial):
     sent = Event()
     closed = Event()
     release = Event()
+    errors: list[BaseException] = []
 
-    def serve():
+    def serve() -> None:
+        try:
+            _serve()
+        except BaseException as exc:  # surfaced at fixture exit, not lost with the thread
+            errors.append(exc)
+
+    def _serve() -> None:
         connection, _ = listener.accept()
         with connection:
-            connection.settimeout(0.05)
+            connection.settimeout(2)
             request = b""
             while b"\r\n\r\n" not in request:
-                request += connection.recv(4096)
+                data = connection.recv(4096)
+                if not data:
+                    return
+                request += data
             headers, body = request.split(b"\r\n\r\n", 1)
             content_length = int(
                 next(
@@ -79,13 +90,17 @@ def _streaming_endpoint(initial):
                 )
             )
             while len(body) < content_length:
-                body += connection.recv(4096)
+                data = connection.recv(4096)
+                if not data:
+                    return
+                body += data
             connection.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
             )
             if initial:
                 connection.sendall(f"{len(initial):x}\r\n".encode() + initial + b"\r\n")
             sent.set()
+            connection.settimeout(0.05)
             while not release.is_set():
                 try:
                     if not connection.recv(4096):
@@ -93,6 +108,11 @@ def _streaming_endpoint(initial):
                         return
                 except socket.timeout:
                     continue
+                except (ConnectionResetError, ConnectionAbortedError):
+                    # A client closed with the response headers still unread in
+                    # its receive buffer sends RST, not FIN: that is a close too.
+                    closed.set()
+                    return
             final = _event(status=2)
             try:
                 connection.sendall(f"{len(final):x}\r\n".encode() + final + b"\r\n0\r\n\r\n")
@@ -107,7 +127,25 @@ def _streaming_endpoint(initial):
         release.set()
         server.join(2)
         listener.close()
+        if errors:
+            raise errors[0]
         assert not server.is_alive()
+
+
+def test_streaming_endpoint_treats_connection_reset_as_close() -> None:
+    # A client cancelled before it reads the response headers closes with those
+    # bytes unread, so the kernel sends RST instead of FIN (SOP-1112). That is
+    # still a close, and the endpoint's close signal must report it.
+    with _streaming_endpoint(b"") as (base_url, sent, closed, _release):
+        port = int(base_url.rsplit(":", 1)[1])
+        client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        try:
+            client.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+            assert sent.wait(1)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        finally:
+            client.close()
+        assert closed.wait(1)
 
 
 def test_requires_minimax_key_and_does_not_fall_back_to_openai(monkeypatch):
