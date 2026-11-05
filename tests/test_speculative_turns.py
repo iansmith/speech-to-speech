@@ -945,6 +945,20 @@ def test_vad_max_speech_is_enforced_before_smart_turn():
     assert analyzer.calls == []
 
 
+def test_vad_rejected_segment_after_speech_started_is_not_a_turn_end():
+    handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
+    handler.max_speech_ms = 1500
+    assert handler.speculative_turns.speech_started(0) == ("turn_1", 0, False)
+    handler._speech_started_emitted = True
+
+    assert _drive_final_segment(handler, segment_chunks=63) == []
+
+    stops = _queued_speech_stops(handler)
+    assert len(stops) == 1
+    # A segment the VAD rejects is not a turn end: no turn.ended for it.
+    assert getattr(stops[0], "turn_end_candidate", None) is False
+
+
 def _handler_after_soft_ended_turn() -> VADHandler:
     handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
     outputs = _drive_final_segment(handler, active_chunks=12, segment_chunks=12)
