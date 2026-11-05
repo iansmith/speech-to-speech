@@ -879,8 +879,16 @@ class TestSendLoop:
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()  # session.created
-                output_queue.put(_pcm_bytes(256))
-                output_queue.put(_pcm_bytes(256))
+                # Both chunks must be in the queue before the send loop looks.
+                # Two plain puts race it: since the signal-woken send loop
+                # (#692) the first put wakes the loop at once, and it sent the
+                # first chunk alone in 2 of 15 runs on upstream 1c6eee7c and 4 of
+                # 15 after SOP-1113's merge. Appending under the queue's mutex
+                # adds them without a wake; the PIPELINE_END put then wakes the
+                # loop with both already visible.
+                with output_queue.mutex:
+                    output_queue.queue.extend([_pcm_bytes(256), _pcm_bytes(256)])
+                    output_queue.unfinished_tasks += 2
                 output_queue.put(PIPELINE_END)
 
                 msg1 = ws.receive_json()
