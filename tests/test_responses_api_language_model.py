@@ -34,6 +34,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import WARMUP_MA
 from speech_to_speech.LLM.chat import (
     AUDIO_INPUT_HISTORY_PLACEHOLDER,
     Chat,
+    make_assistant_message,
     make_system_message,
     make_user_message,
 )
@@ -2277,6 +2278,71 @@ def test_generation_failure_after_tool_success_speaks_tool_result():
     eors = [o for o in outputs if isinstance(o, EndOfResponse)]
     assert len(eors) == 1
     assert eors[0].error is not None and "inference exception" in eors[0].error
+
+
+def _sop598_fail_after(chat):
+    """Run one generation over chat whose provider request 500s; return the
+    spoken chunks' texts."""
+    handler = _make_handler()
+
+    def boom(**kwargs):
+        raise RuntimeError("inference exception")
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=boom))
+
+    from openai.types.realtime import RealtimeSessionCreateRequest
+
+    request = GenerateResponseRequest(
+        runtime_config=RuntimeConfig(
+            chat=chat,
+            session=RealtimeSessionCreateRequest(type="realtime", instructions="You are Sophie."),
+        ),
+    )
+    return [o.text for o in handler.process(request) if isinstance(o, LLMResponseChunk)]
+
+
+def _sop598_tool_round(chat, call_id, name, output):
+    chat.add_item(
+        RealtimeConversationItemFunctionCall(
+            type="function_call", call_id=call_id, name=name, arguments="{}", status="completed",
+        )
+    )
+    chat.append_tool_output(
+        call_id,
+        RealtimeConversationItemFunctionCallOutput(
+            type="function_call_output", call_id=call_id, output=output, id="fco_" + call_id,
+        ),
+    )
+
+
+def test_generation_failure_does_not_speak_an_earlier_turns_tool_result():
+    """A voice session's chat holds earlier turns. A tool that ran for the
+    caller's PREVIOUS question is not this turn's result: replaying it would
+    tell the caller a booking happened again, or answer the wrong question.
+    The turn whose own generation failed with no tool of its own hears
+    PROVIDER_FAILURE_FALLBACK."""
+    chat = Chat(5)
+    chat.add_item(make_user_message("Schedule family dinner for Friday at 7pm"))
+    _sop598_tool_round(chat, "call_t1", "create_commitment", "Copy that: Friday, the 18th at 7pm, Family dinner")
+    chat.add_item(make_assistant_message("Done, it's on the calendar."))
+    chat.add_item(make_user_message("What's the weather like?"))
+
+    texts = _sop598_fail_after(chat)
+
+    assert len(texts) == 1
+    assert texts[0] is base_openai_compatible_language_model.PROVIDER_FAILURE_FALLBACK
+
+
+def test_generation_failure_speaks_only_tool_results_not_yet_spoken_about():
+    """Within one turn, a result the model already answered (its text follows
+    the result) was heard; only the results after the last message are owed."""
+    chat = Chat(5)
+    chat.add_item(make_user_message("Add dinner Friday and remind me Thursday"))
+    _sop598_tool_round(chat, "call_a", "create_commitment", "Copy that: Friday dinner")
+    chat.add_item(make_assistant_message("Dinner's on. Now the reminder."))
+    _sop598_tool_round(chat, "call_b", "create_reminder", "Reminder set for Thursday")
+
+    assert _sop598_fail_after(chat) == ["Reminder set for Thursday"]
 
 
 def test_generation_failure_without_tools_speaks_updated_fallback():
