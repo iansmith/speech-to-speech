@@ -76,6 +76,24 @@ PREFETCH_STREAM_QUEUE_MAXSIZE = 16
 PREFETCH_WORKER_ACQUIRE_TIMEOUT_S = 0.05
 PROVIDER_FAILURE_FALLBACK = "My brain may be down right now. It's not you. Give me a minute."
 
+
+def unspoken_tool_outputs(buffer: list[Any]) -> list[str]:
+    """The tool results the failed generation owed the caller (SOP-598).
+
+    Only the outputs after the buffer's last user or assistant message: a
+    voice session's chat keeps earlier turns, and a result the model already
+    answered, or one that ran for an earlier question, is not this turn's to
+    speak. Replaying an earlier create_commitment's "Copy that: ..." would tell
+    the caller a second booking happened.
+    """
+    outputs: list[str] = []
+    for item in buffer:
+        if isinstance(item, (RealtimeConversationItemUserMessage, RealtimeConversationItemAssistantMessage)):
+            outputs = []
+        elif isinstance(item, RealtimeConversationItemFunctionCallOutput) and item.output:
+            outputs.append(item.output)
+    return outputs
+
 # SOP-538: the one line that makes "how long did the abandoned request hold this
 # turn up?" answerable from the voice log alone. Diagnosing the original 15.6 s
 # took correlating four separate lines across two components. Tests pin this
@@ -1128,11 +1146,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # speakable sentence by design contract.
                 fallback_text = PROVIDER_FAILURE_FALLBACK
                 with original_chat._lock:
-                    tool_outputs = [
-                        item.output
-                        for item in original_chat.buffer
-                        if isinstance(item, RealtimeConversationItemFunctionCallOutput) and item.output
-                    ]
+                    tool_outputs = unspoken_tool_outputs(original_chat.buffer)
                 if tool_outputs:
                     fallback_text = " ".join(tool_outputs)
 
