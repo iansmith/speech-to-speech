@@ -497,3 +497,58 @@ def test_successful_empty_provider_output_completes(backend, stream, kind, modal
         assert "ended without" in caplog.text
     else:
         assert "ended without" not in caplog.text
+
+
+def test_text_turn_hears_the_tool_result_when_the_confirmation_leg_500s(monkeypatch):
+    """SOP-598 on the TEXT path: sophie's text turn reads the answer out of
+    response.done. When the generation after a successful tool 500s, that
+    failed response.done must still carry the tool's result as its text, or
+    the texter is told the request failed and retries it into a duplicate."""
+    from openai.types.realtime.conversation_item import (
+        RealtimeConversationItemFunctionCall,
+        RealtimeConversationItemFunctionCallOutput,
+    )
+
+    import tests.test_provider_response_status as mod
+
+    result = "Copy that: Friday, the 18th at 7pm, Jill for Family dinner"
+    make_request = mod._make_request
+
+    def with_tool_round():
+        request = make_request()
+        chat = request.runtime_config.chat
+        chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_598", name="create_commitment", arguments="{}", status="completed"
+            )
+        )
+        chat.append_tool_output(
+            "call_598",
+            RealtimeConversationItemFunctionCallOutput(
+                type="function_call_output", call_id="call_598", output=result, id="fco_598"
+            ),
+        )
+        return request
+
+    def failing_client(payload, stream):
+        return OpenAI(
+            api_key="test",
+            base_url="http://provider.invalid/v1",
+            max_retries=0,
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(500, json={"error": {"message": "inference exception"}})
+                )
+            ),
+        )
+
+    monkeypatch.setattr(mod, "_make_request", with_tool_round)
+    monkeypatch.setattr(mod, "_client", failing_client)
+
+    response, _, events, _, _ = _run("responses", True, "failed", "text", payload=[])
+
+    assert response.status == "failed"
+    spoken = "".join(
+        part.text for item in response.output for part in (getattr(item, "content", None) or []) if getattr(part, "text", None)
+    )
+    assert spoken == result
